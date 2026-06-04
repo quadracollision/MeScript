@@ -1,0 +1,94 @@
+[{:label "FX Vector" :form ":fx [(filter :type :lowpass :cutoff 1200 :res 0.35)\n     (delay :time 0.125 :feedback 0.32 :mix 0.22)]"}
+ {:label "filter" :form "(filter :type :lowpass :cutoff 1200 :res 0.35)"}
+ {:label "comb" :form "(comb :delay-ms 8 :feedback 0.65 :mix 0.35)"}
+ {:label "formant" :form "(formant :vowel :a :mix 0.45)"}
+ {:label "distort" :form "(distort :type :tanh :drive 0.4)"}
+ {:label "bitcrush" :form "(bitcrush :bits 8 :rate 2)"}
+ {:label "delay" :form "(delay :time 0.125 :feedback 0.32 :mix 0.22)"}
+ {:label "wavefolder" :form "(wavefolder :folds 2 :gain 2.0)"}
+ {:label "resonator" :form "(resonator :freq 220 :decay 0.98 :mix 0.35 :harmonics 4)"}
+ {:label "lofi" :form "(lofi :amount 0.45)"}
+ {:label "vinyl" :form "(vinyl :crackle 0.25 :hiss 0.08 :wow 0.12)"}
+ {:label "sub-bass" :form "(sub-bass :mix 0.24)"}
+ {:label "sidechain" :form "(sidechain :rate 2 :depth 0.45 :shape 0.45)"}
+ {:label "radio" :form "(radio :intensity 0.45)"}
+ {:label "telephone" :form "(telephone :quality 0.45)"}
+ {:label "underwater" :form "(underwater :depth 0.55)"}
+ {:label "crystal" :form "(crystal :brightness 0.55 :decay 0.32)"}
+ {:label "dc-remove" :form "(dc-remove)"}
+ {:label "pitch-shift" :form "(pitch-shift :semitones 7 :mix 0.35)"}
+ {:label "harmonizer" :form "(harmonizer :interval 7 :mix 0.30)"}
+ {:label "octaver" :form "(octaver :octave-up 0.0 :octave-down 0.35)"}
+ {:label "reverse" :form "(reverse :mix 1.0)"}
+ {:label "tape-stop" :form "(tape-stop :duration 0.5)"}
+ {:label "granular" :form "(granular :grain-ms 50 :density 0.5 :pitch 1.0 :mix 0.35)"}
+ {:label "granular-stretch" :form "(granular-stretch :rate 0.5 :grain-ms 50)"}
+ {:label "spectral-freeze" :form "(spectral-freeze :freeze 0.6 :mix 0.5)"}
+ {:label "haas" :form "(haas :delay-ms 18 :side :right)"}
+ {:label "stereo-widen" :form "(stereo-widen :width 1.4)"}
+ {:label "stereo-imager" :form "(stereo-imager :width 1.25 :bass-mono 160)"}
+ {:label "width-enhance" :form "(width-enhance :width 1.35 :air 0.2)"}
+ {:label "freq-shift" :form "(freq-shift :shift-hz 35 :mix 0.45)"}
+ {:label "autopan" :form "(autopan :rate 0.5 :depth 0.7)"}
+ {:label "ping-pong-delay" :form "(ping-pong-delay :time-ms 180 :feedback 0.32 :mix 0.28)"}
+ {:label "h3000" :form "(h3000 :detune-cents 9 :delay-ms 18 :feedback 0.05 :mix 0.32)"}
+ {:label "shimmer" :form "(shimmer :shift-semitones 12 :feedback 0.18 :mix 0.22)"}
+ {:label "stutter" :form "(stutter :grain-ms 32 :repeats 2 :mix 0.35)"}
+ {:label "glitch" :form "(glitch :density 0.25 :slice-ms 30)"}
+ {:label "fade" :form "(fade :fade-in-ms 40 :fade-out-ms 180 :duration 1.0)"}
+ {:label "adsr" :form "(adsr :attack 0.01 :decay 0.05 :sustain 0.7 :release 0.08)"}
+ {:label "doppler" :form "(doppler :speed 1.0 :depth 0.3)"}
+ {:label "maximizer" :form "(maximizer :ceiling -0.3 :warmth 0.45 :release-ms 50)"}
+ {:label "parallel-comp" :form "(parallel-comp :threshold -25 :ratio 8 :mix 0.4)"}
+ {:label "multiband-comp" :form "(multiband-comp :low-thresh -20 :mid-thresh -18 :high-thresh -15 :crossover-low 200 :crossover-high 4000)"}
+ {:label "harmonic-enhance" :form "(harmonic-enhance :low-harmonics 0.3 :high-harmonics 0.2 :air 0.15)"}
+ {:label "body" :form "(body :size 0.5 :tone 0.5 :mix 0.3)"}
+ {:label "warmth" :form "(warmth :amount 0.45)"}
+ {:label "spatial" :form "(spatial :room-size 0.5 :position 0.5 :height 0.3)"}
+ {:label "tremolo" :form "(tremolo :rate 6 :depth 0.35)"}
+ {:label "chorus" :form "(chorus :rate 0.6 :depth 0.004 :voices 3 :mix 0.42)"}
+ {:label "ensemble" :form "(ensemble :voices 5 :depth 0.004 :rate 0.8)"}
+ {:label "ce1-chorus" :form "(ce1-chorus :rate 0.5 :intensity 0.5)"}
+ {:label "re301-chorus" :form "(re301-chorus :rate 0.6 :depth 0.5 :tone 0.5)"}
+ {:label "dimension" :form "(dimension :mode 2)"}
+ {:label "dimension-d" :form "(dimension-d :mode 3)"}
+ {:label "flanger" :form "(flanger :rate 0.25 :depth 0.002 :feedback 0.5 :mix 0.45)"}
+ {:label "phaser" :form "(phaser :rate 0.5 :depth 0.5 :stages 4 :mix 0.45)"}
+ {:label "small-stone" :form "(small-stone :rate 0.28 :depth 0.72 :feedback 0.35 :color true)"}
+ {:label "vibrato" :form "(vibrato :rate 5 :depth 0.003)"}
+ {:label "ring-mod" :form "(ring-mod :freq 200 :mix 0.45)"}
+ {:label "arp-ring-mod" :form "(arp-ring-mod :freq 300 :depth 0.8 :diode-curve 0.3)"}
+ {:label "compressor" :form "(compressor :threshold -20 :ratio 4 :attack 0.01 :release 0.1 :makeup 0)"}
+ {:label "fairchild" :form "(fairchild :input-gain 0.5 :threshold -20 :time-constant 3 :mix 1.0)"}
+ {:label "ssl-comp" :form "(ssl-comp :threshold -15 :ratio 4 :attack-ms 10 :release-ms 100 :makeup-db 0)"}
+ {:label "dbx160" :form "(dbx160 :threshold -15 :ratio 6)"}
+ {:label "1176" :form "(1176 :input-gain 0.5 :ratio 4 :attack 0.3 :release 0.5)"}
+ {:label "la2a" :form "(la2a :peak-reduction 0.5 :mode :compress)"}
+ {:label "limiter" :form "(limiter :ceiling -0.1 :release 0.05)"}
+ {:label "gate" :form "(gate :threshold -40 :attack 0.001 :release 0.05)"}
+ {:label "transient" :form "(transient :attack-gain 1.5 :sustain-gain 1.0 :sensitivity 0.01)"}
+ {:label "reverb" :form "(reverb :decay 1.1 :mix 0.22)"}
+ {:label "spring-reverb" :form "(spring-reverb :decay 0.42 :tone 0.58 :mix 0.12 :drip 0.06)"}
+ {:label "emt-plate" :form "(emt-plate :decay 2.5 :damping 0.5 :mix 0.3 :pre-delay-ms 20)"}
+ {:label "lexicon-224" :form "(lexicon-224 :size 0.72 :decay 2.2 :damping 0.52 :pre-delay-ms 18 :mix 0.25)"}
+ {:label "ams-reverb" :form "(ams-reverb :decay 0.58 :damping 0.42 :program :nonlin :mix 0.42)"}
+ {:label "tube" :form "(tube :drive 0.10 :asymmetry 0.03)"}
+ {:label "neve-preamp" :form "(neve-preamp :gain 0.5 :warmth 0.5)"}
+ {:label "marshall-amp" :form "(marshall-amp :gain 0.6 :tone 0.5 :presence 0.5)"}
+ {:label "vox-ac30" :form "(vox-ac30 :gain 0.5 :treble 0.6 :cut 0.4)"}
+ {:label "fender-twin" :form "(fender-twin :volume 0.4 :treble 0.6 :bass 0.5 :reverb-mix 0.3)"}
+ {:label "pultec-eq" :form "(pultec-eq :low-boost 0.18 :high-boost 0.08)"}
+ {:label "tape" :form "(tape :saturation 0.5 :wow 0.1 :flutter 0.1)"}
+ {:label "studer-tape" :form "(studer-tape :input-level 0.5 :speed 1.0 :bias 0.5)"}
+ {:label "exciter" :form "(exciter :amount 0.5 :cutoff 3000)"}
+ {:label "moog" :form "(moog :cutoff 760 :res 0.55 :drive 0.10)"}
+ {:label "tb-303" :form "(tb-303 :cutoff 1050 :res 0.85 :env-mod 0.45 :accent 0.25 :decay 0.24)"}
+ {:label "space-echo" :form "(space-echo :time 0.18 :feedback 0.34 :wow 0.12 :flutter 0.08 :tone 0.62 :spring-mix 0.10 :mix 0.24)"}
+ {:label "tc2290" :form "(tc2290 :time-ms 170 :feedback 0.34 :mod-rate 0.23 :mod-depth 0.002 :mix 0.24)"}
+ {:label "sem-filter" :form "(sem-filter :type :lowpass :cutoff 2000 :res 0.5)"}
+ {:label "ms20" :form "(ms20 :cutoff 820 :res 0.68)"}
+ {:label "prophet-filter" :form "(prophet-filter :cutoff 2000 :res 0.6)"}
+ {:label "obxa-filter" :form "(obxa-filter :type :lowpass :cutoff 2600 :res 0.36)"}
+ {:label "wasp-filter" :form "(wasp-filter :cutoff 1500 :res 0.7)"}
+ {:label "juno-hpf" :form "(juno-hpf :cutoff 180 :res 0.15)"}
+ {:label "buchla-lpg" :form "(buchla-lpg :strike 0.7 :decay 0.3 :res 0.2)"}]
