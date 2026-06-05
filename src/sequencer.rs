@@ -1,16 +1,20 @@
-pub(crate) fn pattern_f32(values: &[f32], step: usize) -> f32 {
-    if values.is_empty() {
-        440.0
+pub(crate) fn pattern_index(values_len: usize, loop_start: usize, step: usize) -> usize {
+    if values_len == 0 {
+        return 0;
+    }
+    let loop_start = loop_start.min(values_len - 1);
+    if step < loop_start {
+        step
     } else {
-        values[step % values.len()]
+        loop_start + ((step - loop_start) % (values_len - loop_start).max(1))
     }
 }
 
-pub(crate) fn pattern_bool(values: &[bool], step: usize) -> bool {
+pub(crate) fn pattern_bool_with_loop(values: &[bool], loop_start: usize, step: usize) -> bool {
     if values.is_empty() {
         false
     } else {
-        values[step % values.len()]
+        values[pattern_index(values.len(), loop_start, step)]
     }
 }
 
@@ -22,11 +26,27 @@ pub(crate) fn pattern_step_gates(values: &[Vec<bool>], step: usize) -> &[bool] {
     }
 }
 
-pub(crate) fn pattern_step_holds(values: &[Vec<usize>], step: usize) -> &[usize] {
+pub(crate) fn pattern_step_gates_with_loop(
+    values: &[Vec<bool>],
+    loop_start: usize,
+    step: usize,
+) -> &[bool] {
+    if values.is_empty() {
+        &[false]
+    } else {
+        &values[pattern_index(values.len(), loop_start, step)]
+    }
+}
+
+pub(crate) fn pattern_step_holds_with_loop(
+    values: &[Vec<usize>],
+    loop_start: usize,
+    step: usize,
+) -> &[usize] {
     if values.is_empty() {
         &[0]
     } else {
-        &values[step % values.len()]
+        &values[pattern_index(values.len(), loop_start, step)]
     }
 }
 

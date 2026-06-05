@@ -18,10 +18,12 @@
          :live-scenes nil
          :live-awaiting-update false
          :live-update-token 0
+         :live-auto-edit-token 0
+         :live-auto-last-error nil
          :live-highlight-step nil
          :live-highlight-scheduled false
          :audio-device nil
-         :remove-insert-comments false}))
+         :remove-insert-comments true}))
 
 (defn resource-slurp [path]
   (when-let [resource (io/resource path)]

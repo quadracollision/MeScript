@@ -126,14 +126,23 @@
    :harmonic-minor [0 2 3 5 7 8 11]
    :melodic-minor [0 2 3 5 7 9 11]
    :pentatonic [0 2 4 7 9]
+   :major-pentatonic [0 2 4 7 9]
    :minor-pentatonic [0 3 5 7 10]
    :blues [0 3 5 6 7 10]
+   :minor-blues [0 3 5 6 7 10]
+   :major-blues [0 2 3 4 7 9]
    :dorian [0 2 3 5 7 9 10]
    :phrygian [0 1 3 5 7 8 10]
    :lydian [0 2 4 6 7 9 11]
    :mixolydian [0 2 4 5 7 9 10]
    :locrian [0 1 3 5 6 8 10]
-   :chromatic [0 1 2 3 4 5 6 7 8 9 10 11]})
+   :chromatic [0 1 2 3 4 5 6 7 8 9 10 11]
+   :whole-tone [0 2 4 6 8 10]
+   :diminished [0 2 3 5 6 8 9 11]
+   :whole-half-diminished [0 2 3 5 6 8 9 11]
+   :half-whole-diminished [0 1 3 4 6 7 9 10]
+   :bebop-major [0 2 4 5 7 8 9 11]
+   :bebop-dominant [0 2 4 5 7 9 10 11]})
 
 (def chords
   {:major [0 4 7]
@@ -365,13 +374,41 @@
             (range n)))))
 
 (defn generated-chord [args]
-  (let [[root chord-name & extra] args]
+  (let [[root chord-form & extra] args]
     (when extra
-      (throw (ex-info "chord expects root and chord name" {:args args})))
-    (let [intervals (or (get chords chord-name)
-                        (throw (ex-info "unknown chord" {:chord chord-name})))
+      (throw (ex-info "chord expects root and chord name or interval vector" {:args args})))
+    (let [intervals (cond
+                      (keyword? chord-form)
+                      (or (get chords chord-form)
+                          (throw (ex-info "unknown chord" {:chord chord-form})))
+
+                      (vector? chord-form)
+                      (mapv #(numeric-value %) chord-form)
+
+                      :else
+                      (throw (ex-info "chord expects a chord name or interval vector"
+                                      {:chord chord-form})))
           root-midi (note->midi root)]
       (mapv #(midi->note (+ root-midi %)) intervals))))
+
+(defn generated-arpeggio [args]
+  (generated-chord args))
+
+(defn generated-shape [args]
+  (let [[values positions & extra] args]
+    (when extra
+      (throw (ex-info "shape expects a vector and a vector of 1-based positions" {:args args})))
+    (let [values (vector-value values "shape")
+          positions (vector-value positions "shape")]
+      (mapv (fn [position]
+              (let [n (positive-count position "shape position")]
+                (when (zero? n)
+                  (throw (ex-info "shape positions are 1-based" {:position position})))
+                (or (get values (dec n))
+                    (throw (ex-info "shape position is outside the source vector"
+                                    {:position position
+                                     :size (count values)})))))
+            positions))))
 
 (defn expand-list-items [env items]
   (loop [remaining items
@@ -406,7 +443,13 @@
       (when-not (vector? expanded-pattern)
         (throw (ex-info "p :repeat requires a vector pattern" {:form pattern-form})))
       (list 'p (repeat-pattern (max 0 n) expanded-pattern)))
-    (apply list 'p (expand-list-items env args))))
+    (let [pattern-form (first args)
+          expanded-items (expand-list-items env args)]
+      (if (and (= 1 (count args))
+               (seq? pattern-form)
+               (contains? #{'chord 'shape} (first pattern-form)))
+        (list 'p [(first expanded-items)])
+        (apply list 'p expanded-items)))))
 
 (defn expand-map-form [env args]
   (let [[op & sources] args
@@ -465,6 +508,9 @@
         rand-range (generated-rand-range @expanded-args)
         scale (generated-scale @expanded-args)
         chord (generated-chord @expanded-args)
+        arpeggio (generated-arpeggio @expanded-args)
+        arp (generated-arpeggio @expanded-args)
+        shape (generated-shape @expanded-args)
         transpose (let [[value semitones & extra] @expanded-args]
                     (when extra
                       (throw (ex-info "transpose expects value and semitones" {:args @expanded-args})))

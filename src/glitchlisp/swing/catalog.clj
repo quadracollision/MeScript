@@ -184,7 +184,7 @@
   ([source]
    (oscillator-structure-snippet source true))
   ([source include-comments?]
-   (str "(d :track-id\n"
+   (str "(d :" (track-id-for-source source) "\n"
         "   :src :" source (param-contract oscillator-param-contracts ":src" include-comments?) "\n"
         "   :note (p [])" (param-contract oscillator-param-contracts ":note" include-comments?) "\n"
         "   :gate (p [])" (param-contract oscillator-param-contracts ":gate" include-comments?) "\n"
@@ -350,10 +350,11 @@
        (if (seq params)
          (let [guide (when include-comments?
                        (->> params
-                            (map (fn [[param _]]
-                                   (str param " " (effect-param-contract effect-name param))))
-                            (str/join ", ")))]
-           (str "(" effect-name " "
+                             (map (fn [[param _]]
+                                    (str param " " (effect-param-contract effect-name param))))
+                             (str/join ", ")))]
+           (str "(" effect-name
+                " "
                 (str/join " " (map (fn [[param _]]
                                       (str param " null"))
                                     params))

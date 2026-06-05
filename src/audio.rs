@@ -151,11 +151,16 @@ pub(crate) fn active_effect_specs(
         .collect()
 }
 
-fn note_at(values: &[f32], index: usize) -> f32 {
+fn note_chord_at(values: &[Vec<f32>], index: usize) -> Vec<f32> {
     if values.is_empty() {
-        440.0
+        vec![440.0]
     } else {
-        values[index % values.len()]
+        let chord = &values[index % values.len()];
+        if chord.is_empty() {
+            vec![440.0]
+        } else {
+            chord.clone()
+        }
     }
 }
 
@@ -318,62 +323,84 @@ impl AudioEngine {
                 continue;
             }
             let track_step = (self.step / step_every).wrapping_add(track.step_offset);
-            let gates = sequencer::pattern_step_gates(&track.gate_subdivisions, track_step);
-            let holds = sequencer::pattern_step_holds(&track.gate_holds, track_step);
+            let gates = sequencer::pattern_step_gates_with_loop(
+                &track.gate_subdivisions,
+                track.gate_loop_start,
+                track_step,
+            );
+            let holds = sequencer::pattern_step_holds_with_loop(
+                &track.gate_holds,
+                track.gate_loop_start,
+                track_step,
+            );
             if gates.len() <= 1 {
-                let gate = gates
-                    .first()
-                    .copied()
-                    .unwrap_or_else(|| sequencer::pattern_bool(&track.gates, track_step));
-                let freq = self.note_for_slot(track, track_step, gate);
+                let gate = gates.first().copied().unwrap_or_else(|| {
+                    sequencer::pattern_bool_with_loop(
+                        &track.gates,
+                        track.gate_loop_start,
+                        track_step,
+                    )
+                });
                 if gate {
+                    let freqs = self.note_chord_for_slot(track, track_step);
                     let hold = holds.first().copied().unwrap_or(0);
                     let hold_seconds = hold as f32 * self.step_samples / self.sample_rate;
                     let param_index = self.next_param_index_for_track(track);
-                    self.push_track_voices(
-                        track,
-                        freq,
-                        self.step,
-                        track_step,
-                        0,
-                        param_index,
-                        hold_seconds,
-                    );
+                    for freq in freqs {
+                        self.push_track_voices(
+                            track,
+                            freq,
+                            self.step,
+                            track_step,
+                            0,
+                            param_index,
+                            hold_seconds,
+                        );
+                    }
+                } else if matches!(track.note_mode, NoteMode::Tick) {
+                    self.next_note_chord_for_track(track);
                 }
                 continue;
             }
 
             let sub_step_samples = self.step_samples / gates.len() as f32;
             for (idx, gate) in gates.iter().enumerate() {
-                let freq = self.note_for_slot(track, track_step, *gate);
                 if !gate {
+                    if matches!(track.note_mode, NoteMode::Tick) {
+                        self.next_note_chord_for_track(track);
+                    }
                     continue;
                 }
+                let freqs = self.note_chord_for_slot(track, track_step);
                 let seed_step = self.step.wrapping_mul(1024).wrapping_add(idx);
                 let hold = holds.get(idx).copied().unwrap_or(0);
                 let hold_seconds = hold as f32 * sub_step_samples / self.sample_rate;
                 let param_index = self.next_param_index_for_track(track);
                 if idx == 0 {
-                    self.push_track_voices(
-                        track,
-                        freq,
-                        seed_step,
-                        track_step,
-                        idx,
-                        param_index,
-                        hold_seconds,
-                    );
+                    for freq in freqs {
+                        self.push_track_voices(
+                            track,
+                            freq,
+                            seed_step,
+                            track_step,
+                            idx,
+                            param_index,
+                            hold_seconds,
+                        );
+                    }
                 } else {
-                    self.pending_triggers.push(PendingTrigger {
-                        samples_until: sub_step_samples * idx as f32,
-                        track: track.clone(),
-                        freq,
-                        seed_step,
-                        track_step,
-                        sub_index: idx,
-                        param_index,
-                        hold_seconds,
-                    });
+                    for freq in freqs {
+                        self.pending_triggers.push(PendingTrigger {
+                            samples_until: sub_step_samples * idx as f32,
+                            track: track.clone(),
+                            freq,
+                            seed_step,
+                            track_step,
+                            sub_index: idx,
+                            param_index,
+                            hold_seconds,
+                        });
+                    }
                 }
             }
         }
@@ -381,23 +408,18 @@ impl AudioEngine {
         self.step = self.step.wrapping_add(1);
     }
 
-    fn note_for_slot(&mut self, track: &crate::model::Track, track_step: usize, gate: bool) -> f32 {
+    fn note_chord_for_slot(&mut self, track: &crate::model::Track, track_step: usize) -> Vec<f32> {
         match track.note_mode {
-            NoteMode::Step => sequencer::pattern_f32(&track.notes, track_step),
-            NoteMode::Hit if gate => self.next_note_for_track(track),
-            NoteMode::Hit => note_at(
-                &track.notes,
-                *self.note_cursors.get(&track.id).unwrap_or(&0),
-            ),
-            NoteMode::Tick => self.next_note_for_track(track),
+            NoteMode::Step => note_chord_at(&track.note_chords, track_step),
+            NoteMode::Hit | NoteMode::Tick => self.next_note_chord_for_track(track),
         }
     }
 
-    fn next_note_for_track(&mut self, track: &crate::model::Track) -> f32 {
+    fn next_note_chord_for_track(&mut self, track: &crate::model::Track) -> Vec<f32> {
         let cursor = self.note_cursors.entry(track.id.clone()).or_insert(0);
-        let freq = note_at(&track.notes, *cursor);
+        let freqs = note_chord_at(&track.note_chords, *cursor);
         *cursor = cursor.wrapping_add(1);
-        freq
+        freqs
     }
 
     fn next_param_index_for_track(&mut self, track: &crate::model::Track) -> usize {
@@ -570,6 +592,11 @@ impl AudioEngine {
     #[cfg(test)]
     pub(crate) fn note_cursor_for_test(&self, track_id: &str) -> usize {
         *self.note_cursors.get(track_id).unwrap_or(&0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_voice_count_for_test(&self) -> usize {
+        self.voices.len()
     }
 }
 

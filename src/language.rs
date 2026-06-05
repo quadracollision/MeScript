@@ -158,10 +158,12 @@ fn eval_form(runtime: &mut Runtime, expr: &Expr) -> Result<(), String> {
                     waveform: Waveform::Sine,
                     oscillator: OscillatorParams::default(),
                     notes: vec![freq],
+                    note_chords: vec![vec![freq]],
                     note_mode: NoteMode::Step,
                     gates: vec![true, false, false, false],
                     gate_subdivisions: vec![vec![true], vec![false], vec![false], vec![false]],
                     gate_holds: vec![vec![0], vec![0], vec![0], vec![0]],
+                    gate_loop_start: 0,
                     step_every: 1,
                     step_offset: 0,
                     amp: 0.35,
@@ -207,7 +209,7 @@ pub(crate) fn apply_scene(runtime: &mut Runtime, id: &str) -> Result<(), String>
         .scenes
         .get(id)
         .cloned()
-        .ok_or_else(|| format!("unknown block ':{}'", id))?;
+        .ok_or_else(|| format!("unknown scene ':{}'", id))?;
     runtime.tracks = scene.tracks;
     runtime.post_effects = scene.post_effects;
     runtime.scene_state = Some(SceneState {
@@ -219,8 +221,8 @@ pub(crate) fn apply_scene(runtime: &mut Runtime, id: &str) -> Result<(), String>
 }
 
 fn define_scene(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
-    let Expr::Keyword(id) = items.get(1).ok_or("block requires a block id")? else {
-        return Err("block id must be a keyword".to_string());
+    let Expr::Keyword(id) = items.get(1).ok_or("scene requires a scene id")? else {
+        return Err("scene id must be a keyword".to_string());
     };
 
     let mut repeats = 0;
@@ -250,9 +252,7 @@ fn define_scene(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
                 index += 2;
             }
             "bars" => {
-                let value = items
-                    .get(index + 1)
-                    .ok_or("block :bars requires a value")?;
+                let value = items.get(index + 1).ok_or("block :bars requires a value")?;
                 steps = usize_value(value, "bars")?.saturating_mul(16).max(1);
                 explicit_steps = true;
                 index += 2;
@@ -321,7 +321,7 @@ fn inferred_track_steps(track: &Track) -> usize {
         .map(|step| step.len().max(1))
         .sum::<usize>()
         .max(1);
-    let note_length = track.notes.len().max(1);
+    let note_length = track.note_chords.len().max(1);
     let note_period = match track.note_mode {
         NoteMode::Step => note_length,
         NoteMode::Hit => {
@@ -337,7 +337,7 @@ fn inferred_track_steps(track: &Track) -> usize {
 }
 
 fn play_scene(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
-    let id = keyword_arg(items, 1, "play-block")?;
+    let id = keyword_arg(items, 1, "play-scene")?;
     apply_scene(runtime, &id)
 }
 
@@ -378,10 +378,12 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
         waveform: Waveform::Sine,
         oscillator: OscillatorParams::default(),
         notes: vec![note_freq("c3").unwrap()],
+        note_chords: vec![vec![note_freq("c3").unwrap()]],
         note_mode: NoteMode::Step,
         gates: vec![true],
         gate_subdivisions: vec![vec![true]],
         gate_holds: vec![vec![0]],
+        gate_loop_start: 0,
         step_every: 1,
         step_offset: 0,
         amp: 0.2,
@@ -412,14 +414,16 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
         match key.as_str() {
             "src" => track.waveform = waveform(value)?,
             "note" => {
-                let (notes, mode) = note_pattern(value)?;
+                let (notes, note_chords, mode) = note_pattern(value)?;
                 track.notes = notes;
+                track.note_chords = note_chords;
                 track.note_mode = mode;
             }
             "gate" => {
-                let (gate_subdivisions, gate_holds) = gate_pattern(value)?;
-                track.gate_subdivisions = gate_subdivisions;
-                track.gate_holds = gate_holds;
+                let gate_pattern = gate_pattern(value)?;
+                track.gate_subdivisions = gate_pattern.gates;
+                track.gate_holds = gate_pattern.holds;
+                track.gate_loop_start = gate_pattern.loop_start;
                 track.gates = track
                     .gate_subdivisions
                     .iter()
@@ -568,9 +572,15 @@ fn numeric_param_pattern(
     normalize: fn(f32) -> f32,
 ) -> Result<Option<Vec<f32>>, String> {
     match expr {
-        Expr::List(items)
-            if matches!(items.first(), Some(Expr::Symbol(name)) if numeric_pattern_form(name)) =>
-        {
+        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if numeric_pattern_form(name)) => {
+            Ok(Some(
+                number_pattern(expr, false)?
+                    .into_iter()
+                    .map(normalize)
+                    .collect(),
+            ))
+        }
+        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "rev" || name == "reverse") => {
             Ok(Some(
                 number_pattern(expr, false)?
                     .into_iter()
@@ -1433,13 +1443,15 @@ fn distortion_kind(name: &str) -> Result<DistortionKind, String> {
     })
 }
 
-fn note_pattern(expr: &Expr) -> Result<(Vec<f32>, NoteMode), String> {
+fn note_pattern(expr: &Expr) -> Result<(Vec<f32>, Vec<Vec<f32>>, NoteMode), String> {
     match expr {
         Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "p") => {
-            Ok((pattern_values(items, true, "p")?, NoteMode::Step))
+            let chords = note_chord_pattern_values(items, "p")?;
+            Ok((flatten_note_chords(&chords), chords, NoteMode::Step))
         }
         Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "s") => {
-            Ok((pattern_values(items, true, "s")?, NoteMode::Hit))
+            let chords = note_chord_pattern_values(items, "s")?;
+            Ok((flatten_note_chords(&chords), chords, NoteMode::Hit))
         }
         Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "gs" || name == "gate-seq" || name == "gate_seq") =>
         {
@@ -1447,16 +1459,39 @@ fn note_pattern(expr: &Expr) -> Result<(Vec<f32>, NoteMode), String> {
                 Some(Expr::Symbol(name)) => name.as_str(),
                 _ => "gs",
             };
-            Ok((pattern_values(items, true, name)?, NoteMode::Tick))
+            let chords = note_chord_pattern_values(items, name)?;
+            Ok((flatten_note_chords(&chords), chords, NoteMode::Tick))
         }
-        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "rev") => {
-            let source = items.get(1).ok_or("rev requires a pattern")?;
-            let (mut values, mode) = note_pattern(source)?;
-            values.reverse();
-            Ok((values, mode))
+        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "rev" || name == "reverse") =>
+        {
+            let source = items.get(1).ok_or("reverse requires a pattern")?;
+            let (_, mut chords, mode) = note_pattern(source)?;
+            chords.reverse();
+            Ok((flatten_note_chords(&chords), chords, mode))
         }
-        _ => Ok((number_pattern(expr, true)?, NoteMode::Step)),
+        _ => {
+            let values = number_pattern(expr, true)?;
+            let chords = values.iter().copied().map(|value| vec![value]).collect();
+            Ok((values, chords, NoteMode::Step))
+        }
     }
+}
+
+fn flatten_note_chords(chords: &[Vec<f32>]) -> Vec<f32> {
+    chords.iter().flatten().copied().collect()
+}
+
+fn note_chord_pattern_values(items: &[Expr], name: &str) -> Result<Vec<Vec<f32>>, String> {
+    let Some(Expr::Vector(values)) = items.get(1) else {
+        return Err(format!("{} requires a vector", name));
+    };
+    values
+        .iter()
+        .map(|value| match value {
+            Expr::Vector(notes) => notes.iter().map(number_value).collect(),
+            _ => Ok(vec![number_value(value)?]),
+        })
+        .collect()
 }
 
 fn pattern_values(items: &[Expr], notes: bool, name: &str) -> Result<Vec<f32>, String> {
@@ -1477,8 +1512,7 @@ fn pattern_values(items: &[Expr], notes: bool, name: &str) -> Result<Vec<f32>, S
 
 fn number_pattern(expr: &Expr, notes: bool) -> Result<Vec<f32>, String> {
     match expr {
-        Expr::List(items)
-            if matches!(items.first(), Some(Expr::Symbol(name)) if numeric_pattern_form(name)) =>
+        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if numeric_pattern_form(name)) =>
         {
             let name = match items.first() {
                 Some(Expr::Symbol(name)) => name.as_str(),
@@ -1486,8 +1520,9 @@ fn number_pattern(expr: &Expr, notes: bool) -> Result<Vec<f32>, String> {
             };
             pattern_values(items, notes, name)
         }
-        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "rev") => {
-            let source = items.get(1).ok_or("rev requires a pattern")?;
+        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "rev" || name == "reverse") =>
+        {
+            let source = items.get(1).ok_or("reverse requires a pattern")?;
             let mut values = number_pattern(source, notes)?;
             values.reverse();
             Ok(values)
@@ -1510,7 +1545,27 @@ fn number_pattern(expr: &Expr, notes: bool) -> Result<Vec<f32>, String> {
     }
 }
 
-fn gate_pattern(expr: &Expr) -> Result<(Vec<Vec<bool>>, Vec<Vec<usize>>), String> {
+#[derive(Clone, Debug)]
+struct ParsedGatePattern {
+    gates: Vec<Vec<bool>>,
+    holds: Vec<Vec<usize>>,
+    loop_start: usize,
+}
+
+fn parsed_gate_pattern(
+    gates: Vec<Vec<bool>>,
+    holds: Vec<Vec<usize>>,
+    loop_start: usize,
+) -> Result<ParsedGatePattern, String> {
+    validate_gate_holds(&gates, &holds)?;
+    Ok(ParsedGatePattern {
+        gates,
+        holds,
+        loop_start,
+    })
+}
+
+fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
     if let Expr::List(items) = expr {
         if let Some(Expr::Symbol(name)) = items.first() {
             match name.as_str() {
@@ -1522,7 +1577,7 @@ fn gate_pattern(expr: &Expr) -> Result<(Vec<Vec<bool>>, Vec<Vec<usize>>), String
                         .map(|gate| vec![gate])
                         .collect();
                     let holds = empty_holds_like(&gates);
-                    return Ok((gates, holds));
+                    return parsed_gate_pattern(gates, holds, 0);
                 }
                 "euclid-rot" => {
                     let pulses = number_arg(items, 1, "euclid-rot")? as usize;
@@ -1533,25 +1588,67 @@ fn gate_pattern(expr: &Expr) -> Result<(Vec<Vec<bool>>, Vec<Vec<usize>>), String
                         .map(|gate| vec![gate])
                         .collect();
                     let holds = empty_holds_like(&gates);
-                    return Ok((gates, holds));
+                    return parsed_gate_pattern(gates, holds, 0);
                 }
-                "rev" => {
-                    let source = items.get(1).ok_or("rev requires a pattern")?;
-                    let (mut gates, mut holds) = gate_pattern(source)?;
-                    gates.reverse();
-                    holds.reverse();
-                    validate_gate_holds(&gates, &holds)?;
-                    return Ok((gates, holds));
+                "rev" | "reverse" => {
+                    let source = items.get(1).ok_or("reverse requires a pattern")?;
+                    let mut pattern = gate_pattern(source)?;
+                    pattern.gates.reverse();
+                    pattern.holds.reverse();
+                    pattern.loop_start = 0;
+                    validate_gate_holds(&pattern.gates, &pattern.holds)?;
+                    return Ok(pattern);
+                }
+                "times" => {
+                    let count_expr = items.get(1).ok_or("times requires a count")?;
+                    let source = items.get(2).ok_or("times requires a pattern")?;
+                    if items.len() > 3 {
+                        return Err("times expects count and one pattern".to_string());
+                    }
+                    let count = usize_value(count_expr, "times")?;
+                    let pattern = gate_pattern(source)?;
+                    let mut gates = Vec::with_capacity(pattern.gates.len() * count);
+                    let mut holds = Vec::with_capacity(pattern.holds.len() * count);
+                    for _ in 0..count {
+                        gates.extend(pattern.gates.iter().cloned());
+                        holds.extend(pattern.holds.iter().cloned());
+                    }
+                    return parsed_gate_pattern(gates, holds, 0);
+                }
+                "then" => {
+                    if items.len() < 3 {
+                        return Err("then expects at least two patterns".to_string());
+                    }
+                    let mut gates = Vec::new();
+                    let mut holds = Vec::new();
+                    let mut loop_start = 0;
+                    for (idx, stage_expr) in items.iter().skip(1).enumerate() {
+                        if idx == items.len() - 2 {
+                            loop_start = gates.len();
+                        }
+                        let stage = gate_pattern(stage_expr)?;
+                        gates.extend(stage.gates);
+                        holds.extend(stage.holds);
+                    }
+                    return parsed_gate_pattern(gates, holds, loop_start);
                 }
                 "p" => {
-                    let Some(Expr::Vector(values)) = items.get(1) else {
-                        return Err("p requires a vector".to_string());
+                    let Some(source) = items.get(1) else {
+                        return Err("p requires a pattern".to_string());
                     };
-                    let pattern = values
-                        .iter()
-                        .map(gate_step_pattern)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    return gate_pattern_from_steps(pattern);
+                    if items.len() > 2 {
+                        return Err("p expects one pattern".to_string());
+                    }
+                    return match source {
+                        Expr::Vector(values) => {
+                            let pattern = values
+                                .iter()
+                                .map(gate_step_pattern)
+                                .collect::<Result<Vec<_>, _>>()?;
+                            gate_pattern_from_steps(pattern)
+                        }
+                        _ => gate_pattern(source),
+                    };
                 }
                 _ => {}
             }
@@ -1573,7 +1670,7 @@ fn gate_pattern(expr: &Expr) -> Result<(Vec<Vec<bool>>, Vec<Vec<usize>>), String
 }
 
 fn gate_subdivision_pattern(expr: &Expr) -> Result<Vec<Vec<bool>>, String> {
-    Ok(gate_pattern(expr)?.0)
+    Ok(gate_pattern(expr)?.gates)
 }
 
 #[derive(Clone, Debug)]
@@ -1582,9 +1679,7 @@ struct GateSlot {
     hold: usize,
 }
 
-fn gate_pattern_from_steps(
-    steps: Vec<Vec<GateSlot>>,
-) -> Result<(Vec<Vec<bool>>, Vec<Vec<usize>>), String> {
+fn gate_pattern_from_steps(steps: Vec<Vec<GateSlot>>) -> Result<ParsedGatePattern, String> {
     let gates: Vec<Vec<bool>> = steps
         .iter()
         .map(|step| step.iter().map(|slot| slot.gate).collect())
@@ -1593,8 +1688,7 @@ fn gate_pattern_from_steps(
         .iter()
         .map(|step| step.iter().map(|slot| slot.hold).collect())
         .collect();
-    validate_gate_holds(&gates, &holds)?;
-    Ok((gates, holds))
+    parsed_gate_pattern(gates, holds, 0)
 }
 
 fn empty_holds_like(gates: &[Vec<bool>]) -> Vec<Vec<usize>> {
@@ -1615,22 +1709,12 @@ fn flatten_hold_grid(holds: &[Vec<usize>]) -> Vec<usize> {
 fn validate_gate_holds(gates: &[Vec<bool>], holds: &[Vec<usize>]) -> Result<(), String> {
     let flat_gates = flatten_gate_grid(gates);
     let flat_holds = flatten_hold_grid(holds);
-    let total = flat_gates.len().max(1);
     for (idx, hold) in flat_holds.iter().copied().enumerate() {
         if hold == 0 {
             continue;
         }
         if !flat_gates.get(idx).copied().unwrap_or(false) {
             return Err("gate hold can only be attached to a hit".to_string());
-        }
-        for extension in 1..=hold {
-            let covered = (idx + extension) % total;
-            if flat_gates.get(covered).copied().unwrap_or(false) {
-                return Err(format!(
-                    "gate hold at slot {} overlaps another hit at slot {}",
-                    idx, covered
-                ));
-            }
         }
     }
     Ok(())

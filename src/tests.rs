@@ -28,6 +28,7 @@ use crate::effects::offline::{
 use crate::gui_render;
 use crate::language::eval_program;
 use crate::model::{NoteMode, Runtime};
+use crate::sequencer;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -51,6 +52,52 @@ fn parses_and_evaluates_track() {
     assert!(runtime.running);
     assert_eq!(runtime.tracks.len(), 1);
     assert_eq!(runtime.tracks["a"].notes.len(), 2);
+}
+
+#[test]
+fn supports_reverse_aliases() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(d :lead
+             :src :sine-synth
+             :note (reverse (p [c3 d3 e3]))
+             :gate (reverse (p [1 0 0]))
+             :amp (reverse (p [0.1 0.2 0.3])))
+         (start!)",
+    )
+    .unwrap();
+
+    let track = &runtime.tracks["lead"];
+    assert!(runtime.running);
+    assert!(track.notes[0] > track.notes[1]);
+    assert!(track.notes[1] > track.notes[2]);
+    assert_eq!(track.gates, vec![false, false, true]);
+    assert_eq!(track.param_patterns.amp, Some(vec![0.3, 0.2, 0.1]));
+}
+
+#[test]
+fn nested_note_pattern_steps_play_as_chords() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(d :chord
+             :src :sine-synth
+             :note (p [[c3 eb3 g3 bb3]])
+             :gate (p [1])
+             :dur 0.2
+             :amp 0.15)
+         (start!)",
+    )
+    .unwrap();
+
+    let track = &runtime.tracks["chord"];
+    assert_eq!(track.note_chords.len(), 1);
+    assert_eq!(track.note_chords[0].len(), 4);
+
+    let mut engine = AudioEngine::new(runtime, 48_000.0);
+    engine.next_sample();
+    assert_eq!(engine.active_voice_count_for_test(), 4);
 }
 
 #[test]
@@ -592,7 +639,10 @@ fn parses_per_hit_numeric_parameter_patterns() {
     assert_eq!(patterns.fm_depth.as_ref().unwrap(), &vec![2.0, 4.0]);
 
     let alias_patterns = &runtime.tracks["aliases"].param_patterns;
-    assert_eq!(alias_patterns.dur_seconds.as_ref().unwrap(), &vec![0.5, 0.25]);
+    assert_eq!(
+        alias_patterns.dur_seconds.as_ref().unwrap(),
+        &vec![0.5, 0.25]
+    );
     assert_eq!(
         alias_patterns.amp.as_ref().unwrap(),
         &vec![0.4, 0.3, 0.2, 0.1]
@@ -982,6 +1032,43 @@ fn supports_nested_gate_subdivisions() {
 }
 
 #[test]
+fn gate_then_times_plays_intro_then_loops_final_stage() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(d :lead
+            :src :sine-synth
+            :note c3
+            :gate (p (then
+                      (times 2 [0 0 0 1 0 0])
+                      [1 0 1 0]))
+            :amp 0.2)",
+    )
+    .unwrap();
+
+    let track = &runtime.tracks["lead"];
+    assert_eq!(
+        track.gates,
+        vec![
+            false, false, false, true, false, false, false, false, false, true, false, false, true,
+            false, true, false,
+        ]
+    );
+    assert_eq!(track.gate_loop_start, 12);
+
+    let played: Vec<bool> = (0..24)
+        .map(|step| sequencer::pattern_bool_with_loop(&track.gates, track.gate_loop_start, step))
+        .collect();
+    assert_eq!(
+        played,
+        vec![
+            false, false, false, true, false, false, false, false, false, true, false, false, true,
+            false, true, false, true, false, true, false, true, false, true, false,
+        ]
+    );
+}
+
+#[test]
 fn supports_gate_holds() {
     let mut runtime = Runtime::new();
     eval_program(
@@ -1010,21 +1097,18 @@ fn supports_gate_holds() {
 }
 
 #[test]
-fn gate_holds_reject_overlapping_hits() {
+fn gate_holds_can_overlap_later_hits() {
     let mut runtime = Runtime::new();
-    let err = eval_program(
+    eval_program(
         &mut runtime,
         "(d :lead :src :sine-synth :note c3 :gate (p [1 (gate-hold 2) 1 0]) :amp 0.2)",
     )
-    .unwrap_err();
-    assert!(err.contains("overlaps another hit"));
+    .unwrap();
 
-    let err = eval_program(
-        &mut runtime,
-        "(d :lead :src :sine-synth :note c3 :gate (p [1 0 0 (gate-hold 1)]) :amp 0.2)",
-    )
-    .unwrap_err();
-    assert!(err.contains("overlaps another hit"));
+    assert_eq!(
+        runtime.tracks["lead"].gate_holds,
+        vec![vec![0], vec![2], vec![0], vec![0]]
+    );
 }
 
 #[test]

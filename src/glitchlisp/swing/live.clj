@@ -217,6 +217,23 @@
     (.write writer (str command "\n"))
     (.flush writer)))
 
+(defn send-compiled-live-update!
+  [^JTextComponent editor-pane ^JLabel status compiled waiting-status]
+  (when-let [writer (:live-writer @shared/state)]
+    (when (live-process-running?)
+      (let [token (begin-live-update!)]
+        (schedule-live-update-timeout! status token))
+      (SwingUtilities/invokeLater #(shared/set-status! status waiting-status))
+      (locking writer
+        (.write writer "EVAL\n")
+        (.write writer compiled)
+        (when-not (str/ends-with? compiled "\n")
+          (.write writer "\n"))
+        (.write writer live-end-marker)
+        (.write writer "\n")
+        (.flush writer))
+      true)))
+
 (defn live-update!
   [^JFrame frame ^JTextComponent editor-pane ^JLabel status device ensure-renderer! preview-source require-playback-form! compile-source]
   (future
@@ -228,16 +245,7 @@
             preview (preview-source source)
             compiled (compile-source preview)
             writer (ensure-live-process! editor-pane status device ensure-renderer!)]
-        (let [token (begin-live-update!)]
-          (schedule-live-update-timeout! status token))
-        (SwingUtilities/invokeLater #(shared/set-status! status "waiting for live engine..."))
-        (.write writer "EVAL\n")
-        (.write writer compiled)
-        (when-not (str/ends-with? compiled "\n")
-          (.write writer "\n"))
-        (.write writer live-end-marker)
-        (.write writer "\n")
-        (.flush writer))
+        (send-compiled-live-update! editor-pane status compiled "waiting for live engine..."))
       (catch Exception ex
         (SwingUtilities/invokeLater
           #(do

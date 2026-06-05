@@ -44,8 +44,16 @@
 
 (defn insert-at-caret! [^JTextComponent editor text]
   (ensure-valid-caret! editor)
-  (.replaceSelection editor text)
-  (.requestFocusInWindow editor))
+  (let [start (min (.getSelectionStart editor) (.getSelectionEnd editor))
+        end (max (.getSelectionStart editor) (.getSelectionEnd editor))
+        doc (.getDocument editor)]
+    (.remove doc start (- end start))
+    (.insertString doc start text nil)
+    (.setCaretPosition editor (+ start (count text)))
+    (.requestFocusInWindow editor)))
+
+(defn replace-selection-with-text! [^JTextComponent editor text]
+  (insert-at-caret! editor text))
 
 (defn replace-text-range! [^JTextComponent editor text start end]
   (let [doc (.getDocument editor)]
@@ -251,10 +259,10 @@
           action-key
           (proxy [AbstractAction] []
             (actionPerformed [_]
-              (.replaceSelection editor
-                                 (str "\n"
-                                      (smart-next-line-indent (.getText editor)
-                                                              (.getCaretPosition editor)))))))
+              (let [insertion (str "\n"
+                                    (smart-next-line-indent (.getText editor)
+                                                            (.getCaretPosition editor)))]
+                (replace-selection-with-text! editor insertion)))))
     (.put (.getInputMap editor JComponent/WHEN_FOCUSED) tab tab-action-key)
     (.put (.getActionMap editor)
           tab-action-key
@@ -419,12 +427,12 @@
 (def syntax-max-highlight-chars 60000)
 
 (def syntax-form-names
-  #{"adsr" "and" "asdr" "block" "by-scene" "choose" "chord" "clear" "clear-all"
+  #{"adsr" "and" "arpeggio" "arp" "asdr" "block" "by-scene" "choose" "chord" "clear" "clear-all"
     "cue" "d" "def" "delay" "distort" "euclid" "euclid-rot" "every-n"
     "filter" "gate-hold" "gate-seq" "gate_seq" "gs" "interleave" "map"
     "master-fx" "mute" "not" "offset" "or" "p" "pan" "phaser" "play-block"
-    "play-note" "play-scene" "post-fx" "range" "repeat" "rev" "reverb"
-    "rotate" "s" "scale" "scene" "solo" "start!" "stop!" "take" "tracks" "transpose"
+    "play-note" "play-scene" "post-fx" "rand-range" "range" "repeat" "rev" "reverse" "reverb"
+    "rotate" "s" "scale" "scene" "shape" "solo" "start!" "stop!" "take" "then" "times" "tracks" "transpose"
     "unmute" "unsolo"})
 
 (defn syntax-attrs [^Color color]

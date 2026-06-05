@@ -25,6 +25,7 @@
 
 (load-swing-module! "glitchlisp/swing/shared.clj" "src/glitchlisp/swing/shared.clj")
 (load-swing-module! "glitchlisp/swing/catalog.clj" "src/glitchlisp/swing/catalog.clj")
+(load-swing-module! "glitchlisp/swing/docs.clj" "src/glitchlisp/swing/docs.clj")
 (load-swing-module! "glitchlisp/swing/editor.clj" "src/glitchlisp/swing/editor.clj")
 (load-swing-module! "glitchlisp/swing/render.clj" "src/glitchlisp/swing/render.clj")
 (load-swing-module! "glitchlisp/swing/live.clj" "src/glitchlisp/swing/live.clj")
@@ -42,10 +43,15 @@
 (def track-id-for-source glitchlisp.swing.catalog/track-id-for-source)
 (def defaults-for-source glitchlisp.swing.catalog/defaults-for-source)
 (def oscillator-parameter-examples glitchlisp.swing.catalog/oscillator-parameter-examples)
+(def oscillator-param-contracts glitchlisp.swing.catalog/oscillator-param-contracts)
 (def oscillator-structure-snippet glitchlisp.swing.catalog/oscillator-structure-snippet)
 (def oscillator-snippet glitchlisp.swing.catalog/oscillator-snippet)
+(def language-reference-text glitchlisp.swing.docs/language-reference-text)
+(def show-language-reference! glitchlisp.swing.docs/show-language-reference!)
 (def load-effects glitchlisp.swing.catalog/load-effects)
 (def effect-options glitchlisp.swing.catalog/effect-options)
+(def effect-param-contracts glitchlisp.swing.catalog/effect-param-contracts)
+(def effect-type-contracts glitchlisp.swing.catalog/effect-type-contracts)
 (def blank-effect-form glitchlisp.swing.catalog/blank-effect-form)
 (def state glitchlisp.swing.shared/state)
 (def set-status! glitchlisp.swing.shared/set-status!)
@@ -258,12 +264,72 @@
   (glitchlisp.swing.live/ensure-live-process! editor status device ensure-renderer!))
 
 (def send-live-command! glitchlisp.swing.live/send-live-command!)
+(def send-compiled-live-update! glitchlisp.swing.live/send-compiled-live-update!)
 
 (defn live-update! [^JFrame frame ^JTextComponent editor ^JLabel status device]
   (glitchlisp.swing.live/live-update!
     frame editor status device ensure-renderer! preview-source require-playback-form! compile-glitchlisp-source))
 
 (def live-stop! glitchlisp.swing.live/live-stop!)
+
+(def live-auto-update-delay-ms 450)
+(def live-auto-update-timer-key "glitchlisp.liveAutoUpdateTimer")
+
+(defn valid-live-compiled-source [source]
+  (require-playback-form! source)
+  (compile-glitchlisp-source (preview-source source)))
+
+(defn next-live-auto-edit-token! []
+  (:live-auto-edit-token
+    (swap! state update :live-auto-edit-token
+           #(inc (long (or % 0))))))
+
+(defn live-auto-apply-source! [^JTextComponent editor ^JLabel status source token]
+  (future
+    (try
+      (let [compiled (valid-live-compiled-source source)]
+        (when (and (= token (:live-auto-edit-token @state))
+                   (live-process-running?))
+          (swap! state assoc :live-auto-last-error nil)
+          (send-compiled-live-update! editor status compiled "live edit applied")))
+      (catch Exception ex
+        (when (= token (:live-auto-edit-token @state))
+          (swap! state assoc :live-auto-last-error (clean-error-message ex))
+          (SwingUtilities/invokeLater
+            #(when (live-process-running?)
+               (set-status! status "live edit pending: waiting for valid source"))))))))
+
+(defn schedule-live-auto-update! [^JTextComponent editor ^JLabel status]
+  (let [token (next-live-auto-edit-token!)]
+    (when (live-process-running?)
+      (when-let [^Timer timer (.getClientProperty editor live-auto-update-timer-key)]
+        (.putClientProperty editor "glitchlisp.liveAutoUpdateToken" token)
+        (.restart timer)))))
+
+(defn install-live-auto-update! [^JTextComponent editor ^JLabel status]
+  (when-not (.getClientProperty editor live-auto-update-timer-key)
+    (let [timer (Timer. live-auto-update-delay-ms nil)]
+      (.setRepeats timer false)
+      (.addActionListener
+        timer
+        (reify ActionListener
+          (actionPerformed [_ _]
+            (let [token (or (.getClientProperty editor "glitchlisp.liveAutoUpdateToken")
+                            (:live-auto-edit-token @state))
+                  source (.getText editor)]
+              (when (live-process-running?)
+                (live-auto-apply-source! editor status source token))))))
+      (.putClientProperty editor live-auto-update-timer-key timer)
+      (.addDocumentListener
+        (.getDocument editor)
+        (reify DocumentListener
+          (insertUpdate [_ _]
+            (when-not (.getClientProperty editor syntax-refreshing-key)
+              (schedule-live-auto-update! editor status)))
+          (removeUpdate [_ _]
+            (when-not (.getClientProperty editor syntax-refreshing-key)
+              (schedule-live-auto-update! editor status)))
+          (changedUpdate [_ _] nil))))))
 
 (defn save-current! [^JFrame frame ^JTextComponent editor ^JLabel status]
   (let [file (or (:file @state) (choose-file frame "Save"))]
@@ -331,7 +397,8 @@
     "Scene" ["scene" "scene chain" "by-scene track"]
     "Math / Logic" ["+" "-" "*" "/"
                     "map and" "map or" "map not" "map transpose"
-                    "range" "repeat" "rotate" "interleave"]
+                    "range" "repeat" "take" "reverse" "rotate" "interleave"
+                    "choose" "rand-range" "scale" "chord" "custom chord" "shape" "arpeggio" "transpose"]
     "Pattern" ["p :repeat" "every-n" "euclid-rot" "held gates" "nested subdivisions"]
     "Playback" ["play-scene" "bpm" "mute" "solo" "clear"]
     []))
@@ -363,10 +430,11 @@
      (= label "on :gate") nil
      :else (blank-effect-form label include-comments?))))
 
-(defn post-fx-form-for-label [label include-comments?]
-  (str "(post-fx [\n  "
-       (str/replace (effect-form-for-label label include-comments?) "\n" "\n  ")
-       "\n])\n"))
+(defn post-fx-form-for-label
+  ([label include-comments?]
+   (str "(post-fx [\n  "
+        (str/replace (effect-form-for-label label include-comments?) "\n" "\n  ")
+        "\n])\n")))
 
 (defn form-after-keyword [text start end keyword-text]
   (let [key-idx (.indexOf text keyword-text start)]
@@ -521,9 +589,44 @@
               [start end]))
           (sort-by first > ranges))))
 
+(defn enclosing-def-range [text caret]
+  (let [caret (max 0 (min caret (count text)))]
+    (some (fn [[start end]]
+            (when (<= start caret end)
+              [start end]))
+          (sort-by first > (form-ranges text "def")))))
+
+(defn enclosing-open-form-start [text caret symbols]
+  (let [caret (max 0 (min caret (count text)))]
+    (loop [idx (.lastIndexOf text "(" caret)]
+      (when (>= idx 0)
+        (if (and (some #(form-symbol-at? text idx %) symbols)
+                 (not (matching-close text idx \( \))))
+          idx
+          (recur (.lastIndexOf text "(" (dec idx))))))))
+
+(defn enclosing-open-scene-start [text caret]
+  (enclosing-open-form-start text caret ["scene" "block"]))
+
+(defn enclosing-open-def-start [text caret]
+  (enclosing-open-form-start text caret ["def"]))
+
 (defn scene-track-insert-offset [text caret]
   (when-let [[_ end] (enclosing-scene-range text caret)]
     end))
+
+(defn def-track-insert-offset [text caret]
+  (when-let [[_ end] (enclosing-def-range text caret)]
+    end))
+
+(defn trailing-whitespace-range-before [text offset]
+  (let [start (loop [idx offset]
+                (if (and (pos? idx)
+                         (Character/isWhitespace (.charAt text (dec idx))))
+                  (recur (dec idx))
+                  idx))]
+    (when (< start offset)
+      [start offset])))
 
 (defn scene-track-insertion [text offset snippet]
   (let [needs-leading-newline? (and (pos? offset)
@@ -582,18 +685,45 @@
   (if-let [[_ end] (enclosing-track-range text caret)]
     (inc end)
     (or (scene-track-insert-offset text caret)
+        (def-track-insert-offset text caret)
         (top-level-insert-offset text caret))))
 
 (defn insert-track-form! [^JTextComponent editor snippet]
   (let [text (.getText editor)
         caret (.getCaretPosition editor)
-        offset (track-form-insert-offset text caret)
-        insertion (if (and (not (enclosing-track-range text caret))
-                           (scene-track-insert-offset text caret))
-                    (scene-track-insertion text offset snippet)
-                    (ensure-leading-newline-for-top-level-insert text offset snippet))]
-    (.setCaretPosition editor offset)
-    (insert-at-caret! editor insertion)))
+        in-track? (boolean (enclosing-track-range text caret))
+        in-open-scene? (and (not in-track?) (boolean (enclosing-open-scene-start text caret)))
+        in-open-def? (and (not in-track?) (not in-open-scene?) (boolean (enclosing-open-def-start text caret)))
+        offset (if (or in-open-scene? in-open-def?)
+                 caret
+                 (track-form-insert-offset text caret))
+        in-scene? (and (not in-track?) (not in-open-scene?) (boolean (scene-track-insert-offset text caret)))
+        in-def? (and (not in-track?) (not in-open-def?) (not in-scene?) (boolean (def-track-insert-offset text caret)))
+        [replace-start replace-end] (if (or in-scene? in-def?)
+                                      (or (trailing-whitespace-range-before text offset)
+                                          [offset offset])
+                                      [offset offset])
+        [replace-start replace-end] (if (or in-open-scene? in-open-def?)
+                                      (or (trailing-whitespace-range-before text offset)
+                                          [offset offset])
+                                      [replace-start replace-end])
+        insertion (cond
+                    in-open-scene?
+                    (str (scene-track-insertion text replace-start snippet) ")")
+
+                    in-open-def?
+                    (str (ensure-leading-newline-for-top-level-insert text replace-start snippet) ")")
+
+                    in-scene?
+                    (scene-track-insertion text replace-start snippet)
+
+                    :else
+                    (ensure-leading-newline-for-top-level-insert text replace-start snippet))]
+    (if (< replace-start replace-end)
+      (replace-text-range! editor insertion replace-start replace-end)
+      (do
+        (.setCaretPosition editor offset)
+        (insert-at-caret! editor insertion)))))
 
 (defn track-insert-category? [category]
   (#{"Oscillator"} category))
@@ -687,8 +817,18 @@
                       "map transpose" "(map transpose [] 12)"
                       "range" "(range )"
                       "repeat" "(repeat 2 [])"
+                      "take" "(take 8 [])"
+                      "reverse" "(reverse [])"
                       "rotate" "(rotate 1 [])"
                       "interleave" "(interleave [] [])"
+                      "choose" "(choose :count 8 :seed 1 [])"
+                      "rand-range" "(rand-range :count 8 :seed 1 :min 0 :max 1)"
+                      "scale" "(scale c3 :minor 8)"
+                      "chord" "(chord c3 :minor7)"
+                      "custom chord" "(chord c3 [0 3 7 10])"
+                      "shape" "(shape (chord c3 :minor7) [2 4])"
+                      "arpeggio" "(arpeggio c3 :minor7)"
+                      "transpose" "(transpose c3 12)"
                       "")
      "Playback" (case option
                   "play-scene" (str "(play-scene :" scene ")\n")
@@ -721,6 +861,85 @@
           (= "Math / Logic" category) (insert-math-logic-form! editor option snippet)
           :else (insert-at-caret! editor snippet)))))))
 
+(def null-parameter-names
+  (delay
+    (->> (concat (keys oscillator-param-contracts)
+                 [":sample-path" ":sample" ":sample-data"]
+                 (keys effect-param-contracts)
+                 (mapcat keys (vals effect-type-contracts)))
+         distinct
+         (sort-by count >)
+         vec)))
+
+(defn null-param-line? [line]
+  (let [trimmed (str/trim line)]
+    (boolean
+      (some (fn [param]
+              (re-matches
+                (re-pattern (str (java.util.regex.Pattern/quote param)
+                                 "\\s+(?:null|nil)(?:\\s*;.*)?"))
+                trimmed))
+            @null-parameter-names))))
+
+(defn remove-inline-null-param-pairs [line]
+  (reduce (fn [[text changed?] param]
+            (let [pattern (re-pattern
+                            (str "\\s+"
+                                 (java.util.regex.Pattern/quote param)
+                                 "\\s+(?:null|nil)(?=(?:\\s|[\\)\\]]|;|$))"))
+                  updated (str/replace text pattern "")]
+              [updated (or changed? (not= text updated))]))
+          [line false]
+          @null-parameter-names))
+
+(defn clear-null-parameters-text [text]
+  (let [lines (str/split text #"\n" -1)]
+    (->> lines
+         (keep (fn [line]
+                 (when-not (null-param-line? line)
+                   (let [[updated changed?] (remove-inline-null-param-pairs line)]
+                     (if changed?
+                       (str/replace updated #"\s+;.*$" "")
+                       updated)))))
+         (str/join "\n"))))
+
+(defn set-editor-text-without-undo-event! [^JTextComponent editor text]
+  (let [previous (.getClientProperty editor syntax-refreshing-key)
+        doc (.getDocument editor)]
+    (.putClientProperty editor syntax-refreshing-key true)
+    (try
+      (.remove doc 0 (.getLength doc))
+      (.insertString doc 0 text nil)
+      (finally
+        (.putClientProperty editor syntax-refreshing-key previous)))))
+
+(defn replace-editor-text-undoably! [^JTextComponent editor before after edit-name]
+  (set-editor-text-without-undo-event! editor after)
+  (when-let [manager (editor-undo-manager editor)]
+    (.addEdit
+      manager
+      (proxy [javax.swing.undo.AbstractUndoableEdit] []
+        (getPresentationName [] edit-name)
+        (undo []
+          (proxy-super undo)
+          (set-editor-text-without-undo-event! editor before)
+          (.setCaretPosition editor 0))
+        (redo []
+          (proxy-super redo)
+          (set-editor-text-without-undo-event! editor after)
+          (.setCaretPosition editor 0))))))
+
+(defn clear-null-parameters! [^JTextComponent editor status]
+  (let [before (.getText editor)
+        after (clear-null-parameters-text before)]
+    (if (= before after)
+      (set-status! status "null parameters: none")
+      (do
+        (replace-editor-text-undoably! editor before after "Clear Null Parameters")
+        (.setCaretPosition editor 0)
+        (.requestFocusInWindow editor)
+        (set-status! status "null parameters: cleared")))))
+
 (defn build-ui [initial-file]
   (let [frame (JFrame. "temporaworkstation")
         editor (editor-pane)
@@ -738,6 +957,7 @@
     (install-syntax-highlighter! editor)
     (install-paren-highlighter! editor)
     (install-live-gate-range-cache! editor)
+    (install-live-auto-update! editor status)
     (.setLayout tools (BoxLayout. tools BoxLayout/Y_AXIS))
     (.setBorder tools (BorderFactory/createEmptyBorder 6 8 6 8))
     (.setPreferredSize tools (Dimension. 148 480))
@@ -835,8 +1055,12 @@
                                                     (if %
                                                       "insert comments: removed"
                                                       "insert comments: shown")))))
+          (.add preferences-menu
+                (menu-item "Clear Null Parameters"
+                           #(clear-null-parameters! editor status)))
           (.add audio-menu devices-menu)
           (.add audio-menu (menu-item "Refresh Devices" #(refresh-devices!)))
+          (.add about-menu (menu-item "Language Reference" #(show-language-reference! frame)))
           (.add about-menu (menu-item "About MeScript" #(show-about! frame)))
           (.add menu-bar file-menu)
           (.add menu-bar preferences-menu)
