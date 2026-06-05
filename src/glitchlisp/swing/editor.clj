@@ -5,13 +5,45 @@
     [java.awt Color Dimension Font Rectangle]
     [java.awt.event ActionListener MouseAdapter MouseEvent]
     [javax.swing.event CaretListener DocumentListener UndoableEditListener]
-    [javax.swing.text DefaultHighlighter$DefaultHighlightPainter JTextComponent SimpleAttributeSet StyleConstants StyledDocument]
-    [javax.swing AbstractAction BorderFactory JFrame JLabel JComponent JMenuItem JOptionPane JPopupMenu JTextField JTextPane KeyStroke SwingUtilities Timer]
+    [javax.swing.text DefaultCaret DefaultHighlighter$DefaultHighlightPainter JTextComponent SimpleAttributeSet StyleConstants StyledDocument]
+    [javax.swing AbstractAction BorderFactory JFrame JLabel JComponent JMenuItem JOptionPane JPopupMenu JTextField JTextPane JViewport KeyStroke SwingUtilities Timer]
     [javax.swing.undo UndoManager]))
 
 (def set-status! shared/set-status!)
 
+(defn document-length [^JTextComponent editor]
+  (.getLength (.getDocument editor)))
+
+(defn safe-caret-position [^JTextComponent editor]
+  (let [length (document-length editor)]
+    (try
+      (-> (.getCaretPosition editor)
+          (max 0)
+          (min length))
+      (catch Exception _
+        length))))
+
+(defn ensure-valid-caret! [^JTextComponent editor]
+  (let [position (safe-caret-position editor)]
+    (try
+      (.setCaretPosition editor position)
+      (catch Exception _
+        (.setCaretPosition editor (document-length editor))))
+    (safe-caret-position editor)))
+
+(defn safe-editor-caret []
+  (proxy [DefaultCaret] []
+    (focusLost [event]
+      (try
+        (when-let [component (.getComponent this)]
+          (let [length (.getLength (.getDocument component))
+                dot (-> (.getDot this) (max 0) (min length))]
+            (.setDot this dot)))
+        (proxy-super focusLost event)
+        (catch Exception _)))))
+
 (defn insert-at-caret! [^JTextComponent editor text]
+  (ensure-valid-caret! editor)
   (.replaceSelection editor text)
   (.requestFocusInWindow editor))
 
@@ -623,12 +655,26 @@
     (when (< start end)
       (paint-live-step-range! editor graphics [start end]))))
 
+(defn editor-text-width [^JTextComponent editor]
+  (let [metrics (.getFontMetrics editor (.getFont editor))]
+    (+ 24
+       (reduce max
+               0
+               (map #(.stringWidth metrics %)
+                    (str/split-lines (.getText editor)))))))
+
 (defn editor-pane []
   (let [editor (proxy [JTextPane] []
-                 (getScrollableTracksViewportWidth [] false)
+                 (getScrollableTracksViewportWidth []
+                   (let [parent (.getParent this)]
+                     (if (instance? JViewport parent)
+                       (> (.getWidth ^JViewport parent)
+                          (editor-text-width this))
+                       false)))
                  (paintComponent [graphics]
                    (proxy-super paintComponent graphics)
                    (paint-live-step-overlay! this graphics)))]
+    (.setCaret editor (safe-editor-caret))
     (install-standard-edit-controls! editor)
     editor))
 
@@ -1177,10 +1223,15 @@
        (map #(if (clojure.string/blank? %) % (str indent %)))
        (clojure.string/join "\n")))
 
-(defn scene-wrapper [scene body]
-  (str "(scene :" scene "\n"
-       (indent-lines (clojure.string/trim body) "  ")
-       ")\n"))
+(defn scene-wrapper
+  ([scene body]
+   (scene-wrapper scene body true))
+  ([scene body _include-comments?]
+   (str "(scene :" scene " :repeat 1\n"
+        "  ; :steps 16\n"
+        "  ; :bars 1\n"
+        (indent-lines (clojure.string/trim body) "  ")
+        ")\n")))
 
 (defn scene-block-range [^JTextComponent editor]
   (let [text (.getText editor)

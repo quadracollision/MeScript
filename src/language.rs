@@ -241,11 +241,19 @@ fn define_scene(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
                 repeats = usize_value(value, "repeat")?;
                 index += 2;
             }
-            "steps" | "length" | "bars" => {
+            "steps" | "length" => {
                 let value = items
                     .get(index + 1)
                     .ok_or("block :steps requires a value")?;
                 steps = usize_value(value, "steps")?.max(1);
+                explicit_steps = true;
+                index += 2;
+            }
+            "bars" => {
+                let value = items
+                    .get(index + 1)
+                    .ok_or("block :bars requires a value")?;
+                steps = usize_value(value, "bars")?.saturating_mul(16).max(1);
                 explicit_steps = true;
                 index += 2;
             }
@@ -560,7 +568,9 @@ fn numeric_param_pattern(
     normalize: fn(f32) -> f32,
 ) -> Result<Option<Vec<f32>>, String> {
     match expr {
-        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "p") => {
+        Expr::List(items)
+            if matches!(items.first(), Some(Expr::Symbol(name)) if numeric_pattern_form(name)) =>
+        {
             Ok(Some(
                 number_pattern(expr, false)?
                     .into_iter()
@@ -576,6 +586,10 @@ fn numeric_param_pattern(
         )),
         _ => Ok(None),
     }
+}
+
+fn numeric_pattern_form(name: &str) -> bool {
+    matches!(name, "p" | "g" | "gs" | "gate-seq" | "gate_seq")
 }
 
 fn set_f32_param_pattern_or_scalar(
@@ -1463,8 +1477,14 @@ fn pattern_values(items: &[Expr], notes: bool, name: &str) -> Result<Vec<f32>, S
 
 fn number_pattern(expr: &Expr, notes: bool) -> Result<Vec<f32>, String> {
     match expr {
-        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "p") => {
-            pattern_values(items, notes, "p")
+        Expr::List(items)
+            if matches!(items.first(), Some(Expr::Symbol(name)) if numeric_pattern_form(name)) =>
+        {
+            let name = match items.first() {
+                Some(Expr::Symbol(name)) => name.as_str(),
+                _ => "p",
+            };
+            pattern_values(items, notes, name)
         }
         Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "rev") => {
             let source = items.get(1).ok_or("rev requires a pattern")?;

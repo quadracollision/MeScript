@@ -58,6 +58,7 @@
 (def set-combo-items! glitchlisp.swing.shared/set-combo-items!)
 
 (def insert-at-caret! glitchlisp.swing.editor/insert-at-caret!)
+(def ensure-valid-caret! glitchlisp.swing.editor/ensure-valid-caret!)
 (def replace-text-range! glitchlisp.swing.editor/replace-text-range!)
 (def insert-text-at! glitchlisp.swing.editor/insert-text-at!)
 (def leading-spaces glitchlisp.swing.editor/leading-spaces)
@@ -283,6 +284,12 @@
                           (actionPerformed [_ _] (f (.isSelected item)))))
     item))
 
+(def about-text
+  "MeScript v0.2\nJune 4th 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
+
+(defn show-about! [^JFrame frame]
+  (JOptionPane/showMessageDialog frame about-text "About MeScript" JOptionPane/INFORMATION_MESSAGE))
+
 (defn choose-wav-file [parent]
   (let [chooser (JFileChooser. ".")]
     (.setSelectedFile chooser (File. "render.wav"))
@@ -338,8 +345,14 @@
              (oscillator-option-header? (.getItemAt form-combo 0)))
     (.setSelectedIndex form-combo 1)))
 
-(defn insert-scene-template [scene]
-  (str "(scene :" scene "\n  )\n"))
+(defn insert-scene-template
+  ([scene]
+   (insert-scene-template scene true))
+  ([scene _include-comments?]
+   (str "(scene :" scene " :repeat 1\n"
+        "  ; :steps 16\n"
+        "  ; :bars 1\n"
+        "  )\n")))
 
 (defn effect-form-for-label
   ([label]
@@ -499,24 +512,86 @@
     start
     (top-level-insert-offset text caret)))
 
-(defn insert-scene-form! [^JTextComponent editor snippet]
+(defn enclosing-scene-range [text caret]
+  (let [caret (max 0 (min caret (count text)))
+        ranges (concat (form-ranges text "scene")
+                       (form-ranges text "block"))]
+    (some (fn [[start end]]
+            (when (<= start caret end)
+              [start end]))
+          (sort-by first > ranges))))
+
+(defn scene-track-insert-offset [text caret]
+  (when-let [[_ end] (enclosing-scene-range text caret)]
+    end))
+
+(defn scene-track-insertion [text offset snippet]
+  (let [needs-leading-newline? (and (pos? offset)
+                                    (not= (.charAt text (dec offset)) \newline))]
+    (str (when needs-leading-newline? "\n")
+         (indent-lines (str/trim snippet) "  ")
+         "\n")))
+
+(defn scene-name-from-snippet [snippet]
+  (some-> (re-find #"\((?:scene|block)\s+:([^\s\)]+)" snippet)
+          second))
+
+(defn track-into-existing-scene [source scene [start end]]
+  (let [track-text (clojure.string/trim (range-text source [start (inc end)]))
+        without-track (remove-ranges source [[start end]])]
+    (if-let [[_ scene-end] (named-scene-range without-track scene)]
+      (let [insertion (str "\n" (indent-lines track-text "  "))]
+        (str (subs without-track 0 scene-end)
+             insertion
+             (subs without-track scene-end)))
+      source)))
+
+(defn wrap-track-in-scene [source scene [start end] include-comments?]
+  (let [track-text (range-text source [start (inc end)])
+        replacement (scene-wrapper scene track-text include-comments?)]
+    (str (subs source 0 start)
+         replacement
+         (subs source (inc end)))))
+
+(defn insert-scene-around-track! [^JTextComponent editor snippet scene track-range include-comments?]
+  (let [text (.getText editor)
+        updated (if (scene-exists? text scene)
+                  (track-into-existing-scene text scene track-range)
+                  (wrap-track-in-scene text scene track-range include-comments?))]
+    (.setText editor updated)
+    (when-let [[_ end] (named-scene-range updated scene)]
+      (.setCaretPosition editor (inc end)))))
+
+(defn insert-scene-form! [^JTextComponent editor snippet include-comments?]
   (let [text (.getText editor)
         caret (.getCaretPosition editor)
-        offset (scene-insert-offset text caret)
-        insertion (ensure-leading-newline-for-top-level-insert text offset snippet)]
-    (.setCaretPosition editor offset)
-    (insert-at-caret! editor insertion)))
+        scene (scene-name-from-snippet snippet)]
+    (if-let [track-range (top-level-track-range-at-caret text caret)]
+      (if scene
+        (insert-scene-around-track! editor snippet scene track-range include-comments?)
+        (let [offset (scene-insert-offset text caret)
+              insertion (ensure-leading-newline-for-top-level-insert text offset snippet)]
+          (.setCaretPosition editor offset)
+          (insert-at-caret! editor insertion)))
+      (let [offset (scene-insert-offset text caret)
+            insertion (ensure-leading-newline-for-top-level-insert text offset snippet)]
+        (.setCaretPosition editor offset)
+        (insert-at-caret! editor insertion)))))
 
 (defn track-form-insert-offset [text caret]
   (if-let [[_ end] (enclosing-track-range text caret)]
     (inc end)
-    (top-level-insert-offset text caret)))
+    (or (scene-track-insert-offset text caret)
+        (top-level-insert-offset text caret))))
 
 (defn insert-track-form! [^JTextComponent editor snippet]
   (let [text (.getText editor)
         caret (.getCaretPosition editor)
         offset (track-form-insert-offset text caret)
-        insertion (ensure-leading-newline-for-top-level-insert text offset snippet)]
+        insertion (if (and (not (enclosing-track-range text caret))
+                           (scene-track-insert-offset text caret))
+                    (scene-track-insertion text offset snippet)
+                    (ensure-leading-newline-for-top-level-insert text offset snippet))]
     (.setCaretPosition editor offset)
     (insert-at-caret! editor insertion)))
 
@@ -579,7 +654,7 @@
                 (effect-form-for-label option include-comments?))
      "Post FX" (post-fx-form-for-label option include-comments?)
      "Scene" (case option
-               "scene" (insert-scene-template scene)
+               "scene" (insert-scene-template scene include-comments?)
                "scene chain" (str "(scene :" scene " :next :next-scene\n"
                                   "  )\n\n"
                                   "(scene :next-scene\n"
@@ -625,6 +700,7 @@
      "")))
 
 (defn insert-selected-form! [^JTextComponent editor ^JComboBox category-combo ^JComboBox form-combo scene]
+  (ensure-valid-caret! editor)
   (let [category (str (.getSelectedItem category-combo))
         option (str (.getSelectedItem form-combo))
         snippet (insert-form-snippet editor
@@ -639,7 +715,7 @@
         (if (#{"FX" "Effect"} category)
         (insert-effect-smart! editor snippet)
         (cond
-          (= "Scene" category) (insert-scene-form! editor snippet)
+          (= "Scene" category) (insert-scene-form! editor snippet (not (:remove-insert-comments @state)))
           (top-level-insert-category? category) (insert-top-level-form! editor snippet)
           (track-insert-category? category) (insert-track-form! editor snippet)
           (= "Math / Logic" category) (insert-math-logic-form! editor option snippet)
@@ -713,6 +789,7 @@
       (let [menu-bar (JMenuBar.)
             file-menu (JMenu. "File")
             preferences-menu (JMenu. "Preferences")
+            about-menu (JMenu. "About")
             audio-menu (JMenu. "Audio")
             devices-menu (JMenu. "Output Device")]
         (letfn [(set-device-items! [devices]
@@ -760,9 +837,11 @@
                                                       "insert comments: shown")))))
           (.add audio-menu devices-menu)
           (.add audio-menu (menu-item "Refresh Devices" #(refresh-devices!)))
+          (.add about-menu (menu-item "About MeScript" #(show-about! frame)))
           (.add menu-bar file-menu)
           (.add menu-bar preferences-menu)
           (.add menu-bar audio-menu)
+          (.add menu-bar about-menu)
           (.setJMenuBar frame menu-bar)
           (refresh-devices!)))
 

@@ -565,7 +565,15 @@ fn parses_per_hit_numeric_parameter_patterns() {
             :unison-detune (p [4 8])
             :unison-spread (p [0.2 0.7])
             :fm-ratio (p [1.5 3.0])
-            :fm-depth (p [2.0 4.0]))",
+            :fm-depth (p [2.0 4.0]))
+         (d :aliases
+            :src :sine-synth
+            :note c3
+            :gate (p [1 0 1 0])
+            :dur (gate-seq [0.5 0.25])
+            :amp (gs [0.4 0.3 0.2 0.1])
+            :gain (g [1.0 0.8])
+            :unison (gs [2 4]))",
     )
     .unwrap();
 
@@ -582,6 +590,15 @@ fn parses_per_hit_numeric_parameter_patterns() {
     assert_eq!(patterns.unison_spread.as_ref().unwrap(), &vec![0.2, 0.7]);
     assert_eq!(patterns.fm_ratio.as_ref().unwrap(), &vec![1.5, 3.0]);
     assert_eq!(patterns.fm_depth.as_ref().unwrap(), &vec![2.0, 4.0]);
+
+    let alias_patterns = &runtime.tracks["aliases"].param_patterns;
+    assert_eq!(alias_patterns.dur_seconds.as_ref().unwrap(), &vec![0.5, 0.25]);
+    assert_eq!(
+        alias_patterns.amp.as_ref().unwrap(),
+        &vec![0.4, 0.3, 0.2, 0.1]
+    );
+    assert_eq!(alias_patterns.gain.as_ref().unwrap(), &vec![1.0, 0.8]);
+    assert_eq!(alias_patterns.unison.as_ref().unwrap(), &vec![2, 4]);
 }
 
 #[test]
@@ -754,6 +771,18 @@ fn scene_steps_of_uses_named_track_cycle() {
     )
     .unwrap();
     assert_eq!(runtime.scenes["intro"].steps, 12);
+}
+
+#[test]
+fn scene_bars_are_converted_to_sixteen_step_bars() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(scene :intro :bars 2 :repeat 1
+           (d :kick :src :kick-808 :note c1 :gate (p [1 0 0 0]) :amp 0.2))",
+    )
+    .unwrap();
+    assert_eq!(runtime.scenes["intro"].steps, 32);
 }
 
 #[test]
