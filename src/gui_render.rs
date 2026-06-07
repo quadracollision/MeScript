@@ -1,5 +1,7 @@
 use crate::audio;
-use crate::language::load_runtime;
+use crate::editor::editor_preview_source;
+use crate::language::{compile_source_for_runtime, eval_program};
+use crate::model::Runtime;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -22,7 +24,7 @@ pub(crate) fn run(default_seconds: f32) -> Result<(), String> {
     let seconds = ask_seconds(&tool, default_seconds)?.unwrap_or(default_seconds);
     let output = wav_output_path(&input, &output_dir)?;
 
-    match audio::render(load_runtime(path_to_str(&input)?)?, seconds, output.clone()) {
+    match render_selected_file(&input, seconds, output.clone()) {
         Ok(stats) => {
             show_info(
                 &tool,
@@ -41,6 +43,19 @@ pub(crate) fn run(default_seconds: f32) -> Result<(), String> {
             Err(error)
         }
     }
+}
+
+pub(crate) fn render_selected_file(
+    input: &Path,
+    seconds: f32,
+    output: PathBuf,
+) -> Result<audio::RenderStats, String> {
+    let source = std::fs::read_to_string(path_to_str(input)?).map_err(|error| error.to_string())?;
+    let preview = editor_preview_source(&source);
+    let preview = compile_source_for_runtime(&preview)?;
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &preview)?;
+    audio::render(runtime, seconds, output)
 }
 
 pub(crate) fn wav_output_path(input: &Path, output_dir: &Path) -> Result<PathBuf, String> {
@@ -147,9 +162,20 @@ fn ask_seconds(tool: &DialogTool, default_seconds: f32) -> Result<Option<f32>, S
     if text.is_empty() {
         return Ok(Some(default_seconds));
     }
-    text.parse::<f32>()
-        .map(Some)
-        .map_err(|_| format!("render seconds must be numeric, got '{}'", text))
+    parse_render_seconds(&text).map(Some)
+}
+
+pub(crate) fn parse_render_seconds(text: &str) -> Result<f32, String> {
+    let seconds = text
+        .parse::<f32>()
+        .map_err(|_| format!("render seconds must be numeric, got '{}'", text))?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(format!(
+            "render seconds must be greater than 0, got '{}'",
+            text
+        ));
+    }
+    Ok(seconds)
 }
 
 fn selection_from_output(output: Output) -> Result<Option<PathBuf>, String> {

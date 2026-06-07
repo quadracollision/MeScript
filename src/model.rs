@@ -165,6 +165,7 @@ pub(crate) struct Scene {
 pub(crate) struct SceneState {
     pub(crate) current: String,
     pub(crate) cycle: usize,
+    pub(crate) start_step: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -189,5 +190,40 @@ impl Runtime {
             scenes: HashMap::new(),
             scene_state: None,
         }
+    }
+
+    pub(crate) fn status_summary(&self) -> String {
+        let (scene, cycle) = if self.running {
+            self.scene_state
+                .as_ref()
+                .map(|state| {
+                    let scene = format!(":{}", state.current);
+                    let cycle = self
+                        .scenes
+                        .get(&state.current)
+                        .map(|scene| {
+                            if scene.repeats == 0 {
+                                format!("{}/loop", state.cycle + 1)
+                            } else {
+                                format!("{}/{}", state.cycle + 1, scene.repeats)
+                            }
+                        })
+                        .unwrap_or_else(|| (state.cycle + 1).to_string());
+                    (scene, cycle)
+                })
+                .unwrap_or_else(|| ("-".to_string(), "-".to_string()))
+        } else {
+            ("-".to_string(), "-".to_string())
+        };
+
+        format!(
+            "bpm={} running={} tracks={} scenes={} scene={} cycle={}",
+            self.bpm,
+            self.running,
+            self.tracks.len(),
+            self.scenes.len(),
+            scene,
+            cycle
+        )
     }
 }

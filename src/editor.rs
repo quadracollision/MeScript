@@ -1,5 +1,5 @@
 use crate::audio::open_output_stream;
-use crate::language::{apply_scene, eval_program};
+use crate::language::{apply_scene, compile_source_for_runtime, eval_program};
 use crate::model::Runtime;
 use cpal::traits::StreamTrait;
 use std::fmt::Write as _;
@@ -8,6 +8,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+
+pub(crate) const DEFAULT_SOURCE: &str = "";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EditorBuffer {
@@ -24,6 +26,7 @@ impl EditorBuffer {
         Self { lines, path }
     }
 
+    #[cfg(test)]
     pub(crate) fn empty(path: Option<PathBuf>) -> Self {
         Self {
             lines: Vec::new(),
@@ -116,14 +119,219 @@ pub(crate) fn apply_runtime_source(
     source: &str,
 ) -> Result<Runtime, String> {
     let mut next = Runtime::new();
-    eval_program(&mut next, source)?;
+    let source = compile_source_for_runtime(source)?;
+    eval_program(&mut next, &source)?;
     *runtime.lock().expect("runtime lock poisoned") = next.clone();
     Ok(next)
 }
 
+pub(crate) fn editor_run_message(snapshot: &Runtime) -> String {
+    format!("running {}", snapshot.status_summary())
+}
+
+pub(crate) fn editor_stop_message(snapshot: &Runtime) -> String {
+    format!("stopped {}", snapshot.status_summary())
+}
+
+pub(crate) fn editor_scene_message(action: &str, scene: &str, snapshot: &Runtime) -> String {
+    format!("{} scene :{} {}", action, scene, snapshot.status_summary())
+}
+
+pub(crate) fn editor_preview_source(source: &str) -> String {
+    if has_playback_command(source) {
+        source.to_string()
+    } else if let Some(scene) = first_scene_name(source) {
+        format!("{}\n\n(play-scene :{})", source.trim(), scene)
+    } else if has_top_level_playable(source) {
+        format!("{}\n\n(start!)", source.trim())
+    } else {
+        source.to_string()
+    }
+}
+
+#[derive(Debug)]
+struct TopLevelForm {
+    head: String,
+    first_arg: Option<String>,
+    start_line: usize,
+    end_line: usize,
+}
+
+fn read_form_token(source: &str, start: usize) -> Option<(String, usize)> {
+    let mut token_start = None;
+    for (offset, ch) in source[start..].char_indices() {
+        if token_start.is_none() && ch.is_whitespace() {
+            continue;
+        }
+        let absolute = start + offset;
+        if token_start.is_none() {
+            token_start = Some(absolute);
+        }
+        if ch.is_whitespace() || matches!(ch, '(' | ')' | '[' | ']') {
+            let begin = token_start?;
+            return (absolute > begin).then(|| (source[begin..absolute].to_string(), absolute));
+        }
+    }
+    let begin = token_start?;
+    Some((source[begin..].to_string(), source.len()))
+}
+
+fn top_level_forms(source: &str) -> Vec<TopLevelForm> {
+    let mut forms = Vec::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut in_comment = false;
+    let mut line = 0usize;
+    let mut pending: Option<TopLevelForm> = None;
+
+    for (idx, ch) in source.char_indices() {
+        if in_comment {
+            if ch == '\n' {
+                line += 1;
+            }
+            in_comment = ch != '\n';
+            continue;
+        }
+        if escape {
+            escape = false;
+            if ch == '\n' {
+                line += 1;
+            }
+            continue;
+        }
+        if in_string {
+            if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            } else if ch == '\n' {
+                line += 1;
+            }
+            continue;
+        }
+
+        match ch {
+            ';' => in_comment = true,
+            '"' => in_string = true,
+            '(' | '[' | '{' => {
+                if depth == 0 {
+                    if let Some((head, next)) = read_form_token(source, idx + ch.len_utf8()) {
+                        let first_arg = read_form_token(source, next).map(|(token, _)| token);
+                        pending = Some(TopLevelForm {
+                            head,
+                            first_arg,
+                            start_line: line,
+                            end_line: line,
+                        });
+                    }
+                }
+                depth += 1;
+            }
+            ')' | ']' | '}' => {
+                if depth == 1 {
+                    if let Some(mut form) = pending.take() {
+                        form.end_line = line;
+                        forms.push(form);
+                    }
+                }
+                depth = depth.saturating_sub(1);
+            }
+            '\n' => line += 1,
+            _ => {}
+        }
+    }
+    if let Some(mut form) = pending {
+        form.end_line = line;
+        forms.push(form);
+    }
+
+    forms
+}
+
+fn has_playback_command(source: &str) -> bool {
+    top_level_forms(source).iter().any(|form| {
+        matches!(
+            form.head.as_str(),
+            "start!" | "play-scene" | "play-block" | "cue"
+        )
+    })
+}
+
+fn first_scene_name(source: &str) -> Option<String> {
+    top_level_forms(source)
+        .into_iter()
+        .find(|form| matches!(form.head.as_str(), "scene" | "block"))
+        .and_then(|form| form.first_arg)
+        .and_then(|token| token.strip_prefix(':').map(str::to_string))
+}
+
+pub(crate) fn scene_name_for_cursor(lines: &[String], cursor_line: usize) -> Option<String> {
+    let source = lines.join("\n");
+    let forms = top_level_forms(&source);
+    for offset in 0..=3 {
+        let index = cursor_line.saturating_sub(offset);
+        if let Some(scene) = forms
+            .iter()
+            .find(|form| {
+                form.start_line == index
+                    && matches!(
+                        form.head.as_str(),
+                        "scene" | "block" | "play-scene" | "play-block" | "cue"
+                    )
+            })
+            .and_then(scene_name_from_form)
+        {
+            return Some(scene);
+        }
+    }
+
+    if let Some(scene) = forms
+        .iter()
+        .rev()
+        .find(|form| {
+            matches!(form.head.as_str(), "scene" | "block")
+                && form.start_line <= cursor_line
+                && cursor_line <= form.end_line
+        })
+        .and_then(scene_name_from_form)
+    {
+        return Some(scene);
+    }
+
+    unique_scene_definition_name(&forms)
+}
+
+fn scene_name_from_form(form: &TopLevelForm) -> Option<String> {
+    form.first_arg
+        .as_deref()
+        .and_then(|token| token.trim_end_matches(')').strip_prefix(':'))
+        .map(str::to_string)
+}
+
+fn unique_scene_definition_name(forms: &[TopLevelForm]) -> Option<String> {
+    let mut names = forms
+        .iter()
+        .filter(|form| matches!(form.head.as_str(), "scene" | "block"))
+        .filter_map(scene_name_from_form);
+    let first = names.next()?;
+    if names.next().is_none() {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn has_top_level_playable(source: &str) -> bool {
+    top_level_forms(source)
+        .iter()
+        .any(|form| matches!(form.head.as_str(), "d" | "sample"))
+}
+
 fn eval_live_form(runtime: &Arc<Mutex<Runtime>>, source: &str) -> Result<Runtime, String> {
+    let source = compile_source_for_runtime(source)?;
     let mut runtime_guard = runtime.lock().expect("runtime lock poisoned");
-    eval_program(&mut runtime_guard, source)?;
+    eval_program(&mut runtime_guard, &source)?;
     Ok(runtime_guard.clone())
 }
 
@@ -134,7 +342,7 @@ pub(crate) fn run(path: Option<&str>) -> Result<(), String> {
             fs::read_to_string(&path).map_err(|error| format!("{}: {}", path.display(), error))?;
         EditorBuffer::new(Some(path), source)
     } else {
-        EditorBuffer::empty(None)
+        EditorBuffer::new(None, DEFAULT_SOURCE.to_string())
     };
     if buffer.lines.is_empty() {
         buffer.lines.push(String::new());
@@ -142,7 +350,7 @@ pub(crate) fn run(path: Option<&str>) -> Result<(), String> {
 
     let runtime = Arc::new(Mutex::new(Runtime::new()));
     if !buffer.source().is_empty() {
-        apply_runtime_source(&runtime, &buffer.source())?;
+        apply_runtime_source(&runtime, &editor_preview_source(&buffer.source()))?;
     }
     let stream = open_output_stream(runtime.clone())?;
     stream.play().map_err(|error| error.to_string())?;
@@ -263,7 +471,7 @@ const OSCILLATOR_SNIPPETS: &[Snippet] = &[
     },
     Snippet {
         label: "scene",
-        text: "(scene :intro :steps 16 :repeat 2\n  \n)\n\n(play-scene :intro)\n",
+        text: "(scene :intro :loop true\n  \n)\n\n(play-scene :intro)\n",
     },
 ];
 
@@ -290,7 +498,7 @@ const EFFECT_SNIPPETS: &[Snippet] = &[
     },
     Snippet {
         label: "h3000",
-        text: "(h3000 :detune-cents 9 :delay-ms 18 :feedback 0.05 :mix 0.32)",
+        text: "(h3000 :detune-cents 9 :mix 0.32)",
     },
     Snippet {
         label: "sub bass",
@@ -322,7 +530,7 @@ impl EditorApp {
             active_block: None,
             selection_anchor: None,
             dirty: false,
-            message: "Ctrl-S save  Ctrl-R run  Ctrl-O osc  Ctrl-E fx  Ctrl-Q quit".to_string(),
+            message: "Ctrl-S save  Ctrl-R run  Ctrl-O osc  Ctrl-E fx  Ctrl-P cue  Ctrl-B loop  Ctrl-X stop  Ctrl-Q quit".to_string(),
             menu: None,
         }
     }
@@ -580,16 +788,11 @@ impl EditorApp {
             self.buffer.source()
         };
         let snapshot = if self.active_block.is_some() {
-            eval_live_form(&self.runtime, &source)?
+            eval_live_form(&self.runtime, &editor_preview_source(&source))?
         } else {
-            apply_runtime_source(&self.runtime, &source)?
+            apply_runtime_source(&self.runtime, &editor_preview_source(&source))?
         };
-        self.message = format!(
-            "running bpm={} running={} tracks={}",
-            snapshot.bpm,
-            snapshot.running,
-            snapshot.tracks.len()
-        );
+        self.message = editor_run_message(&snapshot);
         Ok(())
     }
 
@@ -598,10 +801,12 @@ impl EditorApp {
             "put cursor on a (scene :name ...), (block :name ...), or (play-scene :name) line",
         )?;
         let mut runtime = Runtime::new();
-        eval_program(&mut runtime, &self.buffer.source())?;
+        let source = compile_source_for_runtime(&self.buffer.source())?;
+        eval_program(&mut runtime, &source)?;
         apply_scene(&mut runtime, &scene)?;
+        let message = editor_scene_message("cued", &scene, &runtime);
         *self.runtime.lock().expect("runtime lock poisoned") = runtime;
-        self.message = format!("cued scene :{}", scene);
+        self.message = message;
         Ok(())
     }
 
@@ -610,14 +815,16 @@ impl EditorApp {
             "put cursor on a (scene :name ...), (block :name ...), or (play-scene :name) line",
         )?;
         let mut runtime = Runtime::new();
-        eval_program(&mut runtime, &self.buffer.source())?;
+        let source = compile_source_for_runtime(&self.buffer.source())?;
+        eval_program(&mut runtime, &source)?;
         let Some(scene_def) = runtime.scenes.get_mut(&scene) else {
             return Err(format!("unknown scene ':{}'", scene));
         };
         scene_def.next = Some(scene.clone());
         apply_scene(&mut runtime, &scene)?;
+        let message = editor_scene_message("looping", &scene, &runtime);
         *self.runtime.lock().expect("runtime lock poisoned") = runtime;
-        self.message = format!("looping scene :{}", scene);
+        self.message = message;
         Ok(())
     }
 
@@ -625,17 +832,11 @@ impl EditorApp {
         let mut runtime = self.runtime.lock().expect("runtime lock poisoned");
         runtime.running = false;
         runtime.scene_state = None;
-        self.message = "stopped".to_string();
+        self.message = editor_stop_message(&runtime);
     }
 
     fn scene_name_near_cursor(&self) -> Option<String> {
-        for offset in 0..=3 {
-            let index = self.cursor_line.saturating_sub(offset);
-            if let Some(scene) = scene_name_from_line(self.buffer.lines.get(index)?) {
-                return Some(scene);
-            }
-        }
-        None
+        scene_name_for_cursor(&self.buffer.lines, self.cursor_line)
     }
 
     fn terminal_size(&self) -> (usize, usize) {
@@ -781,18 +982,6 @@ impl EditorApp {
             width = width
         );
     }
-}
-
-fn scene_name_from_line(line: &str) -> Option<String> {
-    let trimmed = line.trim_start();
-    let rest = trimmed
-        .strip_prefix("(scene ")
-        .or_else(|| trimmed.strip_prefix("(block "))
-        .or_else(|| trimmed.strip_prefix("(play-scene "))
-        .or_else(|| trimmed.strip_prefix("(play-block "))
-        .or_else(|| trimmed.strip_prefix("(cue "))?;
-    let token = rest.split_whitespace().next()?.trim_end_matches(')');
-    token.strip_prefix(':').map(str::to_string)
 }
 
 fn read_key() -> io::Result<Key> {

@@ -5,8 +5,11 @@ use crate::model::{
     Waveform,
 };
 use crate::sequencer;
+use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
 enum Expr {
@@ -118,8 +121,136 @@ pub(crate) fn eval_program(runtime: &mut Runtime, source: &str) -> Result<(), St
     Ok(())
 }
 
+pub(crate) fn source_needs_compiler(source: &str) -> bool {
+    if tokenize(source)
+        .into_iter()
+        .any(|token| token.starts_with("1_"))
+    {
+        return true;
+    }
+    parse_program(source)
+        .map(|forms| forms.iter().any(expr_needs_compiler))
+        .unwrap_or(false)
+}
+
+fn expr_needs_compiler(expr: &Expr) -> bool {
+    match expr {
+        Expr::List(items) => {
+            let head = match items.first() {
+                Some(Expr::Symbol(head)) => head.as_str(),
+                _ => return items.iter().any(expr_needs_compiler),
+            };
+            if head == "p"
+                && (items.len() != 2
+                    || matches!(items.get(1), Some(Expr::Keyword(key)) if key == "repeat"))
+            {
+                return true;
+            }
+            if head == "times"
+                && (items.len() != 3
+                    || !matches!(items.get(1), Some(Expr::Number(value)) if *value > 0.0 && value.fract() == 0.0))
+            {
+                return true;
+            }
+            if head == "then" && items.len() < 3 {
+                return true;
+            }
+            matches!(
+                head,
+                "def"
+                    | "tracks"
+                    | "by-scene"
+                    | "+"
+                    | "-"
+                    | "*"
+                    | "/"
+                    | "and"
+                    | "or"
+                    | "not"
+                    | "map"
+                    | "range"
+                    | "repeat"
+                    | "take"
+                    | "rotate"
+                    | "interleave"
+                    | "every-n"
+                    | "choose"
+                    | "rand-range"
+                    | "scale"
+                    | "chord"
+                    | "shape"
+                    | "arpeggio"
+                    | "arp"
+                    | "transpose"
+            ) || items.iter().skip(1).any(expr_needs_compiler)
+        }
+        Expr::Vector(items) => items.iter().any(expr_needs_compiler),
+        _ => false,
+    }
+}
+
+pub(crate) fn compile_source_for_runtime(source: &str) -> Result<String, String> {
+    if !source_needs_compiler(source) {
+        return Ok(source.to_string());
+    }
+    let compiler_path = Path::new("src/compiler.clj");
+    if !compiler_path.exists() {
+        return Err(
+            "source uses compiler helper forms, but src/compiler.clj was not found".to_string(),
+        );
+    }
+    let mut child = Command::new("clojure")
+        .args([
+            "-J-XX:+PerfDisableSharedMem",
+            "-M",
+            "-e",
+            "(do (load-file \"src/compiler.clj\") (print (glitchlisp-compiler/compile-source (slurp *in*))))",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to run Clojure compiler: {}", error))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or("failed to open compiler stdin")?
+        .write_all(source.as_bytes())
+        .map_err(|error| format!("failed to send source to compiler: {}", error))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to wait for compiler: {}", error))?;
+    if output.status.success() {
+        String::from_utf8(output.stdout).map_err(|error| error.to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            "compiler failed without an error message".to_string()
+        } else {
+            clean_compiler_error(&stderr)
+        })
+    }
+}
+
+fn clean_compiler_error(stderr: &str) -> String {
+    let mut lines = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    while let Some(line) = lines.next() {
+        if line.starts_with("Execution error") {
+            return lines.next().unwrap_or(line).to_string();
+        }
+        if line.starts_with("Full report at:") {
+            break;
+        }
+    }
+    stderr.to_string()
+}
+
 pub(crate) fn load_runtime(path: &str) -> Result<Runtime, String> {
     let source = fs::read_to_string(path).map_err(|error| format!("{}: {}", path, error))?;
+    let source = compile_source_for_runtime(&source)?;
     let mut runtime = Runtime::new();
     eval_program(&mut runtime, &source)?;
     Ok(runtime)
@@ -135,21 +266,33 @@ fn eval_form(runtime: &mut Runtime, expr: &Expr) -> Result<(), String> {
 
     match name.as_str() {
         "bpm" => {
-            runtime.bpm = number_arg(items, 1, "bpm")?.clamp(20.0, 320.0);
+            expect_arity(items, "bpm", 2)?;
+            runtime.bpm = bpm_value(number_arg(items, 1, "bpm")?)?;
             Ok(())
         }
         "start!" => {
+            expect_arity(items, "start!", 1)?;
+            if runtime.tracks.is_empty() {
+                return if runtime.scenes.is_empty() {
+                    Err("start! requires at least one top-level track".to_string())
+                } else {
+                    Err("start! only starts top-level tracks; use (play-scene :scene-name) for scenes".to_string())
+                };
+            }
             runtime.running = true;
             Ok(())
         }
         "stop!" => {
+            expect_arity(items, "stop!", 1)?;
             runtime.running = false;
             runtime.scene_state = None;
             Ok(())
         }
         "block" | "scene" => define_scene(runtime, items),
-        "play-block" | "play-scene" | "cue" => play_scene(runtime, items),
+        "sample" => define_sample_track(runtime, items),
+        "play-block" | "play-scene" | "cue" => play_scene(runtime, items, name),
         "play-note" => {
+            expect_arity(items, "play-note", 2)?;
             let freq = number_arg(items, 1, "play-note")?;
             runtime.tracks.insert(
                 "tone".to_string(),
@@ -179,21 +322,28 @@ fn eval_form(runtime: &mut Runtime, expr: &Expr) -> Result<(), String> {
             Ok(())
         }
         "post-fx" | "master-fx" => {
+            expect_arity(items, name, 2)?;
             runtime.post_effects =
                 offline_effect_chain(items.get(1).ok_or("post-fx requires an effect vector")?)?;
             Ok(())
         }
         "d" => define_track(runtime, items),
         "clear" => {
+            expect_arity(items, "clear", 2)?;
             let id = keyword_arg(items, 1, "clear")?;
-            runtime.tracks.remove(&id);
-            Ok(())
+            runtime
+                .tracks
+                .remove(&id)
+                .map(|_| ())
+                .ok_or_else(|| format!("unknown track ':{}'", id))
         }
         "clear-all" => {
+            expect_arity(items, "clear-all", 1)?;
             runtime.tracks.clear();
             runtime.post_effects.clear();
             runtime.scenes.clear();
             runtime.scene_state = None;
+            runtime.running = false;
             Ok(())
         }
         "mute" => set_track_flag(runtime, items, "mute", true, false),
@@ -204,19 +354,59 @@ fn eval_form(runtime: &mut Runtime, expr: &Expr) -> Result<(), String> {
     }
 }
 
+fn expect_arity(items: &[Expr], form: &str, expected: usize) -> Result<(), String> {
+    if items.len() == expected {
+        Ok(())
+    } else if expected == 1 {
+        Err(format!("{} expects no arguments", form))
+    } else {
+        Err(format!(
+            "{} expects exactly {} argument",
+            form,
+            expected - 1
+        ))
+    }
+}
+
 pub(crate) fn apply_scene(runtime: &mut Runtime, id: &str) -> Result<(), String> {
     let scene = runtime
         .scenes
         .get(id)
         .cloned()
         .ok_or_else(|| format!("unknown scene ':{}'", id))?;
+    validate_scene_next_targets(runtime, id)?;
     runtime.tracks = scene.tracks;
     runtime.post_effects = scene.post_effects;
     runtime.scene_state = Some(SceneState {
         current: scene.id,
         cycle: 0,
+        start_step: 0,
     });
     runtime.running = true;
+    Ok(())
+}
+
+fn validate_scene_next_targets(runtime: &Runtime, start: &str) -> Result<(), String> {
+    let mut current = start.to_string();
+    let mut visited = HashSet::new();
+    while visited.insert(current.clone()) {
+        let Some(scene) = runtime.scenes.get(&current) else {
+            return Err(format!("unknown scene ':{}'", current));
+        };
+        if scene.repeats == 0 {
+            return Ok(());
+        }
+        let Some(next) = &scene.next else {
+            return Ok(());
+        };
+        if !runtime.scenes.contains_key(next) {
+            return Err(format!(
+                "scene ':{}' :next references unknown scene ':{}'",
+                scene.id, next
+            ));
+        }
+        current = next.clone();
+    }
     Ok(())
 }
 
@@ -226,46 +416,83 @@ fn define_scene(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
     };
 
     let mut repeats = 0;
+    let mut explicit_repeats = false;
     let mut steps = 0;
     let mut explicit_steps = false;
     let mut steps_of = None;
+    let mut loop_by = None;
+    let mut bars = None;
+    let mut bar_steps = None;
+    let mut bar_steps_of = None;
     let mut next = None;
+    let mut seen_options = HashSet::new();
     let mut index = 2;
     while index < items.len() {
         let Expr::Keyword(key) = &items[index] else {
             break;
         };
+        let canonical_key = scene_option_canonical_key(key);
+        if !seen_options.insert(canonical_key) {
+            return Err(format!("duplicate scene option ':{}'", key));
+        }
         match key.as_str() {
             "repeat" | "repeats" | "times" => {
                 let value = items
                     .get(index + 1)
-                    .ok_or("block :repeat requires a value")?;
+                    .ok_or("scene :repeat requires a value")?;
                 repeats = usize_value(value, "repeat")?;
+                explicit_repeats = true;
+                index += 2;
+            }
+            "loop" => {
+                let value = items.get(index + 1).ok_or("scene :loop requires a value")?;
+                loop_true_value(value)?;
+                repeats = 0;
+                explicit_repeats = true;
                 index += 2;
             }
             "steps" | "length" => {
                 let value = items
                     .get(index + 1)
-                    .ok_or("block :steps requires a value")?;
-                steps = usize_value(value, "steps")?.max(1);
+                    .ok_or("scene :steps requires a value")?;
+                steps = positive_usize_value(value, "steps")?;
                 explicit_steps = true;
                 index += 2;
             }
             "bars" => {
-                let value = items.get(index + 1).ok_or("block :bars requires a value")?;
-                steps = usize_value(value, "bars")?.saturating_mul(16).max(1);
+                let value = items.get(index + 1).ok_or("scene :bars requires a value")?;
+                bars = Some(positive_usize_value(value, "bars")?);
                 explicit_steps = true;
                 index += 2;
             }
-            "steps-of" | "length-of" => {
-                steps_of = Some(keyword_arg(items, index + 1, "block :steps-of")?);
+            "bar-steps" | "bar-length" => {
+                let value = items
+                    .get(index + 1)
+                    .ok_or("scene :bar-steps requires a value")?;
+                bar_steps = Some(positive_usize_value(value, "bar-steps")?);
                 index += 2;
+            }
+            "bar-steps-of" | "bar-length-of" => {
+                bar_steps_of = Some(keyword_arg(items, index + 1, "scene :bar-steps-of")?);
+                index += 2;
+            }
+            "steps-of" | "length-of" => {
+                steps_of = Some(keyword_arg(items, index + 1, "scene :steps-of")?);
+                index += 2;
+            }
+            "loop-by" => {
+                let track_id = keyword_arg(items, index + 1, "scene :loop-by")?;
+                let count = items
+                    .get(index + 2)
+                    .ok_or("scene :loop-by requires a count")?;
+                loop_by = Some((track_id, positive_usize_value(count, "loop-by")?));
+                index += 3;
             }
             "next" => {
-                next = Some(keyword_arg(items, index + 1, "block :next")?);
+                next = Some(keyword_arg(items, index + 1, "scene :next")?);
                 index += 2;
             }
-            _ => break,
+            _ => return Err(format!("unknown scene option ':{}'", key)),
         }
     }
 
@@ -276,14 +503,40 @@ fn define_scene(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
         index += 1;
     }
 
+    let has_loop_by = loop_by.is_some();
     if let Some(track_id) = steps_of {
         let track = block_runtime
             .tracks
             .get(&track_id)
-            .ok_or_else(|| format!("block :steps-of references unknown track ':{}'", track_id))?;
+            .ok_or_else(|| format!("scene :steps-of references unknown track ':{}'", track_id))?;
         steps = inferred_track_steps(track);
+    } else if let Some((track_id, count)) = loop_by {
+        let track = block_runtime
+            .tracks
+            .get(&track_id)
+            .ok_or_else(|| format!("scene :loop-by references unknown track ':{}'", track_id))?;
+        steps = count.saturating_mul(inferred_track_steps(track));
+    } else if let Some(bars) = bars {
+        let per_bar = if let Some(track_id) = bar_steps_of {
+            let track = block_runtime.tracks.get(&track_id).ok_or_else(|| {
+                format!(
+                    "scene :bar-steps-of references unknown track ':{}'",
+                    track_id
+                )
+            })?;
+            inferred_track_steps(track)
+        } else {
+            bar_steps.unwrap_or(16)
+        };
+        steps = bars.saturating_mul(per_bar);
+    } else if bar_steps.is_some() || bar_steps_of.is_some() {
+        return Err("scene :bar-steps requires :bars".to_string());
     } else if !explicit_steps {
         steps = inferred_scene_steps(&block_runtime)?;
+    }
+
+    if has_loop_by && next.is_some() && !explicit_repeats {
+        repeats = 1;
     }
 
     runtime.scenes.insert(
@@ -298,6 +551,88 @@ fn define_scene(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
         },
     );
     Ok(())
+}
+
+fn define_sample_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
+    let id = items.get(1).ok_or("sample requires a track id")?.clone();
+    if !matches!(id, Expr::Keyword(_)) {
+        return Err("sample track id must be a keyword".to_string());
+    }
+    let sample_arg = items
+        .get(2)
+        .ok_or("sample requires a wav path or :sample-data")?
+        .clone();
+    let inline_options = matches!(sample_arg, Expr::Keyword(_));
+    let options_start = if inline_options { 2 } else { 3 };
+    validate_sample_options(items, options_start)?;
+    let mut track_items = vec![
+        Expr::Symbol("d".to_string()),
+        id,
+        Expr::Keyword("src".to_string()),
+        Expr::Keyword("sample".to_string()),
+    ];
+    if !inline_options {
+        track_items.push(Expr::Keyword("sample-path".to_string()));
+        track_items.push(sample_arg);
+    }
+    for (key, value) in [
+        ("note", Expr::Symbol("c3".to_string())),
+        ("gate", Expr::Number(1.0)),
+        ("dur", Expr::Number(1.0)),
+        ("amp", Expr::Number(1.0)),
+    ] {
+        if !track_options_contain_from(items, options_start, key) {
+            track_items.push(Expr::Keyword(key.to_string()));
+            track_items.push(value);
+        }
+    }
+    track_items.extend(items.iter().skip(options_start).cloned());
+    if inline_options
+        && !track_options_contain_any_from(
+            items,
+            options_start,
+            &[
+                "sample-data",
+                "sample_data",
+                "sample",
+                "sample-path",
+                "sample_path",
+            ],
+        )
+    {
+        return Err("sample requires a wav path or :sample-data".to_string());
+    }
+    define_track(runtime, &track_items)
+}
+
+fn validate_sample_options(items: &[Expr], start: usize) -> Result<(), String> {
+    let mut index = start;
+    while index < items.len() {
+        let Expr::Keyword(key) = &items[index] else {
+            return Err("sample options must be keyword/value pairs".to_string());
+        };
+        if index + 1 >= items.len() {
+            return Err(format!("sample :{} requires a value", key));
+        }
+        index += 2;
+    }
+    Ok(())
+}
+
+fn track_options_contain_from(items: &[Expr], start: usize, key: &str) -> bool {
+    items
+        .iter()
+        .skip(start)
+        .step_by(2)
+        .any(|expr| matches!(expr, Expr::Keyword(name) if name == key))
+}
+
+fn track_options_contain_any_from(items: &[Expr], start: usize, keys: &[&str]) -> bool {
+    items
+        .iter()
+        .skip(start)
+        .step_by(2)
+        .any(|expr| matches!(expr, Expr::Keyword(name) if keys.contains(&name.as_str())))
 }
 
 fn inferred_scene_steps(runtime: &Runtime) -> Result<usize, String> {
@@ -336,8 +671,11 @@ fn inferred_track_steps(track: &Track) -> usize {
     track.step_every.max(1) * lcm(gate_length, note_period)
 }
 
-fn play_scene(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
-    let id = keyword_arg(items, 1, "play-scene")?;
+fn play_scene(runtime: &mut Runtime, items: &[Expr], form: &str) -> Result<(), String> {
+    if items.len() > 2 {
+        return Err(format!("{} expects exactly one scene keyword", form));
+    }
+    let id = keyword_arg(items, 1, form)?;
     apply_scene(runtime, &id)
 }
 
@@ -348,6 +686,29 @@ fn keyword_arg(items: &[Expr], index: usize, form: &str) -> Result<String, Strin
     }
 }
 
+fn scene_option_canonical_key(key: &str) -> &str {
+    match key {
+        "repeat" | "repeats" | "times" | "loop" => "repeat",
+        "steps" | "length" | "bars" | "steps-of" | "length-of" | "loop-by" => "steps",
+        "bar-steps" | "bar-length" | "bar-steps-of" | "bar-length-of" => "bar-steps",
+        other => other,
+    }
+}
+
+fn track_param_canonical_key(key: &str) -> &str {
+    match key {
+        "detune" | "detune-cents" => "detune",
+        "pulse-width" | "pulse_width" | "pw" => "pulse-width",
+        "morph" | "morph-pos" | "morph_pos" => "morph",
+        "unison-detune" | "unison_detune" => "unison-detune",
+        "unison-spread" | "unison_spread" | "spread" => "unison-spread",
+        "fm-ratio" | "fm_ratio" => "fm-ratio",
+        "fm-depth" | "fm_depth" => "fm-depth",
+        "sample" | "sample-path" | "sample_path" | "sample-data" | "sample_data" => "sample",
+        other => other,
+    }
+}
+
 fn set_track_flag(
     runtime: &mut Runtime,
     items: &[Expr],
@@ -355,6 +716,7 @@ fn set_track_flag(
     value: bool,
     solo: bool,
 ) -> Result<(), String> {
+    expect_arity(items, form, 2)?;
     let id = keyword_arg(items, 1, form)?;
     let track = runtime
         .tracks
@@ -400,13 +762,18 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
     }
 
     let mut index = 2;
+    let mut seen_parameters = HashSet::new();
     while index < items.len() {
         let Expr::Keyword(key) = &items[index] else {
             return Err("track parameters must be keyword/value pairs".to_string());
         };
+        let canonical_key = track_param_canonical_key(key);
+        if !seen_parameters.insert(canonical_key) {
+            return Err(format!("duplicate track parameter ':{}'", key));
+        }
         let value = items
             .get(index + 1)
-            .ok_or("missing track parameter value")?;
+            .ok_or_else(|| format!("track parameter ':{}' requires a value", key))?;
         if null_value(value) {
             index += 2;
             continue;
@@ -436,6 +803,7 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
                     &mut track.param_patterns.detune_cents,
                     &mut track.oscillator.detune_cents,
                     |value| value,
+                    key,
                 )?;
             }
             "phase" => {
@@ -444,71 +812,86 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
                     &mut track.param_patterns.phase,
                     &mut track.oscillator.phase,
                     |value| value.rem_euclid(1.0),
+                    key,
                 )?;
             }
             "pulse-width" | "pulse_width" | "pw" => {
-                set_f32_param_pattern_or_scalar(
+                set_bounded_f32_param_pattern_or_scalar(
                     value,
                     &mut track.param_patterns.pulse_width,
                     &mut track.oscillator.pulse_width,
-                    |value| value.clamp(0.01, 0.99),
+                    0.01,
+                    0.99,
+                    key,
                 )?;
             }
             "morph" | "morph-pos" | "morph_pos" => {
-                set_f32_param_pattern_or_scalar(
+                set_bounded_f32_param_pattern_or_scalar(
                     value,
                     &mut track.param_patterns.morph_pos,
                     &mut track.oscillator.morph_pos,
-                    |value| value.clamp(0.0, 1.0),
+                    0.0,
+                    1.0,
+                    key,
                 )?;
             }
             "gain" => {
-                set_f32_param_pattern_or_scalar(
+                set_bounded_f32_param_pattern_or_scalar(
                     value,
                     &mut track.param_patterns.gain,
                     &mut track.oscillator.gain,
-                    |value| value.clamp(0.0, 2.0),
+                    0.0,
+                    2.0,
+                    key,
                 )?;
             }
             "unison" => {
-                set_usize_param_pattern_or_scalar(
+                set_bounded_usize_param_pattern_or_scalar(
                     value,
                     &mut track.param_patterns.unison,
                     &mut track.oscillator.unison,
-                    |value| value.clamp(1, 10),
+                    1,
+                    10,
                     "unison",
                 )?;
             }
             "unison-detune" | "unison_detune" => {
-                set_f32_param_pattern_or_scalar(
+                set_bounded_f32_param_pattern_or_scalar(
                     value,
                     &mut track.param_patterns.unison_detune,
                     &mut track.oscillator.unison_detune,
-                    |value| value.clamp(0.0, 100.0),
+                    0.0,
+                    100.0,
+                    key,
                 )?;
             }
             "unison-spread" | "unison_spread" | "spread" => {
-                set_f32_param_pattern_or_scalar(
+                set_bounded_f32_param_pattern_or_scalar(
                     value,
                     &mut track.param_patterns.unison_spread,
                     &mut track.oscillator.unison_spread,
-                    |value| value.clamp(0.0, 1.0),
+                    0.0,
+                    1.0,
+                    key,
                 )?;
             }
             "fm-ratio" | "fm_ratio" => {
-                set_f32_param_pattern_or_scalar(
+                set_min_f32_param_pattern_or_scalar(
                     value,
                     &mut track.param_patterns.fm_ratio,
                     &mut track.oscillator.fm_ratio,
-                    |value| value.max(0.01),
+                    0.01,
+                    key,
                 )?;
             }
             "fm-depth" | "fm_depth" => {
-                set_f32_param_pattern_or_scalar(
+                set_bounded_f32_param_pattern_or_scalar(
                     value,
                     &mut track.param_patterns.fm_depth,
                     &mut track.oscillator.fm_depth,
-                    |value| value.clamp(0.0, 32.0),
+                    0.0,
+                    32.0,
+                    key,
                 )?;
             }
             "harmonics" => track.oscillator.harmonics = harmonic_values(value)?,
@@ -520,26 +903,30 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
                 track.sample_data = sample_values(value)?;
                 track.waveform = Waveform::Sample;
             }
-            "every" => track.step_every = usize_value(value, "every")?.max(1),
+            "every" => track.step_every = positive_usize_value(value, "every")?,
             "offset" => track.step_offset = usize_value(value, "offset")?,
             "amp" => {
-                set_f32_param_pattern_or_scalar(
+                set_bounded_f32_param_pattern_or_scalar(
                     value,
                     &mut track.param_patterns.amp,
                     &mut track.amp,
-                    |value| value.clamp(0.0, 1.0),
+                    0.0,
+                    1.0,
+                    key,
                 )?;
             }
             "dur" => {
-                set_f32_param_pattern_or_scalar(
+                set_bounded_f32_param_pattern_or_scalar(
                     value,
                     &mut track.param_patterns.dur_seconds,
                     &mut track.dur_seconds,
-                    |value| value.clamp(0.005, 4.0),
+                    0.005,
+                    4.0,
+                    key,
                 )?;
             }
             "fx" => track.effects = effect_chain(value)?,
-            _ => {}
+            _ => return Err(format!("unknown track parameter ':{}'", key)),
         }
         index += 2;
     }
@@ -555,6 +942,22 @@ fn number_arg(items: &[Expr], index: usize, form: &str) -> Result<f32, String> {
     number_value(value)
 }
 
+fn bpm_value(value: f32) -> Result<f32, String> {
+    if (20.0..=320.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "bpm must be between 20 and 320, got {}",
+            trim_float(value)
+        ))
+    }
+}
+
+fn trim_float(value: f32) -> String {
+    let text = value.to_string();
+    text.strip_suffix(".0").unwrap_or(&text).to_string()
+}
+
 fn number_value(expr: &Expr) -> Result<f32, String> {
     match expr {
         Expr::Number(value) => Ok(*value),
@@ -565,6 +968,23 @@ fn number_value(expr: &Expr) -> Result<f32, String> {
 
 fn null_value(expr: &Expr) -> bool {
     matches!(expr, Expr::Symbol(name) if matches!(name.as_str(), "nil" | "null"))
+}
+
+fn bool_value(expr: &Expr, name: &str) -> Result<bool, String> {
+    match expr {
+        Expr::Symbol(value) if value == "true" => Ok(true),
+        Expr::Symbol(value) if value == "false" => Ok(false),
+        Expr::Number(value) => Ok(*value != 0.0),
+        _ => Err(format!("{} must be true or false", name)),
+    }
+}
+
+fn loop_true_value(expr: &Expr) -> Result<(), String> {
+    if bool_value(expr, "loop")? {
+        Ok(())
+    } else {
+        Err("scene :loop only accepts true; use :repeat N for finite scenes".to_string())
+    }
 }
 
 fn numeric_param_pattern(
@@ -599,7 +1019,7 @@ fn numeric_param_pattern(
 }
 
 fn numeric_pattern_form(name: &str) -> bool {
-    matches!(name, "p" | "g" | "gs" | "gate-seq" | "gate_seq")
+    matches!(name, "p" | "s" | "g" | "gs" | "gate-seq" | "gate_seq")
 }
 
 fn set_f32_param_pattern_or_scalar(
@@ -607,32 +1027,132 @@ fn set_f32_param_pattern_or_scalar(
     pattern: &mut Option<Vec<f32>>,
     scalar: &mut f32,
     normalize: fn(f32) -> f32,
+    name: &str,
 ) -> Result<(), String> {
-    if let Some(values) = numeric_param_pattern(expr, normalize)? {
+    if let Some(values) =
+        numeric_param_pattern(expr, normalize).map_err(|error| format!(":{} {}", name, error))?
+    {
         *pattern = Some(values);
     } else {
-        *scalar = normalize(number_value(expr)?);
+        *scalar = normalize(number_value(expr).map_err(|error| format!(":{} {}", name, error))?);
         *pattern = None;
     }
     Ok(())
 }
 
-fn set_usize_param_pattern_or_scalar(
+fn set_bounded_f32_param_pattern_or_scalar(
     expr: &Expr,
-    pattern: &mut Option<Vec<usize>>,
-    scalar: &mut usize,
-    normalize: fn(usize) -> usize,
+    pattern: &mut Option<Vec<f32>>,
+    scalar: &mut f32,
+    min: f32,
+    max: f32,
     name: &str,
 ) -> Result<(), String> {
-    if let Some(values) = numeric_param_pattern(expr, |value| value)? {
+    if let Some(values) = numeric_param_pattern(expr, |value| value)
+        .map_err(|error| format!(":{} {}", name, error))?
+    {
         *pattern = Some(
             values
                 .into_iter()
-                .map(|value| normalize(value.floor().max(0.0) as usize))
-                .collect(),
+                .map(|value| {
+                    bounded_f32_value(value, min, max, name)
+                        .map_err(|error| format!(":{} {}", name, error))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         );
     } else {
-        *scalar = normalize(usize_value(expr, name)?);
+        *scalar = bounded_f32_value(
+            number_value(expr).map_err(|error| format!(":{} {}", name, error))?,
+            min,
+            max,
+            name,
+        )
+        .map_err(|error| format!(":{} {}", name, error))?;
+        *pattern = None;
+    }
+    Ok(())
+}
+
+fn set_min_f32_param_pattern_or_scalar(
+    expr: &Expr,
+    pattern: &mut Option<Vec<f32>>,
+    scalar: &mut f32,
+    min: f32,
+    name: &str,
+) -> Result<(), String> {
+    if let Some(values) = numeric_param_pattern(expr, |value| value)
+        .map_err(|error| format!(":{} {}", name, error))?
+    {
+        *pattern = Some(
+            values
+                .into_iter()
+                .map(|value| {
+                    min_f32_value(value, min, name).map_err(|error| format!(":{} {}", name, error))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    } else {
+        *scalar = min_f32_value(
+            number_value(expr).map_err(|error| format!(":{} {}", name, error))?,
+            min,
+            name,
+        )
+        .map_err(|error| format!(":{} {}", name, error))?;
+        *pattern = None;
+    }
+    Ok(())
+}
+
+fn bounded_f32_value(value: f32, min: f32, max: f32, name: &str) -> Result<f32, String> {
+    if (min..=max).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "{} must be between {} and {}, got {}",
+            name,
+            trim_float(min),
+            trim_float(max),
+            trim_float(value)
+        ))
+    }
+}
+
+fn min_f32_value(value: f32, min: f32, name: &str) -> Result<f32, String> {
+    if value >= min {
+        Ok(value)
+    } else {
+        Err(format!(
+            "{} must be at least {}, got {}",
+            name,
+            trim_float(min),
+            trim_float(value)
+        ))
+    }
+}
+
+fn set_bounded_usize_param_pattern_or_scalar(
+    expr: &Expr,
+    pattern: &mut Option<Vec<usize>>,
+    scalar: &mut usize,
+    min: usize,
+    max: usize,
+    name: &str,
+) -> Result<(), String> {
+    if let Some(values) = numeric_param_pattern(expr, |value| value)
+        .map_err(|error| format!(":{} {}", name, error))?
+    {
+        *pattern = Some(
+            values
+                .into_iter()
+                .map(|value| {
+                    usize_from_f32(value, name)
+                        .and_then(|value| bounded_usize_value(value, min, max, name))
+                        .map_err(|error| format!(":{} {}", name, error))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    } else {
+        *scalar = bounded_usize_value(usize_value(expr, name)?, min, max, name)?;
         *pattern = None;
     }
     Ok(())
@@ -640,19 +1160,48 @@ fn set_usize_param_pattern_or_scalar(
 
 fn usize_value(expr: &Expr, name: &str) -> Result<usize, String> {
     let value = numeric_only(expr)?;
+    usize_from_f32(value, name)
+}
+
+fn usize_from_f32(value: f32, name: &str) -> Result<usize, String> {
     if value < 0.0 || value.fract() != 0.0 {
         return Err(format!("{} must be a non-negative integer", name));
     }
     Ok(value as usize)
 }
 
+fn bounded_usize_value(value: usize, min: usize, max: usize, name: &str) -> Result<usize, String> {
+    if (min..=max).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "{} must be between {} and {}, got {}",
+            name, min, max, value
+        ))
+    }
+}
+
+fn positive_usize_value(expr: &Expr, name: &str) -> Result<usize, String> {
+    let value = usize_value(expr, name)?;
+    if value == 0 {
+        return Err(format!("{} must be greater than zero", name));
+    }
+    Ok(value)
+}
+
 fn harmonic_values(expr: &Expr) -> Result<[f32; 8], String> {
     let Expr::Vector(items) = expr else {
         return Err("harmonics must be a vector".to_string());
     };
+    if items.len() > 8 {
+        return Err(format!(
+            "harmonics accepts at most 8 values, got {}",
+            items.len()
+        ));
+    }
     let mut harmonics = OscillatorParams::default().harmonics;
-    for (idx, item) in items.iter().take(8).enumerate() {
-        harmonics[idx] = number_value(item)?.clamp(0.0, 2.0);
+    for (idx, item) in items.iter().enumerate() {
+        harmonics[idx] = bounded_f32_value(number_value(item)?, 0.0, 2.0, "harmonics")?;
     }
     Ok(harmonics)
 }
@@ -661,7 +1210,20 @@ fn sample_values(expr: &Expr) -> Result<Vec<f32>, String> {
     let Expr::Vector(items) = expr else {
         return Err("sample-data must be a vector".to_string());
     };
-    items.iter().map(number_value).collect()
+    non_empty_sample_data(
+        items
+            .iter()
+            .map(number_value)
+            .collect::<Result<Vec<_>, _>>()?,
+    )
+}
+
+fn non_empty_sample_data(samples: Vec<f32>) -> Result<Vec<f32>, String> {
+    if samples.is_empty() {
+        Err("sample-data requires at least one value".to_string())
+    } else {
+        Ok(samples)
+    }
 }
 
 fn string_value(expr: &Expr) -> Result<&str, String> {
@@ -696,12 +1258,14 @@ fn load_sample_path(expr: &Expr) -> Result<Vec<f32>, String> {
         }
     };
     if channels == 1 {
-        return Ok(samples);
+        return non_empty_sample_data(samples);
     }
-    Ok(samples
-        .chunks(channels)
-        .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32)
-        .collect())
+    non_empty_sample_data(
+        samples
+            .chunks(channels)
+            .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32)
+            .collect(),
+    )
 }
 
 fn waveform(expr: &Expr) -> Result<Waveform, String> {
@@ -776,62 +1340,153 @@ fn waveform(expr: &Expr) -> Result<Waveform, String> {
 
 fn effect_chain(expr: &Expr) -> Result<Vec<TrackEffect>, String> {
     match expr {
-        Expr::Vector(items) => items.iter().map(track_effect).collect(),
-        Expr::List(_) => Ok(vec![track_effect(expr)?]),
+        Expr::Vector(items) => items.iter().filter_map(track_effect).collect(),
+        Expr::List(_) => match track_effect(expr) {
+            Some(effect) => Ok(vec![effect?]),
+            None => Ok(Vec::new()),
+        },
         _ => Err("fx must be a vector of effect forms".to_string()),
     }
 }
 
-fn track_effect(expr: &Expr) -> Result<TrackEffect, String> {
+fn track_effect(expr: &Expr) -> Option<Result<TrackEffect, String>> {
     let Expr::List(items) = expr else {
-        return Err("effect must be a form".to_string());
+        return Some(Err("effect must be a form".to_string()));
     };
     let Some(Expr::Symbol(name)) = items.first() else {
-        return Ok(TrackEffect {
-            spec: effect_spec(expr)?,
+        return Some(effect_spec(expr).map(|spec| TrackEffect {
+            spec,
             gate_subdivisions: None,
-        });
+        }));
     };
 
     if name != "on" {
-        return Ok(TrackEffect {
-            spec: effect_spec(expr)?,
+        if all_effect_params_null(items) {
+            if let Some(keys) = live_effect_param_keys(name) {
+                if let Err(error) = validate_effect_args(items, name, keys) {
+                    return Some(Err(error));
+                }
+            }
+            return None;
+        }
+        return Some(effect_spec(expr).map(|spec| TrackEffect {
+            spec,
             gate_subdivisions: None,
-        });
+        }));
     }
 
     let mut gate_subdivisions = None;
-    let mut effect = None;
+    let mut effect: Option<Option<EffectSpec>> = None;
     let mut index = 1;
     while index < items.len() {
         match &items[index] {
             Expr::Keyword(key) if key == "gate" => {
+                if gate_subdivisions.is_some() {
+                    return Some(Err("on expects only one :gate pattern".to_string()));
+                }
                 let value = items
                     .get(index + 1)
-                    .ok_or("on :gate requires a gate pattern")?;
-                gate_subdivisions = Some(gate_subdivision_pattern(value)?);
+                    .ok_or("on :gate requires a gate pattern")
+                    .map_err(String::from);
+                let Ok(value) = value else {
+                    return Some(Err(value.unwrap_err()));
+                };
+                match gate_subdivision_pattern(value) {
+                    Ok(pattern) => gate_subdivisions = Some(pattern),
+                    Err(error) => return Some(Err(error)),
+                }
                 index += 2;
             }
             form @ Expr::List(_) => {
-                effect = Some(effect_spec(form)?);
+                if effect.is_some() {
+                    return Some(Err("on expects exactly one effect form".to_string()));
+                }
+                let Expr::List(effect_items) = form else {
+                    unreachable!()
+                };
+                if all_effect_params_null(effect_items) {
+                    if let Some(Expr::Symbol(effect_name)) = effect_items.first() {
+                        if let Some(keys) = live_effect_param_keys(effect_name) {
+                            if let Err(error) =
+                                validate_effect_args(effect_items, effect_name, keys)
+                            {
+                                return Some(Err(error));
+                            }
+                        }
+                    }
+                    effect = Some(None);
+                } else {
+                    match effect_spec(form) {
+                        Ok(spec) => effect = Some(Some(spec)),
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
                 index += 1;
             }
-            _ => return Err("on expects :gate PATTERN followed by one effect form".to_string()),
+            _ => {
+                return Some(Err(
+                    "on expects :gate PATTERN followed by one effect form".to_string()
+                ));
+            }
         }
     }
 
-    Ok(TrackEffect {
-        spec: effect.ok_or("on requires an effect form")?,
-        gate_subdivisions,
-    })
+    match effect {
+        Some(Some(spec)) => Some(Ok(TrackEffect {
+            spec,
+            gate_subdivisions,
+        })),
+        Some(None) => None,
+        None => Some(Err("on requires an effect form".to_string())),
+    }
 }
 
 fn offline_effect_chain(expr: &Expr) -> Result<Vec<OfflineEffectSpec>, String> {
     match expr {
-        Expr::Vector(items) => items.iter().map(offline_effect_spec).collect(),
-        Expr::List(_) => Ok(vec![offline_effect_spec(expr)?]),
+        Expr::Vector(items) => items.iter().filter_map(offline_effect).collect(),
+        Expr::List(_) => match offline_effect(expr) {
+            Some(effect) => Ok(vec![effect?]),
+            None => Ok(Vec::new()),
+        },
         _ => Err("post-fx must be a vector of effect forms".to_string()),
     }
+}
+
+fn offline_effect(expr: &Expr) -> Option<Result<OfflineEffectSpec, String>> {
+    match expr {
+        Expr::List(items) if all_effect_params_null(items) => {
+            if let Some(Expr::Symbol(name)) = items.first() {
+                if let Some(keys) = offline_effect_param_keys(name) {
+                    if let Err(error) = validate_effect_args(items, name, keys) {
+                        return Some(Err(error));
+                    }
+                } else if let Some(keys) = live_effect_param_keys(name) {
+                    if let Err(error) = validate_effect_args(items, name, keys) {
+                        return Some(Err(error));
+                    }
+                }
+            }
+            None
+        }
+        _ => Some(offline_effect_spec(expr)),
+    }
+}
+
+fn all_effect_params_null(items: &[Expr]) -> bool {
+    let mut saw_param = false;
+    let mut index = 1;
+    while index + 1 < items.len() {
+        if matches!(items[index], Expr::Keyword(_)) {
+            saw_param = true;
+            if !null_value(&items[index + 1]) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        index += 2;
+    }
+    saw_param && index == items.len()
 }
 
 fn offline_effect_spec(expr: &Expr) -> Result<OfflineEffectSpec, String> {
@@ -841,12 +1496,20 @@ fn offline_effect_spec(expr: &Expr) -> Result<OfflineEffectSpec, String> {
     let Some(Expr::Symbol(name)) = items.first() else {
         return Err("offline effect form must start with a symbol".to_string());
     };
-    match name.as_str() {
+    let name = name.as_str();
+    if let Some(keys) = offline_effect_param_keys(name) {
+        validate_effect_args(items, name, keys)?;
+    }
+    match name {
         "reverse" => Ok(OfflineEffectSpec::Reverse {
             mix: number_param(items, "mix", 1.0)?,
         }),
         "tape-stop" => Ok(OfflineEffectSpec::TapeStop {
-            duration_pct: number_param(items, "duration-pct", 0.5)?,
+            duration_pct: number_param(
+                items,
+                "duration-pct",
+                number_param(items, "duration", 0.5)?,
+            )?,
         }),
         "granular" => Ok(OfflineEffectSpec::Granular {
             grain_ms: number_param(items, "grain-ms", 40.0)?,
@@ -865,7 +1528,7 @@ fn offline_effect_spec(expr: &Expr) -> Result<OfflineEffectSpec, String> {
         }),
         "haas" => Ok(OfflineEffectSpec::Haas {
             delay_ms: number_param(items, "delay-ms", 14.0)?,
-            side: stereo_side(keyword_param(items, "side").as_deref().unwrap_or("right"))?,
+            side: stereo_side(keyword_param(items, "side")?.as_deref().unwrap_or("right"))?,
         }),
         "stereo-widen" | "stereo_widen" => Ok(OfflineEffectSpec::StereoWiden {
             width: number_param(items, "width", 0.8)?,
@@ -907,9 +1570,16 @@ fn effect_spec(expr: &Expr) -> Result<EffectSpec, String> {
         Some(Expr::Number(value)) if (*value - 1176.0).abs() < f32::EPSILON => "1176",
         _ => return Err("effect form must start with a symbol".to_string()),
     };
+    if let Some(keys) = live_effect_param_keys(name) {
+        validate_effect_args(items, name, keys)?;
+    }
     match name {
         "filter" => Ok(EffectSpec::Filter {
-            kind: filter_kind(keyword_param(items, "type").as_deref().unwrap_or("lowpass"))?,
+            kind: filter_kind(
+                keyword_param(items, "type")?
+                    .as_deref()
+                    .unwrap_or("lowpass"),
+            )?,
             cutoff: number_param(items, "cutoff", 1_000.0)?,
             resonance: number_param(items, "res", number_param(items, "resonance", 0.5)?)?,
             gain_db: number_param(items, "gain-db", number_param(items, "gain_db", 0.0)?)?,
@@ -920,11 +1590,11 @@ fn effect_spec(expr: &Expr) -> Result<EffectSpec, String> {
             mix: number_param(items, "mix", 0.5)?,
         }),
         "formant" => Ok(EffectSpec::Formant {
-            vowel: vowel(keyword_param(items, "vowel").as_deref().unwrap_or("a"))?,
+            vowel: vowel(keyword_param(items, "vowel")?.as_deref().unwrap_or("a"))?,
             mix: number_param(items, "mix", 1.0)?,
         }),
         "distort" | "distortion" => Ok(EffectSpec::Distortion {
-            kind: distortion_kind(keyword_param(items, "type").as_deref().unwrap_or("tanh"))?,
+            kind: distortion_kind(keyword_param(items, "type")?.as_deref().unwrap_or("tanh"))?,
             drive: number_param(items, "drive", 0.5)?,
         }),
         "bitcrush" => Ok(EffectSpec::Bitcrush {
@@ -1114,7 +1784,7 @@ fn effect_spec(expr: &Expr) -> Result<EffectSpec, String> {
             rate: number_param(items, "rate", 0.4)?,
             depth: number_param(items, "depth", 0.7)?,
             feedback: number_param(items, "feedback", 0.6)?,
-            color: bool_param(items, "color", false),
+            color: bool_param(items, "color", false)?,
         }),
         "vibrato" => Ok(EffectSpec::Vibrato {
             rate: number_param(items, "rate", 5.0)?,
@@ -1155,7 +1825,7 @@ fn effect_spec(expr: &Expr) -> Result<EffectSpec, String> {
         }),
         "la2a" => Ok(EffectSpec::La2a {
             peak_reduction: number_param(items, "peak-reduction", 0.5)?,
-            limit: matches!(keyword_param(items, "mode").as_deref(), Some("limit")),
+            limit: matches!(keyword_param(items, "mode")?.as_deref(), Some("limit")),
         }),
         "1176" | "urei-1176" => Ok(EffectSpec::Urei1176 {
             input_gain: number_param(items, "input-gain", 0.5)?,
@@ -1204,7 +1874,7 @@ fn effect_spec(expr: &Expr) -> Result<EffectSpec, String> {
             decay: number_param(items, "decay", 2.0)?,
             damping: number_param(items, "damping", 0.5)?,
             program: ams_program(
-                keyword_param(items, "program")
+                keyword_param(items, "program")?
                     .as_deref()
                     .unwrap_or("nonlin"),
             )?,
@@ -1272,7 +1942,11 @@ fn effect_spec(expr: &Expr) -> Result<EffectSpec, String> {
         "obxa-filter" => Ok(EffectSpec::ObxaFilter {
             cutoff: number_param(items, "cutoff", 2_000.0)?,
             resonance: number_param(items, "res", number_param(items, "resonance", 0.6)?)?,
-            kind: filter_kind(keyword_param(items, "type").as_deref().unwrap_or("lowpass"))?,
+            kind: filter_kind(
+                keyword_param(items, "type")?
+                    .as_deref()
+                    .unwrap_or("lowpass"),
+            )?,
         }),
         "303" | "303-filter" | "tb303" | "tb-303" => Ok(EffectSpec::Diode303 {
             cutoff: number_param(items, "cutoff", 800.0)?,
@@ -1300,7 +1974,11 @@ fn effect_spec(expr: &Expr) -> Result<EffectSpec, String> {
         "sem-filter" | "sem" => Ok(EffectSpec::Sem {
             cutoff: number_param(items, "cutoff", 2_000.0)?,
             resonance: number_param(items, "res", number_param(items, "resonance", 0.5)?)?,
-            kind: filter_kind(keyword_param(items, "type").as_deref().unwrap_or("lowpass"))?,
+            kind: filter_kind(
+                keyword_param(items, "type")?
+                    .as_deref()
+                    .unwrap_or("lowpass"),
+            )?,
         }),
         "ms20" | "ms20-filter" => Ok(EffectSpec::Ms20 {
             cutoff: number_param(items, "cutoff", 1_500.0)?,
@@ -1323,21 +2001,993 @@ fn effect_spec(expr: &Expr) -> Result<EffectSpec, String> {
     }
 }
 
-fn keyword_param(items: &[Expr], key: &str) -> Option<String> {
+fn offline_effect_param_keys(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        "reverse" => &["mix"],
+        "tape-stop" => &["duration-pct", "duration"],
+        "granular" => &["grain-ms", "density", "spray", "pitch-spread"],
+        "granular-stretch" => &["rate", "grain-ms"],
+        "spectral-freeze" => &["freeze-pos", "sustain", "mix"],
+        "haas" => &["delay-ms", "side"],
+        "stereo-widen" | "stereo_widen" => &["width"],
+        "stereo-imager" | "stereo_imager" => &["width", "bass-mono-freq"],
+        "width-enhance" | "width_enhance" => &["low-width", "high-width", "crossover"],
+        "freq-shift" | "freq_shift" => &["shift-hz", "mix"],
+        "autopan" | "auto-pan" => &["rate", "depth"],
+        "ping-pong-delay" | "ping_pong_delay" | "ping-pong" => &["time", "feedback", "mix"],
+        _ => return None,
+    })
+}
+
+fn live_effect_param_keys(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        "filter" => &["type", "cutoff", "res", "resonance", "gain-db", "gain_db"],
+        "comb" => &["delay-ms", "delay", "feedback", "mix"],
+        "formant" => &["vowel", "mix"],
+        "distort" | "distortion" => &["type", "drive"],
+        "bitcrush" => &["bits", "bit-depth", "rate", "sample-rate-reduction"],
+        "delay" => &["time", "feedback", "mix"],
+        "wavefolder" | "fold" => &["folds", "gain", "symmetry"],
+        "resonator" => &["freq", "decay", "mix", "harmonics"],
+        "lofi" | "lo-fi" => &["amount", "intensity"],
+        "vinyl" => &["crackle", "hiss", "wow"],
+        "sub-bass" | "subbass" => &["mix"],
+        "sidechain" => &["rate", "depth", "shape"],
+        "radio" => &["intensity"],
+        "telephone" => &["quality"],
+        "underwater" => &["depth", "depth-amount"],
+        "crystal" => &["brightness", "decay"],
+        "dc-remove" | "dc-block" => &[],
+        "pitch-shift" => &["semitones", "mix"],
+        "harmonizer" => &["interval", "mix"],
+        "octaver" => &["octave-up", "octave-down"],
+        "shimmer" => &["shift-semitones", "feedback", "mix"],
+        "stutter" | "granular-stutter" => &["grain-size-ms", "grain-ms", "repeats", "mix"],
+        "glitch" => &["density", "slice-ms"],
+        "fade" => &["fade-in-ms", "fade-out-ms", "duration"],
+        "adsr" | "asdr" => &[
+            "attack", "a", "decay", "d", "sustain", "s", "release", "r", "duration",
+        ],
+        "doppler" => &["speed", "depth"],
+        "maximizer" => &["ceiling", "warmth", "release-ms"],
+        "multiband-comp" => &[
+            "low-thresh",
+            "mid-thresh",
+            "high-thresh",
+            "crossover-low",
+            "crossover-high",
+        ],
+        "harmonic-enhance" => &["low-harmonics", "high-harmonics", "air"],
+        "body" => &["size", "tone", "mix"],
+        "warmth" => &["amount"],
+        "spatial" => &["room-size", "position", "height"],
+        "parallel-comp" | "parallel-compressor" | "ny-comp" => &["threshold", "ratio", "mix"],
+        "tremolo" => &["rate", "depth"],
+        "chorus" => &["rate", "depth", "voices", "mix"],
+        "dimension" => &["mode"],
+        "ensemble" => &["voices", "depth", "rate"],
+        "ce1-chorus" | "ce-1" => &["rate", "intensity"],
+        "re301-chorus" | "re-301-chorus" => &["rate", "depth", "tone"],
+        "dimension-d" => &["mode"],
+        "h3000" => &["detune-cents", "delay-ms", "feedback", "mix"],
+        "flanger" => &["rate", "depth", "feedback", "mix"],
+        "phaser" => &["rate", "depth", "stages", "mix"],
+        "small-stone" => &["rate", "depth", "feedback", "color"],
+        "vibrato" => &["rate", "depth"],
+        "ring-mod" | "ringmod" => &["freq", "mix"],
+        "arp-ring-mod" => &["freq", "depth", "mix", "diode-curve"],
+        "compressor" => &[
+            "threshold",
+            "ratio",
+            "attack",
+            "release",
+            "makeup",
+            "makeup-gain",
+        ],
+        "fairchild" => &["input-gain", "threshold", "time-constant", "mix"],
+        "ssl-comp" => &["threshold", "ratio", "attack-ms", "release-ms", "makeup-db"],
+        "dbx160" => &["threshold", "ratio"],
+        "la2a" => &["peak-reduction", "mode"],
+        "1176" | "urei-1176" => &["input-gain", "ratio", "attack", "release"],
+        "limiter" => &["ceiling", "release"],
+        "gate" => &["threshold", "attack", "release"],
+        "transient" | "transient-shaper" => &["attack-gain", "sustain-gain", "sensitivity"],
+        "reverb" => &["decay", "mix"],
+        "spring-reverb" => &["decay", "tone", "mix", "drip"],
+        "emt-plate" => &["decay", "damping", "mix", "pre-delay-ms"],
+        "lexicon-224" => &["size", "decay", "damping", "pre-delay-ms", "mix"],
+        "ams-reverb" => &["decay", "damping", "program", "mix"],
+        "tube" | "tube-saturation" => &["drive", "gain", "asymmetry"],
+        "neve-preamp" => &["gain", "warmth"],
+        "marshall-amp" => &["gain", "tone", "presence"],
+        "vox-ac30" => &["gain", "treble", "cut"],
+        "fender-twin" => &["volume", "gain", "treble", "bass", "reverb-mix"],
+        "pultec-eq" | "pultec" => &[
+            "low-boost",
+            "low-atten",
+            "low-freq",
+            "high-boost",
+            "high-atten",
+            "high-freq",
+        ],
+        "tape" => &["saturation", "input-level", "wow", "flutter"],
+        "studer-tape" => &["input-level", "speed", "bias"],
+        "exciter" => &["amount", "cutoff"],
+        "moog" | "moog-ladder" => &["cutoff", "res", "resonance", "drive"],
+        "prophet-filter" => &["cutoff", "res", "resonance"],
+        "obxa-filter" => &["cutoff", "res", "resonance", "type"],
+        "303" | "303-filter" | "tb303" | "tb-303" => {
+            &["cutoff", "res", "resonance", "env-mod", "accent", "decay"]
+        }
+        "space-echo" | "re201" | "re-201" => &[
+            "time",
+            "feedback",
+            "wow",
+            "flutter",
+            "tone",
+            "spring-mix",
+            "mix",
+        ],
+        "tc2290" | "tc-2290" => &["time-ms", "feedback", "mod-rate", "mod-depth", "mix"],
+        "sem-filter" | "sem" => &["cutoff", "res", "resonance", "type"],
+        "ms20" | "ms20-filter" => &["cutoff", "res", "resonance"],
+        "wasp-filter" => &["cutoff", "res", "resonance"],
+        "juno-hpf" => &["cutoff", "res", "resonance"],
+        "buchla-lpg" | "lpg" => &["strike", "decay", "res", "resonance"],
+        _ => return None,
+    })
+}
+
+fn validate_effect_args(
+    items: &[Expr],
+    form_name: &str,
+    allowed_keys: &[&str],
+) -> Result<(), String> {
+    let mut seen_parameters = HashSet::new();
+    let mut index = 1;
+    while index < items.len() {
+        let Expr::Keyword(key) = &items[index] else {
+            return Err(format!(
+                "{} parameters must be keyword/value pairs",
+                form_name
+            ));
+        };
+        if index + 1 >= items.len() {
+            return Err(format!("{} :{} requires a value", form_name, key));
+        }
+        if !allowed_keys.contains(&key.as_str()) {
+            return Err(format!("unknown {} parameter ':{}'", form_name, key));
+        }
+        let canonical_key = effect_param_canonical_key(form_name, key);
+        if !seen_parameters.insert(canonical_key) {
+            return Err(format!("duplicate {} parameter ':{}'", form_name, key));
+        }
+        validate_common_effect_param_value(form_name, key, &items[index + 1])?;
+        validate_effect_specific_param_value(form_name, key, &items[index + 1])?;
+        index += 2;
+    }
+    Ok(())
+}
+
+fn validate_common_effect_param_value(
+    form_name: &str,
+    key: &str,
+    value: &Expr,
+) -> Result<(), String> {
+    if null_value(value) {
+        return Ok(());
+    }
+    if form_name == "h3000" && matches!(key, "delay-ms" | "feedback") {
+        return Err(format!(
+            "h3000 :{} is not implemented by this port yet; remove it",
+            key
+        ));
+    }
+    match key {
+        "mix" => {
+            let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+            bounded_f32_value(value, 0.0, 1.0, "mix")
+                .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+        }
+        "feedback" => {
+            let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+            bounded_f32_value(value, 0.0, 0.95, "feedback")
+                .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+        }
+        "res" | "resonance" => {
+            let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+            bounded_f32_value(value, 0.0, 1.0, "resonance")
+                .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_effect_specific_param_value(
+    form_name: &str,
+    key: &str,
+    value: &Expr,
+) -> Result<(), String> {
+    if null_value(value) {
+        return Ok(());
+    }
+    match form_name {
+        "distort" | "distortion" => match key {
+            "drive" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 10.0, "drive")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "bitcrush" => match key {
+            "bits" | "bit-depth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 2.0, 16.0, "bits")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "rate" | "sample-rate-reduction" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 1.0, 128.0, "rate")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "granular" => match key {
+            "density" | "spray" | "pitch-spread" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "spectral-freeze" => match key {
+            "freeze-pos" | "sustain" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "autopan" | "auto-pan" => match key {
+            "depth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "depth")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "tape-stop" => match key {
+            "duration-pct" | "duration" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.1, 1.0, "duration")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "lofi" | "lo-fi" => match key {
+            "amount" | "intensity" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "amount")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "vinyl" => match key {
+            "crackle" | "hiss" | "wow" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "sidechain" => match key {
+            "depth" | "shape" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "radio" => match key {
+            "intensity" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "intensity")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "telephone" => match key {
+            "quality" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "quality")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "underwater" => match key {
+            "depth" | "depth-amount" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "depth")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "crystal" => match key {
+            "brightness" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "brightness")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "decay" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 0.95, "decay")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "wavefolder" | "fold" => match key {
+            "folds" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 1.0, 8.0, "folds")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "gain" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.1, 12.0, "gain")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "symmetry" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.1, 2.0, "symmetry")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "resonator" => match key {
+            "freq" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                min_f32_value(value, 20.0, "freq")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "decay" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "decay")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "harmonics" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 1.0, 16.0, "harmonics")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "maximizer" => match key {
+            "warmth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "warmth")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "release-ms" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                min_f32_value(value, 1.0, "release-ms")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "harmonic-enhance" => match key {
+            "low-harmonics" | "high-harmonics" | "air" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "body" => match key {
+            "size" | "tone" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "warmth" => match key {
+            "amount" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "amount")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "spatial" => match key {
+            "room-size" | "position" | "height" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "chorus" => match key {
+            "rate" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                min_f32_value(value, 0.01, "rate")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "depth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0001, 0.05, "depth")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "voices" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 1.0, 8.0, "voices")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "ensemble" => match key {
+            "rate" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                min_f32_value(value, 0.01, "rate")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "depth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0005, 0.05, "depth")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "voices" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 2.0, 12.0, "voices")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "ce1-chorus" | "ce-1" => match key {
+            "rate" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.01, 10.0, "rate")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "intensity" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "intensity")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "re301-chorus" | "re-301-chorus" => match key {
+            "rate" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.01, 10.0, "rate")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "depth" | "tone" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "phaser" => match key {
+            "rate" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.01, 20.0, "rate")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "depth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "depth")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "stages" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 1.0, 12.0, "stages")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "dimension" | "dimension-d" => match key {
+            "mode" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 1.0, 4.0, "mode")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "flanger" => match key {
+            "rate" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.01, 20.0, "rate")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "depth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0001, 0.02, "depth")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "small-stone" => match key {
+            "rate" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.01, 20.0, "rate")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "depth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "depth")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "vibrato" => match key {
+            "rate" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                min_f32_value(value, 0.01, "rate")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "depth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0001, 0.03, "depth")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "tremolo" => match key {
+            "rate" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.01, 40.0, "rate")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "depth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "depth")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "ring-mod" | "ringmod" => match key {
+            "freq" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.01, 20_000.0, "freq")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "arp-ring-mod" => match key {
+            "freq" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.01, 20_000.0, "freq")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "depth" | "mix" | "diode-curve" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "tube" | "tube-saturation" => match key {
+            "drive" | "gain" | "asymmetry" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "tape" => match key {
+            "saturation" | "input-level" | "wow" | "flutter" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "studer-tape" => match key {
+            "input-level" | "bias" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "speed" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 2.0, "speed")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "exciter" => match key {
+            "amount" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "amount")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "fairchild" => match key {
+            "input-gain" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "input-gain")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "time-constant" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 1.0, 6.0, "time-constant")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "la2a" => match key {
+            "peak-reduction" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "peak-reduction")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "1176" | "urei-1176" => match key {
+            "input-gain" | "attack" | "release" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "transient" | "transient-shaper" => match key {
+            "attack-gain" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 8.0, "attack-gain")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "sustain-gain" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 4.0, "sustain-gain")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "reverb" => match key {
+            "decay" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "decay")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "spring-reverb" => match key {
+            "decay" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 4.0, "decay")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "tone" | "drip" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "emt-plate" => match key {
+            "decay" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.1, 5.0, "decay")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "damping" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "damping")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "lexicon-224" => match key {
+            "size" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.2, 2.0, "size")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "decay" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.1, 8.0, "decay")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "damping" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "damping")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "ams-reverb" => match key {
+            "decay" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.1, 5.0, "decay")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "damping" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "damping")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "moog" | "moog-ladder" => match key {
+            "drive" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "drive")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "303" | "303-filter" | "tb303" | "tb-303" => match key {
+            "env-mod" | "accent" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "buchla-lpg" | "lpg" => match key {
+            "strike" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "strike")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "neve-preamp" => match key {
+            "gain" | "warmth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "marshall-amp" => match key {
+            "gain" | "tone" | "presence" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "vox-ac30" => match key {
+            "gain" | "treble" | "cut" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "fender-twin" => match key {
+            "volume" | "gain" | "treble" | "bass" | "reverb-mix" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "pultec-eq" | "pultec" => match key {
+            "low-boost" | "low-atten" | "high-boost" | "high-atten" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "space-echo" | "re201" | "re-201" => match key {
+            "time" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.02, 2.0, "time")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "wow" | "flutter" | "tone" | "spring-mix" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "tc2290" | "tc-2290" => match key {
+            "time-ms" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 1.0, 2_000.0, "time-ms")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "mod-rate" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 20.0, "mod-rate")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "mod-depth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 0.05, "mod-depth")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "octaver" => match key {
+            "octave-up" | "octave-down" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "stutter" | "granular-stutter" => match key {
+            "grain-size-ms" | "grain-ms" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 1.0, 500.0, "grain-size-ms")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "repeats" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 1.0, 16.0, "repeats")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "glitch" => match key {
+            "density" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "density")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "slice-ms" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 1.0, 500.0, "slice-ms")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "fade" => match key {
+            "fade-in-ms" | "fade-out-ms" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                min_f32_value(value, 0.0, key)
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "duration" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                min_f32_value(value, 0.001, "duration")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "adsr" | "asdr" => match key {
+            "attack" | "a" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                min_f32_value(value, 0.0, "attack")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "decay" | "d" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                min_f32_value(value, 0.0, "decay")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "sustain" | "s" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "sustain")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "release" | "r" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                min_f32_value(value, 0.0, "release")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "duration" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                min_f32_value(value, 0.001, "duration")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        "doppler" => match key {
+            "speed" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.01, 8.0, "speed")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            "depth" => {
+                let value = number_value(value).map_err(|error| format!(":{} {}", key, error))?;
+                bounded_f32_value(value, 0.0, 1.0, "depth")
+                    .map_err(|error| format!("{} :{} {}", form_name, key, error))?;
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+fn effect_param_canonical_key<'a>(form_name: &str, key: &'a str) -> &'a str {
+    match form_name {
+        "filter" => match key {
+            "res" | "resonance" => "resonance",
+            "gain-db" | "gain_db" => "gain-db",
+            other => other,
+        },
+        "comb" => match key {
+            "delay-ms" | "delay" => "delay-ms",
+            other => other,
+        },
+        "bitcrush" => match key {
+            "bits" | "bit-depth" => "bits",
+            "rate" | "sample-rate-reduction" => "rate",
+            other => other,
+        },
+        "lofi" | "lo-fi" => match key {
+            "amount" | "intensity" => "amount",
+            other => other,
+        },
+        "underwater" => match key {
+            "depth" | "depth-amount" => "depth",
+            other => other,
+        },
+        "stutter" | "granular-stutter" => match key {
+            "grain-size-ms" | "grain-ms" => "grain-size-ms",
+            other => other,
+        },
+        "adsr" | "asdr" => match key {
+            "attack" | "a" => "attack",
+            "decay" | "d" => "decay",
+            "sustain" | "s" => "sustain",
+            "release" | "r" => "release",
+            other => other,
+        },
+        "arp-ring-mod" => match key {
+            "depth" | "mix" => "depth",
+            other => other,
+        },
+        "compressor" => match key {
+            "makeup" | "makeup-gain" => "makeup",
+            other => other,
+        },
+        "tube" | "tube-saturation" => match key {
+            "drive" | "gain" => "drive",
+            other => other,
+        },
+        "fender-twin" => match key {
+            "volume" | "gain" => "volume",
+            other => other,
+        },
+        "tape" => match key {
+            "saturation" | "input-level" => "saturation",
+            other => other,
+        },
+        "moog" | "moog-ladder" | "prophet-filter" | "obxa-filter" | "303" | "303-filter"
+        | "tb303" | "tb-303" | "sem-filter" | "sem" | "ms20" | "ms20-filter" | "wasp-filter"
+        | "juno-hpf" | "buchla-lpg" | "lpg" => match key {
+            "res" | "resonance" => "resonance",
+            other => other,
+        },
+        "tape-stop" => match key {
+            "duration-pct" | "duration" => "duration-pct",
+            other => other,
+        },
+        other => {
+            let _ = other;
+            key
+        }
+    }
+}
+
+fn keyword_param(items: &[Expr], key: &str) -> Result<Option<String>, String> {
     let mut index = 1;
     while index + 1 < items.len() {
         if matches!(&items[index], Expr::Keyword(value) if value == key) {
             if null_value(&items[index + 1]) {
-                return None;
+                return Ok(None);
             }
             return match &items[index + 1] {
-                Expr::Keyword(value) | Expr::Symbol(value) => Some(value.clone()),
-                _ => None,
+                Expr::Keyword(value) | Expr::Symbol(value) => Ok(Some(value.clone())),
+                _ => Err(format!(":{} expected keyword or symbol", key)),
             };
         }
         index += 2;
     }
-    None
+    Ok(None)
 }
 
 fn number_param(items: &[Expr], key: &str, default: f32) -> Result<f32, String> {
@@ -1347,7 +2997,7 @@ fn number_param(items: &[Expr], key: &str, default: f32) -> Result<f32, String> 
             if null_value(&items[index + 1]) {
                 return Ok(default);
             }
-            return number_value(&items[index + 1]);
+            return number_value(&items[index + 1]).map_err(|error| format!(":{} {}", key, error));
         }
         index += 2;
     }
@@ -1361,31 +3011,37 @@ fn optional_number_param(items: &[Expr], key: &str) -> Result<Option<f32>, Strin
             if null_value(&items[index + 1]) {
                 return Ok(None);
             }
-            return number_value(&items[index + 1]).map(Some);
+            return number_value(&items[index + 1])
+                .map(Some)
+                .map_err(|error| format!(":{} {}", key, error));
         }
         index += 2;
     }
     Ok(None)
 }
 
-fn bool_param(items: &[Expr], key: &str, default: bool) -> bool {
+fn bool_param(items: &[Expr], key: &str, default: bool) -> Result<bool, String> {
     let mut index = 1;
     while index + 1 < items.len() {
         if matches!(&items[index], Expr::Keyword(value) if value == key) {
             if null_value(&items[index + 1]) {
-                return default;
+                return Ok(default);
             }
             return match &items[index + 1] {
-                Expr::Keyword(value) | Expr::Symbol(value) => {
-                    matches!(value.as_str(), "true" | "on" | "yes" | "1")
-                }
-                Expr::Number(value) => *value != 0.0,
-                _ => default,
+                Expr::Keyword(value) | Expr::Symbol(value) => match value.as_str() {
+                    "true" | "on" | "yes" | "1" => Ok(true),
+                    "false" | "off" | "no" | "0" => Ok(false),
+                    _ => Err(format!(":{} must be true or false", key)),
+                },
+                Expr::Number(value) if *value == 0.0 => Ok(false),
+                Expr::Number(value) if *value == 1.0 => Ok(true),
+                Expr::Number(_) => Err(format!(":{} must be true or false", key)),
+                _ => Err(format!(":{} must be true or false", key)),
             };
         }
         index += 2;
     }
-    default
+    Ok(default)
 }
 
 fn stereo_side(name: &str) -> Result<StereoSide, String> {
@@ -1446,28 +3102,35 @@ fn distortion_kind(name: &str) -> Result<DistortionKind, String> {
 fn note_pattern(expr: &Expr) -> Result<(Vec<f32>, Vec<Vec<f32>>, NoteMode), String> {
     match expr {
         Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "p") => {
-            let chords = note_chord_pattern_values(items, "p")?;
+            let chords = note_chord_wrapped_pattern_values(items, "p")?;
             Ok((flatten_note_chords(&chords), chords, NoteMode::Step))
         }
         Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "s") => {
-            let chords = note_chord_pattern_values(items, "s")?;
+            let chords = note_chord_wrapped_pattern_values(items, "s")?;
             Ok((flatten_note_chords(&chords), chords, NoteMode::Hit))
         }
-        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "gs" || name == "gate-seq" || name == "gate_seq") =>
+        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "g" || name == "gs" || name == "gate-seq" || name == "gate_seq") =>
         {
             let name = match items.first() {
                 Some(Expr::Symbol(name)) => name.as_str(),
                 _ => "gs",
             };
-            let chords = note_chord_pattern_values(items, name)?;
+            let chords = note_chord_wrapped_pattern_values(items, name)?;
             Ok((flatten_note_chords(&chords), chords, NoteMode::Tick))
         }
         Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "rev" || name == "reverse") =>
         {
+            if items.len() > 2 {
+                return Err("reverse expects one pattern".to_string());
+            }
             let source = items.get(1).ok_or("reverse requires a pattern")?;
             let (_, mut chords, mode) = note_pattern(source)?;
             chords.reverse();
             Ok((flatten_note_chords(&chords), chords, mode))
+        }
+        Expr::Vector(values) => {
+            let chords = note_chords_from_values(values)?;
+            Ok((flatten_note_chords(&chords), chords, NoteMode::Hit))
         }
         _ => {
             let values = number_pattern(expr, true)?;
@@ -1481,31 +3144,73 @@ fn flatten_note_chords(chords: &[Vec<f32>]) -> Vec<f32> {
     chords.iter().flatten().copied().collect()
 }
 
-fn note_chord_pattern_values(items: &[Expr], name: &str) -> Result<Vec<Vec<f32>>, String> {
-    let Some(Expr::Vector(values)) = items.get(1) else {
+fn note_chord_wrapped_pattern_values(items: &[Expr], name: &str) -> Result<Vec<Vec<f32>>, String> {
+    if items.len() > 2 {
+        return Err(format!("{} expects one vector", name));
+    }
+    let Some(source) = items.get(1) else {
         return Err(format!("{} requires a vector", name));
     };
+    note_chord_pattern_values(source, name)
+}
+
+fn note_chord_pattern_values(expr: &Expr, name: &str) -> Result<Vec<Vec<f32>>, String> {
+    match expr {
+        Expr::Vector(values) => note_chords_from_values(values),
+        Expr::List(items) => {
+            let Some(Expr::Symbol(form_name)) = items.first() else {
+                return Err(format!("{} requires a vector", name));
+            };
+            match form_name.as_str() {
+                "times" => {
+                    let count_expr = items.get(1).ok_or("times requires a count")?;
+                    let source = items.get(2).ok_or("times requires a pattern")?;
+                    if items.len() > 3 {
+                        return Err("times expects count and one pattern".to_string());
+                    }
+                    let count = positive_usize_value(count_expr, "times")?;
+                    let pattern = note_chord_pattern_values(source, "times")?;
+                    let mut chords = Vec::with_capacity(pattern.len() * count);
+                    for _ in 0..count {
+                        chords.extend(pattern.iter().cloned());
+                    }
+                    Ok(chords)
+                }
+                "then" => {
+                    if items.len() < 3 {
+                        return Err("then expects at least two patterns".to_string());
+                    }
+                    let mut chords = Vec::new();
+                    for stage in items.iter().skip(1) {
+                        chords.extend(note_chord_pattern_values(stage, "then")?);
+                    }
+                    Ok(chords)
+                }
+                "rev" | "reverse" => {
+                    if items.len() > 2 {
+                        return Err("reverse expects one pattern".to_string());
+                    }
+                    let source = items.get(1).ok_or("reverse requires a pattern")?;
+                    let mut chords = note_chord_pattern_values(source, "reverse")?;
+                    chords.reverse();
+                    Ok(chords)
+                }
+                wrapper if numeric_pattern_form(wrapper) => {
+                    note_chord_wrapped_pattern_values(items, wrapper)
+                }
+                _ => Err(format!("{} requires a vector", name)),
+            }
+        }
+        _ => Err(format!("{} requires a vector", name)),
+    }
+}
+
+fn note_chords_from_values(values: &[Expr]) -> Result<Vec<Vec<f32>>, String> {
     values
         .iter()
         .map(|value| match value {
             Expr::Vector(notes) => notes.iter().map(number_value).collect(),
             _ => Ok(vec![number_value(value)?]),
-        })
-        .collect()
-}
-
-fn pattern_values(items: &[Expr], notes: bool, name: &str) -> Result<Vec<f32>, String> {
-    let Some(Expr::Vector(values)) = items.get(1) else {
-        return Err(format!("{} requires a vector", name));
-    };
-    values
-        .iter()
-        .map(|value| {
-            if notes {
-                number_value(value)
-            } else {
-                numeric_only(value)
-            }
         })
         .collect()
 }
@@ -1518,10 +3223,13 @@ fn number_pattern(expr: &Expr, notes: bool) -> Result<Vec<f32>, String> {
                 Some(Expr::Symbol(name)) => name.as_str(),
                 _ => "p",
             };
-            pattern_values(items, notes, name)
+            wrapped_pattern_values(items, notes, name)
         }
         Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "rev" || name == "reverse") =>
         {
+            if items.len() > 2 {
+                return Err("reverse expects one pattern".to_string());
+            }
             let source = items.get(1).ok_or("reverse requires a pattern")?;
             let mut values = number_pattern(source, notes)?;
             values.reverse();
@@ -1542,6 +3250,76 @@ fn number_pattern(expr: &Expr, notes: bool) -> Result<Vec<f32>, String> {
         } else {
             numeric_only(expr)?
         }]),
+    }
+}
+
+fn wrapped_pattern_values(items: &[Expr], notes: bool, name: &str) -> Result<Vec<f32>, String> {
+    if items.len() > 2 {
+        return Err(format!("{} expects one vector", name));
+    }
+    let Some(source) = items.get(1) else {
+        return Err(format!("{} requires a vector", name));
+    };
+    expanded_pattern_values(source, notes, name)
+}
+
+fn expanded_pattern_values(expr: &Expr, notes: bool, name: &str) -> Result<Vec<f32>, String> {
+    match expr {
+        Expr::Vector(values) => values
+            .iter()
+            .map(|value| {
+                if notes {
+                    number_value(value)
+                } else {
+                    numeric_only(value)
+                }
+            })
+            .collect(),
+        Expr::List(items) => {
+            let Some(Expr::Symbol(form_name)) = items.first() else {
+                return Err(format!("{} requires a vector", name));
+            };
+            match form_name.as_str() {
+                "times" => {
+                    let count_expr = items.get(1).ok_or("times requires a count")?;
+                    let source = items.get(2).ok_or("times requires a pattern")?;
+                    if items.len() > 3 {
+                        return Err("times expects count and one pattern".to_string());
+                    }
+                    let count = positive_usize_value(count_expr, "times")?;
+                    let pattern = expanded_pattern_values(source, notes, "times")?;
+                    let mut values = Vec::with_capacity(pattern.len() * count);
+                    for _ in 0..count {
+                        values.extend(pattern.iter().copied());
+                    }
+                    Ok(values)
+                }
+                "then" => {
+                    if items.len() < 3 {
+                        return Err("then expects at least two patterns".to_string());
+                    }
+                    let mut values = Vec::new();
+                    for stage in items.iter().skip(1) {
+                        values.extend(expanded_pattern_values(stage, notes, "then")?);
+                    }
+                    Ok(values)
+                }
+                "rev" | "reverse" => {
+                    if items.len() > 2 {
+                        return Err("reverse expects one pattern".to_string());
+                    }
+                    let source = items.get(1).ok_or("reverse requires a pattern")?;
+                    let mut values = expanded_pattern_values(source, notes, "reverse")?;
+                    values.reverse();
+                    Ok(values)
+                }
+                wrapper if numeric_pattern_form(wrapper) => {
+                    wrapped_pattern_values(items, notes, wrapper)
+                }
+                _ => Err(format!("{} requires a vector", name)),
+            }
+        }
+        _ => Err(format!("{} requires a vector", name)),
     }
 }
 
@@ -1570,8 +3348,11 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
         if let Some(Expr::Symbol(name)) = items.first() {
             match name.as_str() {
                 "euclid" => {
-                    let pulses = number_arg(items, 1, "euclid")? as usize;
-                    let steps = number_arg(items, 2, "euclid")? as usize;
+                    if items.len() != 3 {
+                        return Err("euclid expects pulses and steps".to_string());
+                    }
+                    let pulses = usize_value(&items[1], "euclid pulses")?;
+                    let steps = positive_usize_value(&items[2], "euclid steps")?;
                     let gates: Vec<Vec<bool>> = sequencer::euclid(pulses, steps, 0)
                         .into_iter()
                         .map(|gate| vec![gate])
@@ -1580,9 +3361,12 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
                     return parsed_gate_pattern(gates, holds, 0);
                 }
                 "euclid-rot" => {
-                    let pulses = number_arg(items, 1, "euclid-rot")? as usize;
-                    let steps = number_arg(items, 2, "euclid-rot")? as usize;
-                    let rotation = number_arg(items, 3, "euclid-rot")? as usize;
+                    if items.len() != 4 {
+                        return Err("euclid-rot expects pulses, steps, and rotation".to_string());
+                    }
+                    let pulses = usize_value(&items[1], "euclid-rot pulses")?;
+                    let steps = positive_usize_value(&items[2], "euclid-rot steps")?;
+                    let rotation = usize_value(&items[3], "euclid-rot rotation")?;
                     let gates: Vec<Vec<bool>> = sequencer::euclid(pulses, steps, rotation)
                         .into_iter()
                         .map(|gate| vec![gate])
@@ -1591,6 +3375,9 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
                     return parsed_gate_pattern(gates, holds, 0);
                 }
                 "rev" | "reverse" => {
+                    if items.len() > 2 {
+                        return Err("reverse expects one pattern".to_string());
+                    }
                     let source = items.get(1).ok_or("reverse requires a pattern")?;
                     let mut pattern = gate_pattern(source)?;
                     pattern.gates.reverse();
@@ -1605,7 +3392,7 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
                     if items.len() > 3 {
                         return Err("times expects count and one pattern".to_string());
                     }
-                    let count = usize_value(count_expr, "times")?;
+                    let count = positive_usize_value(count_expr, "times")?;
                     let pattern = gate_pattern(source)?;
                     let mut gates = Vec::with_capacity(pattern.gates.len() * count);
                     let mut holds = Vec::with_capacity(pattern.holds.len() * count);
@@ -1622,8 +3409,15 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
                     let mut gates = Vec::new();
                     let mut holds = Vec::new();
                     let mut loop_start = 0;
+                    let last_stage_is_times = items.last().is_some_and(|stage| {
+                        matches!(
+                            stage,
+                            Expr::List(stage_items)
+                                if matches!(stage_items.first(), Some(Expr::Symbol(name)) if name == "times")
+                        )
+                    });
                     for (idx, stage_expr) in items.iter().skip(1).enumerate() {
-                        if idx == items.len() - 2 {
+                        if !last_stage_is_times && idx == items.len() - 2 {
                             loop_start = gates.len();
                         }
                         let stage = gate_pattern(stage_expr)?;
@@ -1632,12 +3426,25 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
                     }
                     return parsed_gate_pattern(gates, holds, loop_start);
                 }
-                "p" => {
+                name if numeric_pattern_form(name) => {
                     let Some(source) = items.get(1) else {
-                        return Err("p requires a pattern".to_string());
+                        return Err(format!("{} requires a pattern", name));
                     };
                     if items.len() > 2 {
-                        return Err("p expects one pattern".to_string());
+                        if items
+                            .iter()
+                            .skip(2)
+                            .any(|item| matches!(item, Expr::Symbol(name) if name == "then"))
+                        {
+                            return Err(
+                                format!(
+                                    "{} wraps exactly one pattern; use ({} (then A B)) instead of ({} A then B)",
+                                    name, name, name
+                                )
+                                    .to_string(),
+                            );
+                        }
+                        return Err(format!("{} expects one pattern", name));
                     }
                     return match source {
                         Expr::Vector(values) => {
@@ -1728,6 +3535,9 @@ fn gate_step_pattern(expr: &Expr) -> Result<Vec<GateSlot>, String> {
                 Some(value) => usize_value(value, "gate-hold")?,
                 None => 1,
             };
+            if hold == 0 {
+                return Err("gate-hold must be greater than zero".to_string());
+            }
             if items.len() > 2 {
                 return Err("gate-hold expects zero or one amount".to_string());
             }

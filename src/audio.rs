@@ -14,6 +14,12 @@ use std::time::Duration;
 
 pub(crate) const TRANSPORT_STOPPED_STEP: usize = usize::MAX;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StepEvent {
+    pub(crate) step: usize,
+    pub(crate) scene: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct Voice {
     waveform: Waveform,
@@ -213,6 +219,21 @@ fn effective_oscillator_params(track: &crate::model::Track, index: usize) -> Osc
     params
 }
 
+pub(crate) fn playback_step_for_runtime(runtime: &Runtime, transport_step: usize) -> usize {
+    let Some(state) = runtime.scene_state.as_ref() else {
+        return transport_step;
+    };
+    let Some(scene) = runtime.scenes.get(&state.current) else {
+        return transport_step;
+    };
+    let scene_steps = scene.steps.max(1);
+    let scene_step = transport_step.saturating_sub(state.start_step);
+    state
+        .cycle
+        .saturating_mul(scene_steps)
+        .saturating_add(scene_step % scene_steps)
+}
+
 pub(crate) struct AudioEngine {
     runtime: Arc<Mutex<Runtime>>,
     sample_rate: f32,
@@ -223,7 +244,7 @@ pub(crate) struct AudioEngine {
     pending_triggers: Vec<PendingTrigger>,
     note_cursors: HashMap<String, usize>,
     param_cursors: HashMap<String, usize>,
-    step_sender: Option<Sender<usize>>,
+    step_sender: Option<Sender<StepEvent>>,
     seen_transport_revision: u64,
 }
 
@@ -269,7 +290,7 @@ impl AudioEngine {
         }
     }
 
-    pub(crate) fn set_step_sender(&mut self, sender: Sender<usize>) {
+    pub(crate) fn set_step_sender(&mut self, sender: Sender<StepEvent>) {
         self.step_sender = Some(sender);
     }
 
@@ -303,14 +324,24 @@ impl AudioEngine {
         if !runtime.running {
             if advanced_scene {
                 if let Some(sender) = &self.step_sender {
-                    let _ = sender.send(TRANSPORT_STOPPED_STEP);
+                    let _ = sender.send(StepEvent {
+                        step: TRANSPORT_STOPPED_STEP,
+                        scene: None,
+                    });
                 }
             }
             return;
         }
 
+        let playback_step = playback_step_for_runtime(&runtime, self.step);
         if let Some(sender) = &self.step_sender {
-            let _ = sender.send(self.step);
+            let _ = sender.send(StepEvent {
+                step: playback_step,
+                scene: runtime
+                    .scene_state
+                    .as_ref()
+                    .map(|state| state.current.clone()),
+            });
         }
 
         let solo_active = runtime.tracks.values().any(|track| track.solo);
@@ -319,10 +350,10 @@ impl AudioEngine {
                 continue;
             }
             let step_every = track.step_every.max(1);
-            if self.step % step_every != 0 {
+            if playback_step % step_every != 0 {
                 continue;
             }
-            let track_step = (self.step / step_every).wrapping_add(track.step_offset);
+            let track_step = (playback_step / step_every).wrapping_add(track.step_offset);
             let gates = sequencer::pattern_step_gates_with_loop(
                 &track.gate_subdivisions,
                 track.gate_loop_start,
@@ -525,7 +556,8 @@ impl AudioEngine {
             return false;
         };
         let scene_steps = scene.steps.max(1);
-        if self.step == 0 || self.step % scene_steps != 0 {
+        let scene_elapsed = self.step.saturating_sub(state.start_step);
+        if scene_elapsed == 0 || scene_elapsed % scene_steps != 0 {
             return false;
         }
 
@@ -554,6 +586,7 @@ impl AudioEngine {
         runtime.scene_state = Some(crate::model::SceneState {
             current: next_scene.id,
             cycle: 0,
+            start_step: self.step,
         });
         !same_scene
     }
@@ -605,7 +638,21 @@ fn pan_gains(pan: f32) -> (f32, f32) {
     ((1.0 - pan).sqrt(), pan.sqrt())
 }
 
+fn drum_tune_ratio(freq: f32, reference: f32) -> f32 {
+    if freq > 0.0 && reference > 0.0 {
+        (freq / reference).clamp(0.25, 4.0)
+    } else {
+        1.0
+    }
+}
+
+fn filter_freq(freq: f32, sample_rate: f32) -> f32 {
+    freq.clamp(20.0, sample_rate * 0.45)
+}
+
 fn voice_filters(waveform: Waveform, freq: f32, sample_rate: f32) -> Vec<Biquad> {
+    let hat_ratio = drum_tune_ratio(freq, 1046.5023);
+    let snare_ratio = drum_tune_ratio(freq, 130.8128);
     match waveform {
         Waveform::Snare => vec![
             Biquad::new(FilterKind::Highpass, 1_000.0, 0.2, sample_rate),
@@ -619,10 +666,25 @@ fn voice_filters(waveform: Waveform, freq: f32, sample_rate: f32) -> Vec<Biquad>
             Biquad::new(FilterKind::Highpass, 800.0, 0.2, sample_rate),
             Biquad::new(FilterKind::Lowpass, 4_000.0, 0.2, sample_rate),
         ],
-        Waveform::Hat => vec![Biquad::new(FilterKind::Highpass, 5_000.0, 0.2, sample_rate)],
+        Waveform::Hat => vec![Biquad::new(
+            FilterKind::Highpass,
+            filter_freq(5_000.0 * hat_ratio, sample_rate),
+            0.2,
+            sample_rate,
+        )],
         Waveform::Hat808 => vec![
-            Biquad::new(FilterKind::Highpass, 7_000.0, 0.2, sample_rate),
-            Biquad::new(FilterKind::Highpass, 7_000.0, 0.2, sample_rate),
+            Biquad::new(
+                FilterKind::Highpass,
+                filter_freq(7_000.0 * hat_ratio, sample_rate),
+                0.2,
+                sample_rate,
+            ),
+            Biquad::new(
+                FilterKind::Highpass,
+                filter_freq(7_000.0 * hat_ratio, sample_rate),
+                0.2,
+                sample_rate,
+            ),
         ],
         Waveform::Cowbell808 => {
             let ratio = if freq > 0.0 { freq / 440.0 } else { 1.0 };
@@ -637,20 +699,65 @@ fn voice_filters(waveform: Waveform, freq: f32, sample_rate: f32) -> Vec<Biquad>
             Biquad::new(FilterKind::Highpass, 1_000.0, 0.2, sample_rate),
             Biquad::new(FilterKind::Lowpass, 8_000.0, 0.2, sample_rate),
         ],
-        Waveform::Hat909 => vec![Biquad::new(FilterKind::Highpass, 6_000.0, 0.2, sample_rate)],
-        Waveform::Snare78 => vec![Biquad::new(FilterKind::Highpass, 2_000.0, 0.2, sample_rate)],
+        Waveform::Hat909 => vec![Biquad::new(
+            FilterKind::Highpass,
+            filter_freq(6_000.0 * hat_ratio, sample_rate),
+            0.2,
+            sample_rate,
+        )],
+        Waveform::Snare78 => vec![Biquad::new(
+            FilterKind::Highpass,
+            filter_freq(2_000.0 * snare_ratio, sample_rate),
+            0.2,
+            sample_rate,
+        )],
         Waveform::Hat78 => vec![
-            Biquad::new(FilterKind::Highpass, 5_000.0, 0.2, sample_rate),
-            Biquad::new(FilterKind::Lowpass, 9_000.0, 0.2, sample_rate),
+            Biquad::new(
+                FilterKind::Highpass,
+                filter_freq(5_000.0 * hat_ratio, sample_rate),
+                0.2,
+                sample_rate,
+            ),
+            Biquad::new(
+                FilterKind::Lowpass,
+                filter_freq(9_000.0 * hat_ratio, sample_rate),
+                0.2,
+                sample_rate,
+            ),
         ],
         Waveform::Kick707 => vec![Biquad::new(FilterKind::Lowpass, 400.0, 0.2, sample_rate)],
         Waveform::CymbalCrash => vec![
-            Biquad::new(FilterKind::Highpass, 2_000.0, 0.2, sample_rate),
-            Biquad::new(FilterKind::Highpass, 4_000.0, 0.2, sample_rate),
+            Biquad::new(
+                FilterKind::Highpass,
+                filter_freq(2_000.0 * hat_ratio, sample_rate),
+                0.2,
+                sample_rate,
+            ),
+            Biquad::new(
+                FilterKind::Highpass,
+                filter_freq(4_000.0 * hat_ratio, sample_rate),
+                0.2,
+                sample_rate,
+            ),
         ],
-        Waveform::CymbalRide => vec![Biquad::new(FilterKind::Highpass, 6_000.0, 0.2, sample_rate)],
-        Waveform::Rimshot => vec![Biquad::new(FilterKind::Bandpass, 1_800.0, 1.0, sample_rate)],
-        Waveform::Shaker => vec![Biquad::new(FilterKind::Highpass, 6_000.0, 0.2, sample_rate)],
+        Waveform::CymbalRide => vec![Biquad::new(
+            FilterKind::Highpass,
+            filter_freq(6_000.0 * hat_ratio, sample_rate),
+            0.2,
+            sample_rate,
+        )],
+        Waveform::Rimshot => vec![Biquad::new(
+            FilterKind::Bandpass,
+            filter_freq(1_800.0 * snare_ratio, sample_rate),
+            1.0,
+            sample_rate,
+        )],
+        Waveform::Shaker => vec![Biquad::new(
+            FilterKind::Highpass,
+            filter_freq(6_000.0 * hat_ratio, sample_rate),
+            0.2,
+            sample_rate,
+        )],
         Waveform::Cowbell => {
             let f = if freq > 300.0 { freq } else { 580.0 };
             vec![
@@ -763,20 +870,20 @@ fn oscillator(voice: &mut Voice) -> f32 {
         Waveform::Sine => unison(voice, sine_phase),
         Waveform::Saw => unison(voice, saw_phase),
         Waveform::Square => {
-            if voice.phase < voice.params.pulse_width {
+            if detuned_phase(voice, 0.0) < voice.params.pulse_width {
                 1.0
             } else {
                 -1.0
             }
         }
         Waveform::Tri => unison(voice, tri_phase),
-        Waveform::Pulse => pulse(voice.phase, voice.params.pulse_width),
-        Waveform::Morph => morph(voice.phase, voice.params.morph_pos),
+        Waveform::Pulse => pulse(detuned_phase(voice, 0.0), voice.params.pulse_width),
+        Waveform::Morph => morph(detuned_phase(voice, 0.0), voice.params.morph_pos),
         Waveform::SuperSaw => supersaw(voice),
-        Waveform::Wavetable => wavetable(voice.phase, voice.params.morph_pos),
+        Waveform::Wavetable => wavetable(detuned_phase(voice, 0.0), voice.params.morph_pos),
         Waveform::FmOp => fm_op(voice),
         Waveform::Additive => additive(voice),
-        Waveform::Sync => sync_osc(voice.phase, voice.params.fm_ratio),
+        Waveform::Sync => sync_osc(detuned_phase(voice, 0.0), voice.params.fm_ratio),
         Waveform::PwmSweep => pwm_sweep(voice),
         Waveform::Harsh => harsh(voice.phase),
         Waveform::Chip => quantize((voice.phase * 2.0) - 1.0, 16.0),
@@ -931,7 +1038,7 @@ fn wavetable(phase: f32, morph_pos: f32) -> f32 {
 }
 
 fn fm_op(voice: &Voice) -> f32 {
-    let phase = voice.phase * TAU;
+    let phase = detuned_phase(voice, 0.0) * TAU;
     let modulator = (phase * voice.params.fm_ratio).sin() * voice.params.fm_depth;
     (phase + modulator).sin()
 }
@@ -958,7 +1065,7 @@ fn sync_osc(phase: f32, fm_ratio: f32) -> f32 {
 
 fn pwm_sweep(voice: &Voice) -> f32 {
     let width = 0.5 + 0.35 * (voice.age * TAU * voice.params.fm_ratio * 0.5).sin();
-    pulse(voice.phase, width)
+    pulse(detuned_phase(voice, 0.0), width)
 }
 
 fn harsh(phase: f32) -> f32 {
@@ -1112,7 +1219,8 @@ fn hat(voice: &mut Voice) -> f32 {
     let ratios = [1.0, 1.47, 1.84, 2.55, 3.17, 3.72];
     let metal = ratios
         .iter()
-        .map(|ratio| (voice.phase * TAU * ratio).sin() * 0.15)
+        .enumerate()
+        .map(|(idx, ratio)| (advance_aux_phase(voice, idx, voice.freq * ratio) * TAU).sin() * 0.15)
         .sum::<f32>();
     (metal + filtered_noise(voice, 0) * 0.5) * (-voice.age * 25.0).exp()
 }
@@ -1194,10 +1302,11 @@ fn snare_909(voice: &mut Voice) -> f32 {
 }
 
 fn hat_909(voice: &mut Voice) -> f32 {
+    let ratio = drum_tune_ratio(voice.freq, 1046.5023);
     let carriers = [300.0, 420.0, 680.0, 800.0];
     let mut out = 0.0;
     for carrier in carriers {
-        let p = voice.age * TAU * carrier;
+        let p = voice.age * TAU * carrier * ratio;
         out += (p + (p * 1.414).sin() * 5.0).sin();
     }
     let out = filter_sample(voice, 0, out) * (-voice.age * 18.0).exp();
@@ -1212,8 +1321,9 @@ fn kick_78(voice: &mut Voice) -> f32 {
 }
 
 fn snare_78(voice: &mut Voice) -> f32 {
-    let tone = (voice.age * TAU * 230.0).sin()
-        * (voice.age * TAU * 340.0).sin()
+    let ratio = drum_tune_ratio(voice.freq, 130.8128);
+    let tone = (voice.age * TAU * 230.0 * ratio).sin()
+        * (voice.age * TAU * 340.0 * ratio).sin()
         * (-voice.age * 20.0).exp()
         * 0.6;
     let noise = filtered_noise(voice, 0) * (-voice.age * 15.0).exp() * 0.4;
@@ -1221,11 +1331,12 @@ fn snare_78(voice: &mut Voice) -> f32 {
 }
 
 fn hat_78(voice: &mut Voice) -> f32 {
+    let ratio = drum_tune_ratio(voice.freq, 1046.5023);
     let raw = [300.0, 350.0, 420.0, 600.0]
         .iter()
         .enumerate()
         .map(|(idx, freq)| {
-            if advance_aux_phase(voice, idx, *freq) < 0.5 {
+            if advance_aux_phase(voice, idx, *freq * ratio) < 0.5 {
                 1.0
             } else {
                 -1.0
@@ -1247,7 +1358,8 @@ fn kick_707(voice: &mut Voice) -> f32 {
 }
 
 fn snare_707(voice: &mut Voice) -> f32 {
-    let tone = (voice.age * TAU * 200.0).sin() * (-voice.age * 25.0).exp() * 0.3;
+    let ratio = drum_tune_ratio(voice.freq, 130.8128);
+    let tone = (voice.age * TAU * 200.0 * ratio).sin() * (-voice.age * 25.0).exp() * 0.3;
     let noise = signed_noise(&mut voice.noise) * (-voice.age * 12.0).exp() * 0.7;
     tone + noise
 }
@@ -1267,11 +1379,12 @@ fn clap(voice: &mut Voice) -> f32 {
 }
 
 fn cymbal_crash(voice: &mut Voice) -> f32 {
+    let ratio = drum_tune_ratio(voice.freq, 1046.5023);
     let metal = [300.0, 380.0, 520.0, 890.0, 1_100.0, 1_400.0]
         .iter()
         .enumerate()
         .map(|(idx, freq)| {
-            if advance_aux_phase(voice, idx, *freq) < 0.5 {
+            if advance_aux_phase(voice, idx, *freq * ratio) < 0.5 {
                 1.0
             } else {
                 -1.0
@@ -1286,8 +1399,10 @@ fn cymbal_crash(voice: &mut Voice) -> f32 {
 }
 
 fn cymbal_ride(voice: &mut Voice) -> f32 {
-    let p = voice.age * TAU * 2_500.0;
-    let tone = (p + (voice.age * TAU * 3_200.0).sin() * 1_000.0 * (-voice.age * 10.0).exp()).sin();
+    let ratio = drum_tune_ratio(voice.freq, 1046.5023);
+    let p = voice.age * TAU * 2_500.0 * ratio;
+    let tone =
+        (p + (voice.age * TAU * 3_200.0 * ratio).sin() * 1_000.0 * (-voice.age * 10.0).exp()).sin();
     let noise = signed_noise(&mut voice.noise);
     let noise = filter_sample(voice, 0, noise);
     (tone * 0.5 + noise * 0.5) * (-voice.age * 8.0).exp()
@@ -1301,13 +1416,14 @@ fn tom(voice: &mut Voice) -> f32 {
 }
 
 fn rimshot(voice: &mut Voice) -> f32 {
+    let ratio = drum_tune_ratio(voice.freq, 130.8128);
     let impulse = if voice.age < 10.0 / voice.sample_rate {
         1.0
     } else {
         0.0
     };
     let ring = filter_sample(voice, 0, impulse) * 50.0;
-    let body = (voice.age * TAU * 400.0).sin() * (-voice.age * 80.0).exp() * 0.5;
+    let body = (voice.age * TAU * 400.0 * ratio).sin() * (-voice.age * 80.0).exp() * 0.5;
     ring + body
 }
 
@@ -1557,7 +1673,7 @@ pub(crate) fn open_output_stream(runtime: Arc<Mutex<Runtime>>) -> Result<cpal::S
 
 pub(crate) fn open_output_stream_with_steps(
     runtime: Arc<Mutex<Runtime>>,
-    step_sender: Option<Sender<usize>>,
+    step_sender: Option<Sender<StepEvent>>,
 ) -> Result<cpal::Stream, String> {
     open_output_stream_named(runtime, step_sender, None)
 }
@@ -1572,7 +1688,7 @@ pub(crate) fn output_device_names() -> Result<Vec<String>, String> {
 
 pub(crate) fn open_output_stream_named(
     runtime: Arc<Mutex<Runtime>>,
-    step_sender: Option<Sender<usize>>,
+    step_sender: Option<Sender<StepEvent>>,
     device_name: Option<&str>,
 ) -> Result<cpal::Stream, String> {
     open_output_stream_named_with_info(runtime, step_sender, device_name)
@@ -1581,7 +1697,7 @@ pub(crate) fn open_output_stream_named(
 
 pub(crate) fn open_output_stream_named_with_info(
     runtime: Arc<Mutex<Runtime>>,
-    step_sender: Option<Sender<usize>>,
+    step_sender: Option<Sender<StepEvent>>,
     device_name: Option<&str>,
 ) -> Result<(cpal::Stream, String), String> {
     let host = cpal::default_host();

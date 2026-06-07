@@ -2,7 +2,7 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str])
   (:import
-    [java.awt BorderLayout Color Dimension Font]
+    [java.awt BorderLayout Color Dimension Font GraphicsEnvironment]
     [java.awt.event ActionListener WindowAdapter]
     [java.io BufferedReader ByteArrayInputStream ByteArrayOutputStream File InputStreamReader OutputStreamWriter PushbackReader StringReader]
     [javax.sound.sampled AudioFileFormat$Type AudioFormat AudioInputStream AudioSystem Clip]
@@ -14,11 +14,11 @@
   (when-not (.exists (java.io.File. file-path))
     nil)
   (cond
-    (clojure.java.io/resource resource-path)
-    (load-string (slurp (clojure.java.io/resource resource-path)))
-
     (.exists (java.io.File. file-path))
     (load-file file-path)
+
+    (clojure.java.io/resource resource-path)
+    (load-string (slurp (clojure.java.io/resource resource-path)))
 
     :else
     (throw (java.io.FileNotFoundException. resource-path))))
@@ -50,6 +50,7 @@
 (def show-language-reference! glitchlisp.swing.docs/show-language-reference!)
 (def load-effects glitchlisp.swing.catalog/load-effects)
 (def effect-options glitchlisp.swing.catalog/effect-options)
+(def effect-option-for-label glitchlisp.swing.catalog/effect-option-for-label)
 (def effect-param-contracts glitchlisp.swing.catalog/effect-param-contracts)
 (def effect-type-contracts glitchlisp.swing.catalog/effect-type-contracts)
 (def blank-effect-form glitchlisp.swing.catalog/blank-effect-form)
@@ -153,11 +154,13 @@
 (def install-paren-highlighter! glitchlisp.swing.editor/install-paren-highlighter!)
 (def error-offset glitchlisp.swing.editor/error-offset)
 (def focus-source-error! glitchlisp.swing.editor/focus-source-error!)
+(def report-source-error! glitchlisp.swing.editor/report-source-error!)
 (def text-line-count glitchlisp.swing.editor/text-line-count)
 (def line-number-text glitchlisp.swing.editor/line-number-text)
 (def refresh-line-numbers! glitchlisp.swing.editor/refresh-line-numbers!)
 (def line-number-gutter glitchlisp.swing.editor/line-number-gutter)
 (def matching-close glitchlisp.swing.editor/matching-close)
+(def code-visible-text glitchlisp.swing.editor/code-visible-text)
 (def enclosing-track-range glitchlisp.swing.editor/enclosing-track-range)
 (def find-fx-vector glitchlisp.swing.editor/find-fx-vector)
 (def line-indent-before glitchlisp.swing.editor/line-indent-before)
@@ -212,7 +215,6 @@
 (def read-source-forms glitchlisp.swing.render/read-source-forms)
 (def form-head glitchlisp.swing.render/form-head)
 (def pair-value glitchlisp.swing.render/pair-value)
-(def positive-int-value glitchlisp.swing.render/positive-int-value)
 (def gcd-int glitchlisp.swing.render/gcd-int)
 (def lcm-int glitchlisp.swing.render/lcm-int)
 (def truthy-gate? glitchlisp.swing.render/truthy-gate?)
@@ -276,8 +278,9 @@
 (def live-auto-update-timer-key "glitchlisp.liveAutoUpdateTimer")
 
 (defn valid-live-compiled-source [source]
-  (require-playback-form! source)
-  (compile-glitchlisp-source (preview-source source)))
+  (let [preview (preview-source source)]
+    (require-playback-form! preview)
+    (compile-glitchlisp-source preview)))
 
 (defn next-live-auto-edit-token! []
   (:live-auto-edit-token
@@ -351,7 +354,7 @@
     item))
 
 (def about-text
-  "MeScript v0.2\nJune 4th 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
+  "MeScript v0.3\nJune 7, 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
 
 (defn show-about! [^JFrame frame]
   (JOptionPane/showMessageDialog frame about-text "About MeScript" JOptionPane/INFORMATION_MESSAGE))
@@ -394,39 +397,43 @@
     "Oscillator" (oscillator-option-labels)
     ("FX" "Effect") (cons "on :gate" (map :label (live-effect-options)))
     "Post FX" (map :label (post-effect-options))
-    "Scene" ["scene" "scene chain" "by-scene track"]
+    "Scene" ["scene" "looping scene" "scene chain" "by-scene track"]
     "Math / Logic" ["+" "-" "*" "/"
                     "map and" "map or" "map not" "map transpose"
                     "range" "repeat" "take" "reverse" "rotate" "interleave"
                     "choose" "rand-range" "scale" "chord" "custom chord" "shape" "arpeggio" "transpose"]
-    "Pattern" ["p :repeat" "every-n" "euclid-rot" "held gates" "nested subdivisions"]
-    "Playback" ["play-scene" "bpm" "mute" "solo" "clear"]
+    "Pattern" ["p :repeat" "then / times" "every-n" "euclid-rot" "held gates" "nested subdivisions"]
+    "Playback" ["start!" "stop!" "play-scene" "play-note" "bpm" "mute" "unmute" "solo" "unsolo" "clear" "clear-all"]
     []))
 
 (defn set-insert-options! [^JComboBox form-combo category]
   (.removeAllItems form-combo)
   (doseq [option (insert-form-options category)]
-    (.addItem form-combo option))
-  (when (and (= category "Oscillator")
-             (> (.getItemCount form-combo) 1)
-             (oscillator-option-header? (.getItemAt form-combo 0)))
-    (.setSelectedIndex form-combo 1)))
+    (.addItem form-combo option)))
 
 (defn insert-scene-template
   ([scene]
    (insert-scene-template scene true))
-  ([scene _include-comments?]
+  ([scene include-comments?]
    (str "(scene :" scene " :repeat 1\n"
-        "  ; :steps 16\n"
-        "  ; :bars 1\n"
-        "  )\n")))
+        (when include-comments?
+          "  ; :loop true\n  ; :steps 16\n  ; :bars 1\n")
+        "  (d :lead\n"
+        "     :src :sine-synth\n"
+        "     :note c3\n"
+        "     :gate (p [1 0 1 0])\n"
+        "     :dur 0.12\n"
+        "     :amp 0.2))\n\n"
+        "(play-scene :" scene ")\n")))
 
 (defn effect-form-for-label
   ([label]
    (effect-form-for-label label true))
   ([label include-comments?]
    (cond
-     (= label "FX Vector") ":fx []"
+     (= label "FX Vector") (or (:form (effect-option-for-label label))
+                               ":fx [(filter :type :lowpass :cutoff 1200 :res 0.35)
+     (delay :time 0.125 :feedback 0.32 :mix 0.22)]")
      (= label "on :gate") nil
      :else (blank-effect-form label include-comments?))))
 
@@ -436,8 +443,19 @@
         (str/replace (effect-form-for-label label include-comments?) "\n" "\n  ")
         "\n])\n")))
 
+(defn standalone-post-fx-snippet [post-fx]
+  (str "(d :post-fx-demo\n"
+       "   :src :sine-synth\n"
+       "   :note c3\n"
+       "   :gate (p [1 0 1 0])\n"
+       "   :dur 0.12\n"
+       "   :amp 0.2)\n\n"
+       post-fx
+       "\n(start!)\n"))
+
 (defn form-after-keyword [text start end keyword-text]
-  (let [key-idx (.indexOf text keyword-text start)]
+  (let [visible (code-visible-text text)
+        key-idx (.indexOf visible keyword-text start)]
     (when (and (>= key-idx 0) (< key-idx end))
       (let [value-start (loop [idx (+ key-idx (count keyword-text))]
                           (cond
@@ -465,9 +483,111 @@
     (when-let [[start end] (enclosing-track-range text caret)]
       (form-after-keyword text start end ":gate"))))
 
+(defn current-track-id [^JTextComponent editor]
+  (let [text (.getText editor)
+        caret (.getCaretPosition editor)]
+    (or
+      (when-let [[start end] (enclosing-track-range text caret)]
+        (when-let [match (re-find #"^\((?:d|sample)\s+(:[^\s\)\]]+)"
+                                   (subs text start (inc end)))]
+          (second match)))
+      (let [ids (try
+                  (->> (read-source-forms text)
+                       (tree-seq coll? seq)
+                       (keep #(when (and (seq? %)
+                                         (contains? #{'d 'sample} (first %))
+                                         (keyword? (second %)))
+                                (str (second %))))
+                       distinct
+                       vec)
+                  (catch Exception _
+                    []))]
+        (when (= 1 (count ids))
+          (first ids))))))
+
 (defn fx-gate-snippet [^JTextComponent editor]
-  (str "(on :gate " (or (current-track-gate-form editor) "(p [])") "\n"
-       "    )"))
+  (str "(on :gate " (or (current-track-gate-form editor) "(p [1 0])") "\n"
+       "    (delay :time 0.125 :feedback 0.25 :mix 0.25))"))
+
+(defn playback-track-snippet [^JTextComponent editor form]
+  (let [text (.getText editor)]
+    (if-let [id (current-track-id editor)]
+      (str "(" form " " id ")\n")
+      (if (str/blank? text)
+        (case form
+          "unmute" "(d :lead :src :sine-synth :note c3 :gate 1)\n(start!)\n(mute :lead)\n(unmute :lead)\n"
+          "unsolo" "(d :lead :src :sine-synth :note c3 :gate 1)\n(start!)\n(solo :lead)\n(unsolo :lead)\n"
+          "clear" "(d :lead :src :sine-synth :note c3 :gate 1)\n(d :keep :src :sine-synth :note e3 :gate 1)\n(start!)\n(clear :lead)\n"
+          (str "(d :lead :src :sine-synth :note c3 :gate 1)\n(start!)\n(" form " :lead)\n"))
+        (str "; (" form " :track)\n")))))
+
+(defn playback-scene-snippet [^JTextComponent editor scene]
+  (let [text (.getText editor)
+        scene-id (str ":" scene)]
+    (cond
+      (scene-exists? text scene)
+      (str "(play-scene " scene-id ")\n")
+
+      (str/blank? text)
+      (str "(scene " scene-id " :loop true\n"
+           "  (d :lead :src :sine-synth :note c3 :gate 1))\n"
+           "(play-scene " scene-id ")\n")
+
+      :else
+      (str "; (play-scene " scene-id ")\n"))))
+
+(defn has-top-level-track? [source]
+  (try
+    (boolean
+      (some #(and (seq? %)
+                  (contains? #{'d 'sample} (first %))
+                  (keyword? (second %)))
+            (read-source-forms source)))
+    (catch Exception _
+      false)))
+
+(defn playback-start-snippet [^JTextComponent editor]
+  (let [text (.getText editor)]
+    (cond
+      (has-top-level-track? text)
+      "(start!)\n"
+
+      (str/blank? text)
+      "(d :lead :src :sine-synth :note c3 :gate 1)\n(start!)\n"
+
+      :else
+      "; (start!)\n")))
+
+(defn playback-stop-snippet [^JTextComponent editor]
+  (if (str/blank? (.getText editor))
+    "(d :lead :src :sine-synth :note c3 :gate 1)\n(start!)\n(stop!)\n"
+    "(stop!)\n"))
+
+(defn playback-clear-all-snippet [^JTextComponent editor]
+  (if (str/blank? (.getText editor))
+    "(d :lead :src :sine-synth :note c3 :gate 1)\n(start!)\n(clear-all)\n"
+    "(clear-all)\n"))
+
+(defn standalone-fx-track-snippet [effect]
+  (str "(d :fx-demo\n"
+       "   :src :sine-synth\n"
+       "   :note c3\n"
+       "   :gate (p [1 0 1 0])\n"
+       "   :dur 0.12\n"
+       "   :amp 0.2\n"
+       "   :fx [\n"
+       (indent-lines (str/trim effect) "     ")
+       "\n   ])\n\n"
+       "(start!)\n"))
+
+(defn standalone-pattern-track-snippet [gate]
+  (str "(d :pattern-demo\n"
+       "   :src :click\n"
+       "   :note c3\n"
+       "   :gate " gate "\n"
+       "   :dur 0.05\n"
+       "   :amp 0.4)\n\n"
+       "(start!)\n"))
 
 (defn enclosing-list-range [text caret]
   (let [caret (max 0 (min caret (count text)))]
@@ -503,18 +623,19 @@
   (when-let [[track-start track-end] (enclosing-track-range text caret)]
     (when-let [[fx-open fx-close] (find-fx-vector text track-start track-end)]
       (when (<= fx-open caret fx-close)
-        (loop [idx (.lastIndexOf text "(" caret)]
-          (when (and (>= idx 0) (> idx fx-open))
-            (let [previous (.lastIndexOf text "(" (dec idx))]
-              (if-let [end (matching-close text idx \( \))]
-                (if (and (<= idx caret end)
-                         (< end fx-close)
-                         (let [head (list-head-at text idx)]
-                           (and (seq head)
-                                (not (contains? non-effect-wrapper-heads head)))))
-                  [idx end]
-                  (recur previous))
-                (recur previous)))))))))
+        (let [visible (code-visible-text text)]
+          (loop [idx (.lastIndexOf visible "(" caret)]
+            (when (and (>= idx 0) (> idx fx-open))
+              (let [previous (.lastIndexOf visible "(" (dec idx))]
+                (if-let [end (matching-close text idx \( \))]
+                  (if (and (<= idx caret end)
+                           (< end fx-close)
+                           (let [head (list-head-at text idx)]
+                             (and (seq head)
+                                  (not (contains? non-effect-wrapper-heads head)))))
+                    [idx end]
+                    (recur previous))
+                  (recur previous))))))))))
 
 (defn gate-wrapper-text [gate effect indent]
   (let [effect-indent (str indent "  ")
@@ -528,7 +649,7 @@
 (defn wrap-effect-on-gate! [^JTextComponent editor]
   (let [text (.getText editor)
         caret (.getCaretPosition editor)
-        gate (or (current-track-gate-form editor) "(p [])")]
+        gate (or (current-track-gate-form editor) "(p [1 0])")]
     (if-let [[start end] (enclosing-effect-range text caret)]
       (let [indent (line-indent-at-offset text start)
             effect (subs text start (inc end))
@@ -538,18 +659,20 @@
       (insert-effect-smart! editor (fx-gate-snippet editor)))))
 
 (defn top-level-insert-offset [text caret]
-  (if-let [[_ end] (loop [idx (.lastIndexOf text "(" (max 0 (min caret (count text))))
+  (let [visible (code-visible-text text)
+        caret (max 0 (min caret (count text)))]
+    (if-let [[_ end] (loop [idx (.lastIndexOf visible "(" caret)
                           outermost nil]
                      (if (>= idx 0)
                        (if-let [end (matching-close text idx \( \))]
-                         (recur (.lastIndexOf text "(" (dec idx))
+                         (recur (.lastIndexOf visible "(" (dec idx))
                                 (if (<= idx caret end)
                                   [idx end]
                                   outermost))
-                         (recur (.lastIndexOf text "(" (dec idx)) outermost))
+                         (recur (.lastIndexOf visible "(" (dec idx)) outermost))
                        outermost))]
-    (inc end)
-    caret))
+      (inc end)
+      caret)))
 
 (defn ensure-leading-newline-for-top-level-insert [text offset snippet]
   (let [needs-leading-newline? (and (pos? offset)
@@ -597,13 +720,14 @@
           (sort-by first > (form-ranges text "def")))))
 
 (defn enclosing-open-form-start [text caret symbols]
-  (let [caret (max 0 (min caret (count text)))]
-    (loop [idx (.lastIndexOf text "(" caret)]
+  (let [visible (code-visible-text text)
+        caret (max 0 (min caret (count text)))]
+    (loop [idx (.lastIndexOf visible "(" caret)]
       (when (>= idx 0)
         (if (and (some #(form-symbol-at? text idx %) symbols)
                  (not (matching-close text idx \( \))))
           idx
-          (recur (.lastIndexOf text "(" (dec idx))))))))
+          (recur (.lastIndexOf visible "(" (dec idx))))))))
 
 (defn enclosing-open-scene-start [text caret]
   (enclosing-open-form-start text caret ["scene" "block"]))
@@ -733,22 +857,23 @@
            (contains? #{\( \) \[ \] \;} ch))))
 
 (defn scalar-token-range-at-caret [text caret]
-  (let [caret (max 0 (min caret (count text)))
+  (let [visible (code-visible-text text)
+        caret (max 0 (min caret (count text)))
         probe (cond
                 (and (< caret (count text))
-                     (scalar-token-char? (.charAt text caret))) caret
+                     (scalar-token-char? (.charAt visible caret))) caret
                 (and (pos? caret)
-                     (scalar-token-char? (.charAt text (dec caret)))) (dec caret)
+                     (scalar-token-char? (.charAt visible (dec caret)))) (dec caret)
                 :else nil)]
     (when probe
       (let [start (loop [idx probe]
                     (if (and (pos? idx)
-                             (scalar-token-char? (.charAt text (dec idx))))
+                             (scalar-token-char? (.charAt visible (dec idx))))
                       (recur (dec idx))
                       idx))
             end (loop [idx (inc probe)]
                   (if (and (< idx (count text))
-                           (scalar-token-char? (.charAt text idx)))
+                           (scalar-token-char? (.charAt visible idx)))
                     (recur (inc idx))
                     idx))]
         [start end]))))
@@ -757,7 +882,11 @@
   (#{"+" "-" "*" "/"} option))
 
 (defn arithmetic-token-wrapper [option token]
-  (str "(" option " " token " )"))
+  (let [fallback (case option
+                   ("+" "-") "1"
+                   ("*" "/") "2"
+                   "1")]
+    (str "(" option " " token " " fallback ")")))
 
 (defn insert-math-logic-form! [^JTextComponent editor option snippet]
   (let [text (.getText editor)
@@ -785,43 +914,72 @@
      "Post FX" (post-fx-form-for-label option include-comments?)
      "Scene" (case option
                "scene" (insert-scene-template scene include-comments?)
-               "scene chain" (str "(scene :" scene " :next :next-scene\n"
-                                  "  )\n\n"
-                                  "(scene :next-scene\n"
-                                  "  )\n\n"
+               "looping scene" (str "(scene :" scene " :loop true\n"
+                                    "  (d :lead\n"
+                                    "     :src :sine-synth\n"
+                                    "     :note c3\n"
+                                    "     :gate (p [1 0 1 0])\n"
+                                    "     :dur 0.12\n"
+                                    "     :amp 0.2))\n\n"
+                                    "(play-scene :" scene ")\n")
+               "scene chain" (str "(scene :" scene " :repeat 1 :next :next-scene\n"
+                                  "  (d :lead\n"
+                                  "     :src :sine-synth\n"
+                                  "     :note c3\n"
+                                  "     :gate (p [1 0 1 0])\n"
+                                  "     :dur 0.12\n"
+                                  "     :amp 0.2))\n\n"
+                                  "(scene :next-scene :loop true\n"
+                                  "  (d :lead\n"
+                                  "     :src :sine-synth\n"
+                                  "     :note e3\n"
+                                  "     :gate (p [1 1 0 1])\n"
+                                  "     :dur 0.12\n"
+                                  "     :amp 0.2))\n\n"
                                   "(play-scene :" scene ")\n")
-               "by-scene track" (str "(d :lead\n"
-                                     "   :src :sine-synth\n"
-                                     "   :note (by-scene\n"
-                                     "          :" scene " null\n"
-                                     "          :else null)\n"
-                                     "   :gate (by-scene\n"
-                                     "          :" scene " null\n"
-                                     "          :else null))\n")
+               "by-scene track" (str "(def lead\n"
+                                     "  (d :lead\n"
+                                     "     :src :sine-synth\n"
+                                     "     :note (by-scene\n"
+                                     "            :" scene " c3\n"
+                                     "            :next-scene e3\n"
+                                     "            :else g3)\n"
+                                     "     :gate (by-scene\n"
+                                     "            :" scene " (p [1 0 1 0])\n"
+                                     "            :next-scene (p [1 1 0 1])\n"
+                                     "            :else (p [1 0 0 0]))\n"
+                                     "     :dur 0.12\n"
+                                     "     :amp 0.2))\n\n"
+                                     "(scene :" scene " :repeat 1 :next :next-scene\n"
+                                     "  lead)\n\n"
+                                     "(scene :next-scene :loop true\n"
+                                     "  lead)\n\n"
+                                     "(play-scene :" scene ")\n")
                "")
      "Pattern" (case option
-                 "p :repeat" "(p :repeat 2 [])"
+                 "p :repeat" "(p :repeat 2 [1 0])"
+                 "then / times" "(p (then\n     (times 2 [1 0 0 0])\n     [1 1 1 1]))"
                  "every-n" "(every-n 4 1 0)"
                  "euclid-rot" "(euclid-rot 5 16 0)"
                  "held gates" "(p [1_ 0 1_2 0])"
                  "nested subdivisions" "(p [[1 0] [0 1]])"
                  "")
      "Math / Logic" (case option
-                      "+" "(+ )"
-                      "-" "(- )"
-                      "*" "(* )"
-                      "/" "(/ )"
-                      "map and" "(map and [] [])"
-                      "map or" "(map or [] [])"
-                      "map not" "(map not [])"
-                      "map transpose" "(map transpose [] 12)"
-                      "range" "(range )"
-                      "repeat" "(repeat 2 [])"
-                      "take" "(take 8 [])"
-                      "reverse" "(reverse [])"
-                      "rotate" "(rotate 1 [])"
-                      "interleave" "(interleave [] [])"
-                      "choose" "(choose :count 8 :seed 1 [])"
+                      "+" "(+ 1 2)"
+                      "-" "(- 4 1)"
+                      "*" "(* 2 4)"
+                      "/" "(/ 8 2)"
+                      "map and" "(map and [1 0 1] [1 1 0])"
+                      "map or" "(map or [1 0 1] [0 1 0])"
+                      "map not" "(map not [1 0 1])"
+                      "map transpose" "(map transpose [c3 d3 e3] 12)"
+                      "range" "(range 0 8 1)"
+                      "repeat" "(repeat 2 [1 0])"
+                      "take" "(take 8 [1 0 1 0 1 0 1 0 1 0])"
+                      "reverse" "(reverse [c3 e3 g3])"
+                      "rotate" "(rotate 1 [1 0 0])"
+                      "interleave" "(interleave [1 1] [0 0])"
+                      "choose" "(choose :count 8 :seed 1 [c3 e3 g3])"
                       "rand-range" "(rand-range :count 8 :seed 1 :min 0 :max 1)"
                       "scale" "(scale c3 :minor 8)"
                       "chord" "(chord c3 :minor7)"
@@ -831,11 +989,17 @@
                       "transpose" "(transpose c3 12)"
                       "")
      "Playback" (case option
-                  "play-scene" (str "(play-scene :" scene ")\n")
-                  "bpm" "(bpm )\n"
-                  "mute" "(mute :track)\n"
-                  "solo" "(solo :track)\n"
-                  "clear" "(clear :track)\n"
+                  "start!" (playback-start-snippet editor)
+                  "stop!" (playback-stop-snippet editor)
+                  "play-scene" (playback-scene-snippet editor scene)
+                  "play-note" "(play-note c3)\n"
+                  "bpm" "(bpm 100)\n"
+                  "mute" (playback-track-snippet editor "mute")
+                  "unmute" (playback-track-snippet editor "unmute")
+                  "solo" (playback-track-snippet editor "solo")
+                  "unsolo" (playback-track-snippet editor "unsolo")
+                  "clear" (playback-track-snippet editor "clear")
+                  "clear-all" (playback-clear-all-snippet editor)
                   "")
      "")))
 
@@ -851,14 +1015,24 @@
     (when-not (str/blank? snippet)
       (if (and (#{"FX" "Effect"} category)
                (= option "on :gate"))
-        (wrap-effect-on-gate! editor)
+        (if (enclosing-track-range (.getText editor) (.getCaretPosition editor))
+          (wrap-effect-on-gate! editor)
+          (insert-track-form! editor (standalone-fx-track-snippet snippet)))
         (if (#{"FX" "Effect"} category)
-        (insert-effect-smart! editor snippet)
+        (if (enclosing-track-range (.getText editor) (.getCaretPosition editor))
+          (insert-effect-smart! editor snippet)
+          (insert-track-form! editor (standalone-fx-track-snippet snippet)))
         (cond
           (= "Scene" category) (insert-scene-form! editor snippet (not (:remove-insert-comments @state)))
+          (and (= "Post FX" category)
+               (str/blank? (.getText editor))) (insert-top-level-form! editor (standalone-post-fx-snippet snippet))
+          (and (= "Oscillator" category)
+               (str/blank? (.getText editor))) (insert-top-level-form! editor (str snippet "\n(start!)\n"))
           (top-level-insert-category? category) (insert-top-level-form! editor snippet)
           (track-insert-category? category) (insert-track-form! editor snippet)
           (= "Math / Logic" category) (insert-math-logic-form! editor option snippet)
+          (and (= "Pattern" category)
+               (str/blank? (.getText editor))) (insert-top-level-form! editor (standalone-pattern-track-snippet snippet))
           :else (insert-at-caret! editor snippet)))))))
 
 (def null-parameter-names
@@ -1096,6 +1270,10 @@
   (let [file (some-> (first args) File.)]
     (SwingUtilities/invokeLater #(build-ui file))))
 
-(when-not (or (System/getenv "GLITCHLISP_NO_GUI")
-              (System/getProperty "glitchlisp.noGui"))
+(defn no-gui-mode? []
+  (or (System/getenv "GLITCHLISP_NO_GUI")
+      (System/getProperty "glitchlisp.noGui")
+      (GraphicsEnvironment/isHeadless)))
+
+(when-not (no-gui-mode?)
   (apply -main *command-line-args*))

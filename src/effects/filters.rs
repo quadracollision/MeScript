@@ -37,15 +37,17 @@ pub struct Comb {
     buffer: Vec<f32>,
     pos: usize,
     feedback: f32,
+    mix: f32,
 }
 
 impl Comb {
-    pub fn new(delay_ms: f32, feedback: f32, _mix: f32, sample_rate: f32) -> Self {
+    pub fn new(delay_ms: f32, feedback: f32, mix: f32, sample_rate: f32) -> Self {
         let samples = (delay_ms.clamp(0.1, 250.0) * sample_rate / 1_000.0).floor() as usize;
         Self {
             buffer: vec![0.0; samples.max(1)],
             pos: 0,
             feedback: feedback.clamp(0.0, 0.95),
+            mix: mix.clamp(0.0, 1.0),
         }
     }
 
@@ -53,7 +55,8 @@ impl Comb {
         let delayed = self.buffer[self.pos];
         self.buffer[self.pos] = sample;
         self.pos = (self.pos + 1) % self.buffer.len();
-        sample + delayed * self.feedback
+        let wet = sample + delayed * self.feedback;
+        sample * (1.0 - self.mix) + wet * self.mix
     }
 
     #[cfg(test)]
@@ -65,10 +68,11 @@ impl Comb {
 #[derive(Clone, Debug)]
 pub struct Formant {
     bands: Vec<Biquad>,
+    mix: f32,
 }
 
 impl Formant {
-    pub fn new(vowel: Vowel, _mix: f32, sample_rate: f32) -> Self {
+    pub fn new(vowel: Vowel, mix: f32, sample_rate: f32) -> Self {
         let freqs = match vowel {
             Vowel::A => [800.0, 1150.0, 2900.0, 3900.0, 4950.0],
             Vowel::E => [350.0, 2000.0, 2800.0, 3600.0, 4950.0],
@@ -82,15 +86,18 @@ impl Formant {
                 .filter(|freq| *freq < sample_rate * 0.5)
                 .map(|freq| Biquad::new(FilterKind::Bandpass, freq, 0.3, sample_rate))
                 .collect(),
+            mix: mix.clamp(0.0, 1.0),
         }
     }
 
     pub fn process(&mut self, sample: f32) -> f32 {
-        self.bands
+        let wet = self
+            .bands
             .iter_mut()
             .map(|band| band.process(sample))
             .sum::<f32>()
-            * 0.3
+            * 0.3;
+        sample * (1.0 - self.mix) + wet * self.mix
     }
 }
 

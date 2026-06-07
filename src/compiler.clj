@@ -218,7 +218,27 @@
   (let [n (numeric-value value)]
     (when (neg? n)
       (throw (ex-info (str form-name " count must be non-negative") {:value value})))
+    (when-not (zero? (mod n 1))
+      (throw (ex-info (str form-name " count must be a whole number") {:value value})))
     (int n)))
+
+(defn whole-number-value [value form-name label]
+  (let [n (numeric-value value)]
+    (when-not (zero? (mod n 1))
+      (throw (ex-info (str form-name " " label " must be a whole number") {:value value})))
+    (int n)))
+
+(defn whole-number-long-value [value form-name label]
+  (let [n (numeric-value value)]
+    (when-not (zero? (mod n 1))
+      (throw (ex-info (str form-name " " label " must be a whole number") {:value value})))
+    (long n)))
+
+(defn strictly-positive-count [value form-name]
+  (let [n (positive-count value form-name)]
+    (when (zero? n)
+      (throw (ex-info (str form-name " count must be greater than zero") {:value value})))
+    n))
 
 (defn vector-value [value form-name]
   (if (vector? value)
@@ -227,7 +247,8 @@
 
 (defn transpose-value [value semitones]
   (if (note-symbol? value)
-    (midi->note (+ (note->midi value) (int (numeric-value semitones))))
+    (midi->note (+ (note->midi value)
+                   (whole-number-value semitones "transpose" "semitones")))
     (+ (numeric-value value) (numeric-value semitones))))
 
 (defn arithmetic-form [op values]
@@ -267,25 +288,27 @@
     (if (or (note-symbol? start) (note-symbol? end))
       (let [start-midi (note->midi start)
             end-midi (note->midi end)]
-        (mapv midi->note (range start-midi end-midi (int step))))
+        (mapv midi->note (range start-midi
+                                end-midi
+                                (whole-number-value step "range" "note step"))))
       (vec (range (numeric-value start) (numeric-value end) step)))))
 
 (defn generated-repeat [args]
-  (let [[n value & extra] args]
-    (when extra
-      (throw (ex-info "repeat expects count and one value" {:args args})))
+  (when-not (= 2 (count args))
+    (throw (ex-info "repeat expects count and one value" {:args args})))
+  (let [[n value] args]
     (let [n (positive-count n "repeat")]
       (if (vector? value)
         (vec (apply concat (repeat n value)))
         (vec (repeat n value))))))
 
 (defn generated-take [args]
-  (let [[n value & extra] args]
-    (when extra
-      (throw (ex-info "take expects count and one vector" {:args args})))
-    (let [n (positive-count n "take")
-          values (vector-value value "take")]
-      (vec (take n values)))))
+  (when-not (= 2 (count args))
+    (throw (ex-info "take expects count and one vector" {:args args})))
+  (let [[n value] args
+        n (positive-count n "take")
+        values (vector-value value "take")]
+    (vec (take n values))))
 
 (defn generated-reverse [args]
   (let [[value & extra] args]
@@ -294,23 +317,27 @@
     (vec (reverse (vector-value value "reverse")))))
 
 (defn generated-rotate [args]
-  (let [[n value & extra] args]
-    (when extra
-      (throw (ex-info "rotate expects amount and one vector" {:args args})))
-    (let [values (vector-value value "rotate")
-          size (count values)]
-      (if (zero? size)
-        []
-        (let [amount (mod (int (numeric-value n)) size)]
-          (vec (concat (drop amount values) (take amount values))))))))
+  (when-not (= 2 (count args))
+    (throw (ex-info "rotate expects amount and one vector" {:args args})))
+  (let [[n value] args
+        values (vector-value value "rotate")
+        size (count values)]
+    (if (zero? size)
+      []
+      (let [amount (mod (whole-number-value n "rotate" "amount") size)]
+        (vec (concat (drop amount values) (take amount values)))))))
 
 (defn generated-interleave [args]
   (let [vectors (map #(vector-value % "interleave") args)]
     (when (empty? vectors)
       (throw (ex-info "interleave expects at least one vector" {:args args})))
+    (when-not (apply = (map count vectors))
+      (throw (ex-info "interleave vectors must have the same length" {:args args})))
     (vec (apply concat (apply map vector vectors)))))
 
 (defn generated-every-n [args]
+  (when-not (<= 2 (count args) 3)
+    (throw (ex-info "every-n expects n, hit value, and optional rest value" {:args args})))
   (let [[n hit & more] args
         [rest-value extra] (case (count more)
                              0 [0 nil]
@@ -318,7 +345,7 @@
                              [(first more) (rest more)])]
     (when (seq extra)
       (throw (ex-info "every-n expects n, hit value, and optional rest value" {:args args})))
-    (let [n (max 1 (positive-count n "every-n"))]
+    (let [n (strictly-positive-count n "every-n")]
       (mapv (fn [idx] (if (zero? (mod idx n)) hit rest-value))
             (range n)))))
 
@@ -326,16 +353,49 @@
   (let [next-seed (mod (+ (* 1664525 (long seed)) 1013904223) 4294967296)]
     [next-seed (/ next-seed 4294967296.0)]))
 
-(defn option-value [args key default]
-  (let [pairs (partition 2 args)]
-    (if-let [match (some (fn [[k v]] (when (= k key) v)) pairs)]
-      match
-      default)))
+(defn option-map [form-name allowed args]
+  (loop [remaining args
+         options {}]
+    (cond
+      (empty? remaining)
+      options
+
+      (not (keyword? (first remaining)))
+      (throw (ex-info (str form-name " options must be keyword/value pairs")
+                      {:args args
+                       :value (first remaining)}))
+
+      (not (contains? allowed (first remaining)))
+      (throw (ex-info (str "unknown " form-name " option " (first remaining))
+                      {:args args
+                       :option (first remaining)}))
+
+      (empty? (rest remaining))
+      (throw (ex-info (str form-name " " (first remaining) " requires a value")
+                      {:args args
+                       :option (first remaining)}))
+
+      (contains? options (first remaining))
+      (throw (ex-info (str "duplicate " form-name " option " (first remaining))
+                      {:args args
+                       :option (first remaining)}))
+
+      :else
+      (recur (nnext remaining)
+             (assoc options (first remaining) (second remaining))))))
+
+(defn option-value [options key default]
+  (if (contains? options key)
+    (get options key)
+    default))
 
 (defn generated-choose [args]
-  (let [seed (long (numeric-value (option-value args :seed 1)))
-        n (positive-count (option-value args :count 8) "choose")
-        values (vector-value (last args) "choose")]
+  (when (empty? args)
+    (throw (ex-info "choose expects options and one vector" {:args args})))
+  (let [values (vector-value (last args) "choose")
+        options (option-map "choose" #{:seed :count} (butlast args))
+        seed (whole-number-long-value (option-value options :seed 1) "choose" "seed")
+        n (positive-count (option-value options :count 8) "choose")]
     (when (empty? values)
       (throw (ex-info "choose requires a non-empty vector" {:args args})))
     (loop [seed seed
@@ -347,10 +407,16 @@
           (recur next-seed (conj out (values (min idx (dec (count values)))))))))))
 
 (defn generated-rand-range [args]
-  (let [seed (long (numeric-value (option-value args :seed 1)))
-        n (positive-count (option-value args :count 8) "rand-range")
-        min-value (numeric-value (option-value args :min 0))
-        max-value (numeric-value (option-value args :max 1))]
+  (let [options (option-map "rand-range" #{:seed :count :min :max} args)
+        seed (whole-number-long-value (option-value options :seed 1) "rand-range" "seed")
+        n (positive-count (option-value options :count 8) "rand-range")
+        min-value (numeric-value (option-value options :min 0))
+        max-value (numeric-value (option-value options :max 1))]
+    (when (< max-value min-value)
+      (throw (ex-info "rand-range :max must be greater than or equal to :min"
+                      {:args args
+                       :min min-value
+                       :max max-value})))
     (loop [seed seed
            out []]
       (if (= (count out) n)
@@ -359,56 +425,56 @@
           (recur next-seed (conj out (+ min-value (* r (- max-value min-value))))))))))
 
 (defn generated-scale [args]
-  (let [[root scale-name scale-count & extra] args]
-    (when extra
-      (throw (ex-info "scale expects root, scale name, and count" {:args args})))
-    (let [intervals (or (get scales scale-name)
-                        (throw (ex-info "unknown scale" {:scale scale-name})))
-          root-midi (note->midi root)
-          n (positive-count scale-count "scale")
-          width (count intervals)]
-      (mapv (fn [idx]
-              (midi->note (+ root-midi
-                             (intervals (mod idx width))
-                             (* 12 (quot idx width)))))
-            (range n)))))
+  (when-not (= 3 (count args))
+    (throw (ex-info "scale expects root, scale name, and count" {:args args})))
+  (let [[root scale-name scale-count] args
+        intervals (or (get scales scale-name)
+                      (throw (ex-info "unknown scale" {:scale scale-name})))
+        root-midi (note->midi root)
+        n (positive-count scale-count "scale")
+        width (count intervals)]
+    (mapv (fn [idx]
+            (midi->note (+ root-midi
+                           (intervals (mod idx width))
+                           (* 12 (quot idx width)))))
+          (range n))))
 
 (defn generated-chord [args]
-  (let [[root chord-form & extra] args]
-    (when extra
-      (throw (ex-info "chord expects root and chord name or interval vector" {:args args})))
-    (let [intervals (cond
-                      (keyword? chord-form)
-                      (or (get chords chord-form)
-                          (throw (ex-info "unknown chord" {:chord chord-form})))
+  (when-not (= 2 (count args))
+    (throw (ex-info "chord expects root and chord name or interval vector" {:args args})))
+  (let [[root chord-form] args
+        intervals (cond
+                    (keyword? chord-form)
+                    (or (get chords chord-form)
+                        (throw (ex-info "unknown chord" {:chord chord-form})))
 
-                      (vector? chord-form)
-                      (mapv #(numeric-value %) chord-form)
+                    (vector? chord-form)
+                    (mapv #(numeric-value %) chord-form)
 
-                      :else
-                      (throw (ex-info "chord expects a chord name or interval vector"
-                                      {:chord chord-form})))
-          root-midi (note->midi root)]
-      (mapv #(midi->note (+ root-midi %)) intervals))))
+                    :else
+                    (throw (ex-info "chord expects a chord name or interval vector"
+                                    {:chord chord-form})))
+        root-midi (note->midi root)]
+    (mapv #(midi->note (+ root-midi %)) intervals)))
 
 (defn generated-arpeggio [args]
   (generated-chord args))
 
 (defn generated-shape [args]
-  (let [[values positions & extra] args]
-    (when extra
-      (throw (ex-info "shape expects a vector and a vector of 1-based positions" {:args args})))
-    (let [values (vector-value values "shape")
-          positions (vector-value positions "shape")]
-      (mapv (fn [position]
-              (let [n (positive-count position "shape position")]
-                (when (zero? n)
-                  (throw (ex-info "shape positions are 1-based" {:position position})))
-                (or (get values (dec n))
-                    (throw (ex-info "shape position is outside the source vector"
-                                    {:position position
-                                     :size (count values)})))))
-            positions))))
+  (when-not (= 2 (count args))
+    (throw (ex-info "shape expects a vector and a vector of 1-based positions" {:args args})))
+  (let [[values positions] args
+        values (vector-value values "shape")
+        positions (vector-value positions "shape")]
+    (mapv (fn [position]
+            (let [n (positive-count position "shape position")]
+              (when (zero? n)
+                (throw (ex-info "shape positions are 1-based" {:position position})))
+              (or (get values (dec n))
+                  (throw (ex-info "shape position is outside the source vector"
+                                  {:position position
+                                   :size (count values)})))))
+          positions)))
 
 (defn expand-list-items [env items]
   (loop [remaining items
@@ -433,23 +499,61 @@
       output)))
 
 (defn expand-p-form [env args]
-  (if (and (= :repeat (first args)) (>= (count args) 3))
-    (let [n-form (second args)
-          pattern-form (nth args 2)
-          n (if (number? n-form)
-              (int n-form)
-              (throw (ex-info "p :repeat requires a numeric repeat count" {:form n-form})))
-          expanded-pattern (expand-expr env pattern-form)]
-      (when-not (vector? expanded-pattern)
-        (throw (ex-info "p :repeat requires a vector pattern" {:form pattern-form})))
-      (list 'p (repeat-pattern (max 0 n) expanded-pattern)))
+  (if (= :repeat (first args))
+    (do
+      (when-not (= 3 (count args))
+        (throw (ex-info "p :repeat expects count and one vector pattern" {:args args})))
+      (let [n-form (second args)
+            pattern-form (nth args 2)
+            n (if (number? n-form)
+                (positive-count n-form "p :repeat")
+                (throw (ex-info "p :repeat requires a numeric repeat count" {:form n-form})))
+            expanded-pattern (expand-expr env pattern-form)]
+        (when-not (vector? expanded-pattern)
+          (throw (ex-info "p :repeat requires a vector pattern" {:form pattern-form})))
+        (list 'p (repeat-pattern n expanded-pattern))))
     (let [pattern-form (first args)
           expanded-items (expand-list-items env args)]
+      (when (empty? args)
+        (throw (ex-info "p requires a pattern" {:args args})))
+      (when (> (count args) 1)
+        (if (some #(= 'then %) (rest args))
+          (throw (ex-info "p wraps exactly one pattern; use (p (then A B)) instead of (p A then B)"
+                          {:args args}))
+          (throw (ex-info "p expects one pattern" {:args args}))))
       (if (and (= 1 (count args))
                (seq? pattern-form)
                (contains? #{'chord 'shape} (first pattern-form)))
         (list 'p [(first expanded-items)])
         (apply list 'p expanded-items)))))
+
+(defn positive-runtime-count [value form-name]
+  (when-not (number? value)
+    (throw (ex-info "expected numeric pattern value" {:value value})))
+  (when (or (neg? value) (not (zero? (mod value 1))))
+    (throw (ex-info (str form-name " must be a non-negative integer") {:value value})))
+  (when (zero? value)
+    (throw (ex-info (str form-name " must be greater than zero") {:value value})))
+  (int value))
+
+(defn expand-times-form [env args]
+  (let [count-form (first args)
+        pattern-form (second args)]
+    (when-not count-form
+      (throw (ex-info "times requires a count" {:args args})))
+    (when-not pattern-form
+      (throw (ex-info "times requires a pattern" {:args args})))
+    (when-not (= 2 (count args))
+      (throw (ex-info "times expects count and one pattern" {:args args})))
+    (let [expanded-count (expand-expr env count-form)
+          _ (positive-runtime-count expanded-count "times")
+          expanded-pattern (expand-expr env pattern-form)]
+      (list 'times expanded-count expanded-pattern))))
+
+(defn expand-then-form [env args]
+  (when (< (count args) 2)
+    (throw (ex-info "then expects at least two patterns" {:args args})))
+  (apply list 'then (map #(expand-expr env %) args)))
 
 (defn expand-map-form [env args]
   (let [[op & sources] args
@@ -459,7 +563,10 @@
       (throw (ex-info "map expects an operation and at least one value source" {:args args})))
     (when (empty? vectors)
       (throw (ex-info "map expects at least one vector source" {:args args})))
-    (let [n (apply min (map count vectors))]
+    (let [lengths (map count vectors)
+          n (first lengths)]
+      (when-not (apply = lengths)
+        (throw (ex-info "map vector sources must have the same length" {:args args})))
       (mapv (fn [idx]
               (let [values (map (fn [source]
                                   (if (vector? source)
@@ -468,6 +575,89 @@
                                 expanded-sources)]
                 (expand-expr env (apply list op values))))
             (range n)))))
+
+(defn validate-sample-data-cell! [value]
+  (cond
+    (number? value) true
+    (note-symbol? value) true
+    (symbol? value) (throw (ex-info (str "unknown symbol '" value "'") {:value value}))
+    :else (throw (ex-info "expected number or note" {:value value}))))
+
+(defn validate-sample-data-value! [value]
+  (when-not (vector? value)
+    (throw (ex-info "sample-data must be a vector" {:value value})))
+  (when (empty? value)
+    (throw (ex-info "sample-data requires at least one value" {:value value})))
+  (doseq [cell value]
+    (validate-sample-data-cell! cell))
+  value)
+
+(defn null-symbol? [value]
+  (and (symbol? value)
+       (#{"nil" "null"} (name value))))
+
+(defn validate-sample-path-value! [value]
+  (when-not (or (string? value) (null-symbol? value))
+    (throw (ex-info "expected string" {:value value})))
+  value)
+
+(defn expand-sample-options [env options]
+  (->> (partition 2 options)
+       (mapcat (fn [[key value]]
+                 (cond
+                   (#{:sample-data :sample_data} key)
+                   [key (validate-sample-data-value! (expand-expr env value))]
+
+                   (#{:sample :sample-path :sample_path} key)
+                   [key (validate-sample-path-value! (expand-expr env value))]
+
+                   :else
+                   [key value])))))
+
+(defn expand-sample-form [env args]
+  (let [[id sample-arg & more] args
+        inline-options? (keyword? sample-arg)
+        options (if inline-options?
+                  (cons sample-arg more)
+                  more)]
+    (when-not id
+      (throw (ex-info "sample requires a track id" {:args args})))
+    (when-not (keyword? id)
+      (throw (ex-info "sample track id must be a keyword" {:args args
+                                                           :id id})))
+    (when-not sample-arg
+      (throw (ex-info "sample requires a wav path or :sample-data" {:args args})))
+    (loop [remaining options]
+      (when (seq remaining)
+        (when-not (keyword? (first remaining))
+          (throw (ex-info "sample options must be keyword/value pairs"
+                          {:args args
+                           :value (first remaining)})))
+        (when-not (seq (rest remaining))
+          (throw (ex-info (str "sample " (first remaining) " requires a value")
+                          {:args args
+                           :option (first remaining)})))
+        (recur (nnext remaining))))
+    (when-not inline-options?
+      (validate-sample-path-value! (expand-expr env sample-arg)))
+    (let [options (expand-sample-options env options)
+          provided (set (take-nth 2 options))
+          has-sample-source? (boolean (some provided [:sample-data :sample_data
+                                                      :sample :sample-path :sample_path]))
+          sample-path-items (when-not inline-options? [:sample-path sample-arg])
+          defaults (mapcat identity
+                           (remove #(contains? provided (first %))
+                                   [[:note 'c3]
+                                    [:gate 1]
+                                    [:dur 1]
+                                    [:amp 1]]))]
+      (when (and inline-options? (not has-sample-source?))
+        (throw (ex-info "sample requires a wav path or :sample-data" {:args args})))
+      (expand-expr env
+                   (apply list
+                          'd id
+                          :src :sample
+                          (concat sample-path-items defaults options))))))
 
 (defn expand-expr [env expr]
   (cond
@@ -512,11 +702,14 @@
         arp (generated-arpeggio @expanded-args)
         shape (generated-shape @expanded-args)
         transpose (let [[value semitones & extra] @expanded-args]
-                    (when extra
+                    (when-not (= 2 (count @expanded-args))
                       (throw (ex-info "transpose expects value and semitones" {:args @expanded-args})))
                     (transpose-value value semitones))
         map (expand-map-form env args)
         p (expand-p-form env args)
+        times (expand-times-form env args)
+        then (expand-then-form env args)
+        sample (expand-sample-form env args)
         tracks (apply list 'tracks (expand-list-items env args))
         (apply list (expand-list-items env expr))))
 
@@ -575,6 +768,6 @@
   (let [[input output] args]
     (when-not (and input output)
       (binding [*out* *err*]
-        (println "usage: clojure src/compiler.clj <input.gl> <output.gl>"))
+        (println "usage: ./glitchlisp-native compile <input.gl> <output.gl>"))
       (System/exit 2))
     (compile-file! input output)))

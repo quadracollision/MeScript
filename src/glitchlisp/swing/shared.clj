@@ -21,6 +21,8 @@
          :live-auto-edit-token 0
          :live-auto-last-error nil
          :live-highlight-step nil
+         :live-highlight-scene nil
+         :live-cycle nil
          :live-highlight-scheduled false
          :audio-device nil
          :remove-insert-comments true}))
@@ -52,14 +54,17 @@
                (:live-process snapshot))))
 
 (defn live-status-lines [snapshot]
-  [(str "Device: " (or (:live-audio-info snapshot)
-                       (:audio-device snapshot)
-                       default-audio-device-label))
-   (str "State: " (if (live-running? snapshot) "running" "stopped"))
-   (str "Tracks: " (or (:live-tracks snapshot) "-"))
-   (str "Scenes: " (or (:live-scenes snapshot) "-"))
-   (str "Step: " (or (:live-highlight-step snapshot) "-"))
-   (str "Error: " (or (:live-last-error snapshot) "-"))])
+  (let [running? (live-running? snapshot)]
+    [(str "Device: " (or (:live-audio-info snapshot)
+                         (:audio-device snapshot)
+                         default-audio-device-label))
+     (str "State: " (if running? "running" "stopped"))
+     (str "Tracks: " (or (:live-tracks snapshot) "-"))
+     (str "Scenes: " (or (:live-scenes snapshot) "-"))
+     (str "Scene: " (if running? (or (:live-highlight-scene snapshot) "-") "-"))
+     (str "Cycle: " (if running? (or (:live-cycle snapshot) "-") "-"))
+     (str "Step: " (if running? (or (:live-highlight-step snapshot) "-") "-"))
+     (str "Error: " (or (:live-last-error snapshot) "-"))]))
 
 (defn selected-audio-device [^JComboBox combo]
   (let [selected (.getSelectedItem combo)]

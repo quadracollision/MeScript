@@ -4,8 +4,7 @@
   (:import
     [javax.swing JComboBox]))
 
-(def default-source
-  "")
+(def default-source "")
 
 (defn load-oscillators []
   (try
@@ -48,14 +47,16 @@
    "Sample" 4})
 
 (def oscillator-source-group-labels
-  {"Synth" "/Synths"
-   "Noise" "/Noise"
-   "Drum" "/Drums"
-   "Percussion" "/Percussion"
-   "Sample" "/Sample"})
+  {"Synth" "Synth"
+   "Noise" "Noise"
+   "Drum" "Drum"
+   "Percussion" "Percussion"
+   "Sample" "Sample"})
 
 (defn oscillator-option-label [source]
-  source)
+  (str (get oscillator-source-group-labels (oscillator-source-group source) "Other")
+       " / "
+       source))
 
 (defn oscillator-option-header? [option]
   (str/starts-with? (str option) "/"))
@@ -74,20 +75,12 @@
          (sort-by val)
          (mapcat (fn [[group _]]
                    (when-let [sources (seq (sort (get grouped group)))]
-                     (cons (get oscillator-source-group-labels group)
-                           (map oscillator-option-label sources))))))))
+                     (map oscillator-option-label sources)))))))
 
 (defn track-id-for-source [source]
-  (cond
-    (str/includes? source "kick") "kick"
-    (str/includes? source "snare") "snare"
-    (or (= source "hat") (str/includes? source "hat")) "hat"
-    (some #{source} ["cowbell" "cowbell-808" "woodblock" "rimshot" "shaker" "clap" "tom"]) "perc"
-    (some #{source} ["fm-op" "pluck" "bass-slap"]) "bass"
-    (some #{source} ["pad-wash" "strings" "brass" "organ" "drone-dark"]) "pad"
-    (some #{source} ["bell" "glass" "vocal" "breath"]) "tone"
-    (str/includes? source "noise") "noise"
-    :else "lead"))
+  (-> source
+      (str/replace #"-synth$" "")
+      (str/replace #"[^A-Za-z0-9_-]" "-")))
 
 (defn defaults-for-source [source]
   (cond
@@ -116,7 +109,8 @@
     {:note "(p [c3 eb3 g3 bb3])" :gate "(p [1 0 1 0 0 1 0 1])" :dur "0.12" :amp "0.16" :extra ""}))
 
 (def detune-capable-sources
-  #{"sine-synth" "saw-synth" "tri-synth" "supersaw" "additive" "pad-wash"})
+  #{"sine-synth" "saw-synth" "square-synth" "tri-synth" "pulse" "morph"
+    "supersaw" "wavetable" "fm-op" "additive" "sync" "pwm-sweep" "pad-wash"})
 
 (def phase-capable-sources
   #{"sine-synth" "saw-synth" "square-synth" "tri-synth" "pulse" "morph"
@@ -184,16 +178,29 @@
   ([source]
    (oscillator-structure-snippet source true))
   ([source include-comments?]
-   (str "(d :" (track-id-for-source source) "\n"
-        "   :src :" source (param-contract oscillator-param-contracts ":src" include-comments?) "\n"
-        "   :note (p [])" (param-contract oscillator-param-contracts ":note" include-comments?) "\n"
-        "   :gate (p [])" (param-contract oscillator-param-contracts ":gate" include-comments?) "\n"
-        "   :dur null" (param-contract oscillator-param-contracts ":dur" include-comments?) "\n"
-        "   :amp null" (param-contract oscillator-param-contracts ":amp" include-comments?) "\n"
-        (apply str (map (fn [param]
-                          (str "   " param " null" (param-contract oscillator-param-contracts param include-comments?) "\n"))
-                        (oscillator-parameter-examples source)))
-        ")\n")))
+   (let [{:keys [note gate dur amp]} (defaults-for-source source)]
+     (if (= source "sample")
+       (str "(sample :sample\n"
+            "   :sample-data [1 0.5 -0.25 0]\n"
+            "   :gate (p [1 0 0 0])"
+            (param-contract oscillator-param-contracts ":gate" include-comments?) "\n"
+            "   :note c3"
+            (param-contract oscillator-param-contracts ":note" include-comments?) "\n"
+            "   :dur 0.1"
+            (param-contract oscillator-param-contracts ":dur" include-comments?) "\n"
+            "   :amp 0.6"
+            (param-contract oscillator-param-contracts ":amp" include-comments?) "\n"
+            ")\n")
+       (str "(d :" (track-id-for-source source) "\n"
+            "   :src :" source (param-contract oscillator-param-contracts ":src" include-comments?) "\n"
+            "   :note " note (param-contract oscillator-param-contracts ":note" include-comments?) "\n"
+            "   :gate " gate (param-contract oscillator-param-contracts ":gate" include-comments?) "\n"
+            "   :dur " dur (param-contract oscillator-param-contracts ":dur" include-comments?) "\n"
+            "   :amp " amp (param-contract oscillator-param-contracts ":amp" include-comments?) "\n"
+            (apply str (map (fn [param]
+                              (str "   " param " null" (param-contract oscillator-param-contracts param include-comments?) "\n"))
+                            (oscillator-parameter-examples source)))
+            ")\n")))))
 
 (defn oscillator-snippet [source]
   (let [{:keys [note gate dur amp extra]} (defaults-for-source source)
@@ -221,10 +228,182 @@
    "distort" {":type" "type: keyword; range: :tanh|:hard-clip|:soft-clip|:sine-fold|:rectify|:half-rectify|:waveshape"}
    "distortion" {":type" "type: keyword; range: :tanh|:hard-clip|:soft-clip|:sine-fold|:rectify|:half-rectify|:waveshape"}
    "formant" {":vowel" "type: keyword; range: :a|:e|:i|:o|:u"}
+   "bitcrush" {":bits" "type: integer; range: 2..16"
+               ":bit-depth" "type: integer; range: 2..16"
+               ":rate" "type: integer; range: 1..128"
+               ":sample-rate-reduction" "type: integer; range: 1..128"}
+   "crystal" {":brightness" "type: number; range: 0..1"
+              ":decay" "type: number; range: 0..0.95"}
+   "wavefolder" {":folds" "type: number; range: 1..8"
+                 ":gain" "type: number; range: 0.1..12"
+                 ":symmetry" "type: number; range: 0.1..2"}
+   "fold" {":folds" "type: number; range: 1..8"
+           ":gain" "type: number; range: 0.1..12"
+           ":symmetry" "type: number; range: 0.1..2"}
+   "resonator" {":freq" "type: number Hz; range: >=20"
+                ":decay" "type: number; range: 0..1"
+                ":harmonics" "type: number; range: 1..16"}
+   "chorus" {":rate" "type: number Hz; range: >=0.01"
+             ":depth" "type: number seconds; range: 0.0001..0.05"
+             ":voices" "type: integer; range: 1..8"}
+   "ensemble" {":rate" "type: number Hz; range: >=0.01"
+               ":depth" "type: number seconds; range: 0.0005..0.05"
+               ":voices" "type: integer; range: 2..12"}
+   "ce1-chorus" {":rate" "type: number Hz; range: 0.01..10"
+                 ":intensity" "type: number; range: 0..1"}
+   "ce-1" {":rate" "type: number Hz; range: 0.01..10"
+           ":intensity" "type: number; range: 0..1"}
+   "re301-chorus" {":rate" "type: number Hz; range: 0.01..10"
+                   ":depth" "type: number; range: 0..1"
+                   ":tone" "type: number; range: 0..1"}
+   "re-301-chorus" {":rate" "type: number Hz; range: 0.01..10"
+                    ":depth" "type: number; range: 0..1"
+                    ":tone" "type: number; range: 0..1"}
+   "phaser" {":rate" "type: number Hz; range: 0.01..20"
+             ":depth" "type: number; range: 0..1"
+             ":stages" "type: integer; range: 1..12"}
+   "dimension" {":mode" "type: integer; range: 1..4"}
+   "dimension-d" {":mode" "type: integer; range: 1..4"}
+   "flanger" {":rate" "type: number Hz; range: 0.01..20"
+              ":depth" "type: number seconds; range: 0.0001..0.02"}
+   "small-stone" {":rate" "type: number Hz; range: 0.01..20"
+                  ":depth" "type: number; range: 0..1"
+                  ":color" "type: boolean; range: true|false"}
+   "vibrato" {":rate" "type: number Hz; range: >=0.01"
+              ":depth" "type: number seconds; range: 0.0001..0.03"}
+   "tremolo" {":rate" "type: number Hz; range: 0.01..40"
+              ":depth" "type: number; range: 0..1"}
+   "ring-mod" {":freq" "type: number Hz; range: 0.01..20000"}
+   "ringmod" {":freq" "type: number Hz; range: 0.01..20000"}
+   "arp-ring-mod" {":freq" "type: number Hz; range: 0.01..20000"
+                   ":depth" "type: number; range: 0..1"
+                   ":mix" "type: number; range: 0..1"
+                   ":diode-curve" "type: number; range: 0..1"}
+   "tube" {":drive" "type: number; range: 0..1"
+           ":gain" "type: number; range: 0..1"
+           ":asymmetry" "type: number; range: 0..1"}
+   "tube-saturation" {":drive" "type: number; range: 0..1"
+                      ":gain" "type: number; range: 0..1"
+                      ":asymmetry" "type: number; range: 0..1"}
+   "tape" {":saturation" "type: number; range: 0..1"
+           ":input-level" "type: number; range: 0..1"
+           ":wow" "type: number; range: 0..1"
+           ":flutter" "type: number; range: 0..1"}
+   "studer-tape" {":input-level" "type: number; range: 0..1"
+                  ":speed" "type: number; range: 0..2"
+                  ":bias" "type: number; range: 0..1"}
+   "exciter" {":amount" "type: number; range: 0..1"}
+   "fairchild" {":input-gain" "type: number; range: 0..1"
+                ":time-constant" "type: number; range: 1..6"}
+   "la2a" {":peak-reduction" "type: number; range: 0..1"
+           ":mode" "type: keyword; range: :compress|:limit"}
+   "1176" {":input-gain" "type: number; range: 0..1"
+           ":attack" "type: number; range: 0..1"
+           ":release" "type: number; range: 0..1"}
+   "urei-1176" {":input-gain" "type: number; range: 0..1"
+                ":attack" "type: number; range: 0..1"
+                ":release" "type: number; range: 0..1"}
+   "transient" {":attack-gain" "type: number; range: 0..8"
+                ":sustain-gain" "type: number; range: 0..4"}
+   "transient-shaper" {":attack-gain" "type: number; range: 0..8"
+                       ":sustain-gain" "type: number; range: 0..4"}
+   "reverb" {":decay" "type: number; range: 0..1"}
+   "spring-reverb" {":decay" "type: number; range: 0..4"
+                    ":tone" "type: number; range: 0..1"
+                    ":drip" "type: number; range: 0..1"}
+   "emt-plate" {":decay" "type: number; range: 0.1..5"
+                ":damping" "type: number; range: 0..1"}
+   "lexicon-224" {":size" "type: number; range: 0.2..2"
+                  ":decay" "type: number; range: 0.1..8"
+                  ":damping" "type: number; range: 0..1"}
+   "ams-reverb" {":decay" "type: number; range: 0.1..5"
+                 ":damping" "type: number; range: 0..1"
+                 ":program" "type: keyword; range: :nonlin|:ambience|:plate"}
+   "moog" {":drive" "type: number; range: 0..1"}
+   "moog-ladder" {":drive" "type: number; range: 0..1"}
+   "tb-303" {":env-mod" "type: number; range: 0..1"
+             ":accent" "type: number; range: 0..1"}
+   "tb303" {":env-mod" "type: number; range: 0..1"
+            ":accent" "type: number; range: 0..1"}
+   "buchla-lpg" {":strike" "type: number; range: 0..1"}
+   "lpg" {":strike" "type: number; range: 0..1"}
+   "neve-preamp" {":gain" "type: number; range: 0..1"
+                  ":warmth" "type: number; range: 0..1"}
+   "marshall-amp" {":gain" "type: number; range: 0..1"
+                   ":tone" "type: number; range: 0..1"
+                   ":presence" "type: number; range: 0..1"}
+   "vox-ac30" {":gain" "type: number; range: 0..1"
+               ":treble" "type: number; range: 0..1"
+               ":cut" "type: number; range: 0..1"}
+   "fender-twin" {":volume" "type: number; range: 0..1"
+                  ":gain" "type: number; range: 0..1"
+                  ":treble" "type: number; range: 0..1"
+                  ":bass" "type: number; range: 0..1"
+                  ":reverb-mix" "type: number; range: 0..1"}
+   "pultec-eq" {":low-boost" "type: number; range: 0..1"
+                ":low-atten" "type: number; range: 0..1"
+                ":high-boost" "type: number; range: 0..1"
+                ":high-atten" "type: number; range: 0..1"}
+   "pultec" {":low-boost" "type: number; range: 0..1"
+             ":low-atten" "type: number; range: 0..1"
+             ":high-boost" "type: number; range: 0..1"
+             ":high-atten" "type: number; range: 0..1"}
+   "space-echo" {":time" "type: number seconds; range: 0.02..2"
+                 ":wow" "type: number; range: 0..1"
+                 ":flutter" "type: number; range: 0..1"
+                 ":tone" "type: number; range: 0..1"
+                 ":spring-mix" "type: number; range: 0..1"}
+   "re201" {":time" "type: number seconds; range: 0.02..2"
+            ":wow" "type: number; range: 0..1"
+            ":flutter" "type: number; range: 0..1"
+            ":tone" "type: number; range: 0..1"
+            ":spring-mix" "type: number; range: 0..1"}
+   "re-201" {":time" "type: number seconds; range: 0.02..2"
+             ":wow" "type: number; range: 0..1"
+             ":flutter" "type: number; range: 0..1"
+             ":tone" "type: number; range: 0..1"
+             ":spring-mix" "type: number; range: 0..1"}
+   "tc2290" {":time-ms" "type: number ms; range: 1..2000"
+             ":mod-rate" "type: number Hz; range: 0..20"
+             ":mod-depth" "type: number seconds; range: 0..0.05"}
+   "tc-2290" {":time-ms" "type: number ms; range: 1..2000"
+              ":mod-rate" "type: number Hz; range: 0..20"
+              ":mod-depth" "type: number seconds; range: 0..0.05"}
+   "stutter" {":grain-size-ms" "type: number ms; range: 1..500"
+              ":grain-ms" "type: number ms; range: 1..500"
+              ":repeats" "type: integer; range: 1..16"}
+   "granular-stutter" {":grain-size-ms" "type: number ms; range: 1..500"
+                       ":grain-ms" "type: number ms; range: 1..500"
+                       ":repeats" "type: integer; range: 1..16"}
+   "glitch" {":density" "type: number; range: 0..1"
+             ":slice-ms" "type: number ms; range: 1..500"}
+   "fade" {":fade-in-ms" "type: number ms; range: >=0"
+           ":fade-out-ms" "type: number ms; range: >=0"
+           ":duration" "type: number seconds; range: >=0.001"}
+   "adsr" {":attack" "type: number seconds; range: >=0"
+           ":a" "type: number seconds; range: >=0"
+           ":decay" "type: number seconds; range: >=0"
+           ":d" "type: number seconds; range: >=0"
+           ":sustain" "type: number; range: 0..1"
+           ":s" "type: number; range: 0..1"
+           ":release" "type: number seconds; range: >=0"
+           ":r" "type: number seconds; range: >=0"
+           ":duration" "type: number seconds; range: >=0.001"}
+   "asdr" {":attack" "type: number seconds; range: >=0"
+           ":a" "type: number seconds; range: >=0"
+           ":decay" "type: number seconds; range: >=0"
+           ":d" "type: number seconds; range: >=0"
+           ":sustain" "type: number; range: 0..1"
+           ":s" "type: number; range: 0..1"
+           ":release" "type: number seconds; range: >=0"
+           ":r" "type: number seconds; range: >=0"
+           ":duration" "type: number seconds; range: >=0.001"}
+   "doppler" {":speed" "type: number; range: 0.01..8"
+              ":depth" "type: number; range: 0..1"}
+   "tape-stop" {":duration" "type: number; range: 0.1..1"
+                ":duration-pct" "type: number; range: 0.1..1"}
    "haas" {":side" "type: keyword; range: :left|:right"}
-   "ams-reverb" {":program" "type: keyword; range: :nonlin|:ambience|:plate"}
-   "small-stone" {":color" "type: boolean; range: true|false"}
-   "la2a" {":mode" "type: keyword; range: :compress|:limit"}})
+   })
 
 (def effect-param-contracts
   {":type" "type: keyword"
@@ -239,7 +418,7 @@
    ":harmonics" "type: integer; range: >=1"
    ":mix" "type: number; range: 0..1"
    ":depth" "type: number; range: 0..1"
-   ":feedback" "type: number; range: 0..1"
+   ":feedback" "type: number; range: 0..0.95"
    ":res" "type: number; range: 0..1"
    ":resonance" "type: number; range: 0..1"
    ":width" "type: number; range: >=0"
@@ -334,7 +513,7 @@
    (blank-effect-form label true))
   ([label include-comments?]
    (if (= label "FX Vector")
-     ":fx []"
+     (:form (effect-option-for-label label))
      (let [form (or (:form (effect-option-for-label label)) (str "(" label ")"))
            trimmed (str/trim form)
            inner (if (and (str/starts-with? trimmed "(") (str/ends-with? trimmed ")"))
@@ -363,7 +542,8 @@
          (str "(" effect-name ")"))))))
 
 (defn selected-oscillator-source [^JComboBox combo]
-  (nth oscillator-sources (.getSelectedIndex combo)))
+  (oscillator-option-source (.getSelectedItem combo)))
 
 (defn selected-effect-form [^JComboBox combo]
-  (:form (nth effect-options (.getSelectedIndex combo))))
+  (let [label (str (.getSelectedItem combo))]
+    (:form (effect-option-for-label label))))

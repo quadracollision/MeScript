@@ -21,17 +21,17 @@
  {:label "octaver" :form "(octaver :octave-up 0.0 :octave-down 0.35)"}
  {:label "reverse" :form "(reverse :mix 1.0)"}
  {:label "tape-stop" :form "(tape-stop :duration 0.5)"}
- {:label "granular" :form "(granular :grain-ms 50 :density 0.5 :pitch 1.0 :mix 0.35)"}
+ {:label "granular" :form "(granular :grain-ms 50 :density 0.5 :spray 0.2 :pitch-spread 0.1)"}
  {:label "granular-stretch" :form "(granular-stretch :rate 0.5 :grain-ms 50)"}
- {:label "spectral-freeze" :form "(spectral-freeze :freeze 0.6 :mix 0.5)"}
+ {:label "spectral-freeze" :form "(spectral-freeze :freeze-pos 0.6 :sustain 0.5 :mix 0.5)"}
  {:label "haas" :form "(haas :delay-ms 18 :side :right)"}
  {:label "stereo-widen" :form "(stereo-widen :width 1.4)"}
- {:label "stereo-imager" :form "(stereo-imager :width 1.25 :bass-mono 160)"}
- {:label "width-enhance" :form "(width-enhance :width 1.35 :air 0.2)"}
+ {:label "stereo-imager" :form "(stereo-imager :width 1.25 :bass-mono-freq 160)"}
+ {:label "width-enhance" :form "(width-enhance :low-width 0.7 :high-width 1.35 :crossover 800)"}
  {:label "freq-shift" :form "(freq-shift :shift-hz 35 :mix 0.45)"}
  {:label "autopan" :form "(autopan :rate 0.5 :depth 0.7)"}
- {:label "ping-pong-delay" :form "(ping-pong-delay :time-ms 180 :feedback 0.32 :mix 0.28)"}
- {:label "h3000" :form "(h3000 :detune-cents 9 :delay-ms 18 :feedback 0.05 :mix 0.32)"}
+ {:label "ping-pong-delay" :form "(ping-pong-delay :time 0.18 :feedback 0.32 :mix 0.28)"}
+ {:label "h3000" :form "(h3000 :detune-cents 9 :mix 0.32)"}
  {:label "shimmer" :form "(shimmer :shift-semitones 12 :feedback 0.18 :mix 0.22)"}
  {:label "stutter" :form "(stutter :grain-ms 32 :repeats 2 :mix 0.35)"}
  {:label "glitch" :form "(glitch :density 0.25 :slice-ms 30)"}
@@ -67,7 +67,7 @@
  {:label "limiter" :form "(limiter :ceiling -0.1 :release 0.05)"}
  {:label "gate" :form "(gate :threshold -40 :attack 0.001 :release 0.05)"}
  {:label "transient" :form "(transient :attack-gain 1.5 :sustain-gain 1.0 :sensitivity 0.01)"}
- {:label "reverb" :form "(reverb :decay 1.1 :mix 0.22)"}
+ {:label "reverb" :form "(reverb :decay 0.7 :mix 0.22)"}
  {:label "spring-reverb" :form "(spring-reverb :decay 0.42 :tone 0.58 :mix 0.12 :drip 0.06)"}
  {:label "emt-plate" :form "(emt-plate :decay 2.5 :damping 0.5 :mix 0.3 :pre-delay-ms 20)"}
  {:label "lexicon-224" :form "(lexicon-224 :size 0.72 :decay 2.2 :damping 0.52 :pre-delay-ms 18 :mix 0.25)"}
