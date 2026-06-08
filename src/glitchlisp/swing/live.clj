@@ -65,6 +65,11 @@
              (not= scene (:live-highlight-scene current))
              (assoc :live-cycle nil)))))
 
+(defn queue-playback-highlight! [^JTextComponent editor-pane received-ns]
+  (if (:remove-playback-highlighting @shared/state)
+    (editor/clear-live-step-highlight! editor-pane)
+    (editor/queue-current-live-step-highlight! editor-pane received-ns)))
+
 (defn parse-step-line [line]
   (when (str/starts-with? line "STEP ")
     (let [length (count line)]
@@ -129,7 +134,7 @@
       (when (:live-awaiting-update @shared/state)
         (complete-live-update!)
         (shared/set-status! status "live running"))
-        (editor/queue-current-live-step-highlight! editor-pane received-ns)))
+        (queue-playback-highlight! editor-pane received-ns)))
 
     (str/starts-with? line "AUDIO ")
     (let [info (subs line 6)]
@@ -175,7 +180,10 @@
     (let [message (subs line 4)]
       (swap! shared/state assoc :live-last-error message)
       (complete-live-update!)
-      (shared/set-status! status (str "live error: " message)))
+      (let [ex (editor/source-error-exception (.getText editor-pane) message)
+            clean-message (editor/clean-error-message ex)]
+        (editor/focus-source-error! editor-pane status ex)
+        (shared/set-status! status (str "live error: " clean-message))))
 
     :else
     (when-not (str/blank? line)
@@ -196,7 +204,7 @@
               (when (:live-awaiting-update @shared/state)
                 (complete-live-update!)
                 (SwingUtilities/invokeLater #(shared/set-status! status "live running")))
-                (editor/queue-current-live-step-highlight! editor-pane received-ns)))
+                (queue-playback-highlight! editor-pane received-ns)))
             (SwingUtilities/invokeLater #(handle-live-line! editor-pane status line)))))
       (catch Exception ex
         (SwingUtilities/invokeLater #(shared/set-status! status (str "live reader failed: " (.getMessage ex)))))

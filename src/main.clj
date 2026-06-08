@@ -354,7 +354,7 @@
     item))
 
 (def about-text
-  "MeScript v0.3\nJune 7, 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
+  "MeScript v0.31\nJune 7, 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
 
 (defn show-about! [^JFrame frame]
   (JOptionPane/showMessageDialog frame about-text "About MeScript" JOptionPane/INFORMATION_MESSAGE))
@@ -1229,6 +1229,17 @@
                                                     (if %
                                                       "insert comments: removed"
                                                       "insert comments: shown")))))
+          (.add preferences-menu
+                (checkbox-menu-item "Remove Playback Highlighting"
+                                    (:remove-playback-highlighting @state)
+                                    #(do
+                                       (swap! state assoc :remove-playback-highlighting %)
+                                       (when %
+                                         (clear-live-step-highlight! editor))
+                                       (set-status! status
+                                                    (if %
+                                                      "playback highlighting: removed"
+                                                      "playback highlighting: shown")))))
           (.add preferences-menu
                 (menu-item "Clear Null Parameters"
                            #(clear-null-parameters! editor status)))

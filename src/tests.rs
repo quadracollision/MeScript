@@ -65,7 +65,7 @@ fn parses_and_evaluates_track() {
 fn workstation_about_text_shows_current_version_date() {
     let source = fs::read_to_string("src/main.clj").unwrap();
     assert!(
-        source.contains("MeScript v0.3\\nJune 7, 2026"),
+        source.contains("MeScript v0.31\\nJune 7, 2026"),
         "about text should show current version/date"
     );
 }
@@ -8254,6 +8254,87 @@ fn source_error_reporting_updates_status_even_without_offset() {
 }
 
 #[test]
+fn source_error_reporting_resolves_nested_note_vector_runtime_errors() {
+    let script = r#"
+      (load-file "src/glitchlisp/swing/shared.clj")
+      (load-file "src/glitchlisp/swing/editor.clj")
+      (let [source "(d :hat\n   :src :hat-909\n   :note c6\n   :gate (euclid 5 16))\n\n(d :pad\n   :src :pad-wash\n   :note (p (then\n             (times 12 [[c3 eb3 g3 bb3]])\n             (times 4 [[c3 e4]])))\n   :gate (p [1 0 0 0 1 0 0 0]))\n\n(d :drone-dark\n   :src :drone-dark\n   :note (s [c2 eb2 bb2 [[e3 f3]]])\n   :gate (p [1 0 0 0 0 0 0 0]))\n(start!)"
+            pane (javax.swing.JTextPane.)
+            status (javax.swing.JLabel. "stale")
+            ex (glitchlisp.swing.editor/source-error-exception source "expected number or note")
+            data (ex-data ex)]
+        (.setText pane source)
+        (glitchlisp.swing.editor/report-source-error! pane status ex)
+        (println (.getText status))
+        (println (subs source (:offset data) (:end-offset data)))
+        (println (some? (.getClientProperty pane glitchlisp.swing.editor/error-highlight-key))))
+    "#;
+    let output = Command::new("clojure")
+        .arg("-J-Djava.awt.headless=true")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run nested note vector source error smoke");
+    assert!(
+        output.status.success(),
+        "nested note vector source error smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("expected number or note in :note pattern"),
+        "status should include resolved line and better message: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("[e3 f3]\ntrue"),
+        "source error should highlight the offending nested vector: {}",
+        stdout
+    );
+}
+
+#[test]
+fn live_err_lines_highlight_resolved_source_error() {
+    let script = r#"
+      (load-file "src/glitchlisp/swing/shared.clj")
+      (load-file "src/glitchlisp/swing/editor.clj")
+      (load-file "src/glitchlisp/swing/live.clj")
+      (let [source "(d :drone-dark\n   :src :drone-dark\n   :note (s [c2 eb2 bb2 [[e3 f3]]])\n   :gate (p [1 0 0 0 0 0 0 0]))\n(start!)"
+            pane (javax.swing.JTextPane.)
+            status (javax.swing.JLabel. "stale")]
+        (.setText pane source)
+        (glitchlisp.swing.live/handle-live-line! pane status "ERR expected number or note")
+        (javax.swing.SwingUtilities/invokeAndWait (fn [] nil))
+        (println (.getText status))
+        (println (some? (.getClientProperty pane glitchlisp.swing.editor/error-highlight-key))))
+    "#;
+    let output = Command::new("clojure")
+        .arg("-J-Djava.awt.headless=true")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run live ERR source highlight smoke");
+    assert!(
+        output.status.success(),
+        "live ERR source highlight smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("live error: line 3, col 26: expected number or note in :note pattern"),
+        "live ERR should include resolved line and clearer message: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\ntrue"),
+        "live ERR should install an error highlight: {}",
+        stdout
+    );
+}
+
+#[test]
 fn render_session_file_does_not_become_current_save_target() {
     let script = r#"
       (load-file "src/glitchlisp/swing/shared.clj")
@@ -8596,6 +8677,51 @@ fn swing_live_reader_step_state_matches_handler() {
             && stdout.lines().any(|line| line == "drop")
             && stdout.lines().any(|line| line == "true"),
         "reader STEP state update should match handler behavior: {}",
+        stdout
+    );
+}
+
+#[test]
+fn remove_playback_highlighting_preference_disables_live_step_overlay() {
+    let script = r#"
+      (load-file "src/glitchlisp/swing/shared.clj")
+      (load-file "src/glitchlisp/swing/editor.clj")
+      (load-file "src/glitchlisp/swing/live.clj")
+      (let [pane (javax.swing.JTextPane.)
+            status (javax.swing.JLabel. "stale")
+            source "(d :kick :src :click :gate (p [1 0]))\n(start!)"]
+        (.setText pane source)
+        (swap! glitchlisp.swing.shared/state assoc :remove-playback-highlighting true)
+        (glitchlisp.swing.live/handle-live-line! pane status "STEP 0")
+        (javax.swing.SwingUtilities/invokeAndWait (fn [] nil))
+        (println (:live-highlight-step @glitchlisp.swing.shared/state))
+        (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-key)))
+        (swap! glitchlisp.swing.shared/state assoc :remove-playback-highlighting false)
+        (glitchlisp.swing.live/handle-live-line! pane status "STEP 0")
+        (javax.swing.SwingUtilities/invokeAndWait (fn [] nil))
+        (println (some? (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-key))))
+    "#;
+    let output = Command::new("clojure")
+        .arg("-J-Djava.awt.headless=true")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run remove playback highlighting preference smoke");
+    assert!(
+        output.status.success(),
+        "remove playback highlighting preference smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter(|line| *line == "0" || *line == "true" || *line == "false")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec!["0", "true", "true"],
+        "checked preference should keep step state but remove editor overlay: {}",
         stdout
     );
 }

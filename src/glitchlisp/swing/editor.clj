@@ -1804,6 +1804,116 @@
       (removeUpdate [_] (schedule-paren-highlight-refresh! editor))
       (changedUpdate [_] nil))))
 
+(defn live-number-or-note-error? [message]
+  (boolean (and message
+                (re-find #"(?i)expected number or note" message))))
+
+(defn pattern-value-range [text param]
+  (let [visible (code-visible-text text)]
+    (loop [idx 0]
+      (when-let [found (let [found (.indexOf visible param idx)]
+                         (when (>= found 0) found))]
+        (let [before-ok? (or (zero? found)
+                             (Character/isWhitespace (.charAt visible (dec found)))
+                             (contains? #{\( \[} (.charAt visible (dec found))))
+              after (+ found (count param))
+              after-ok? (or (= after (count visible))
+                            (Character/isWhitespace (.charAt visible after))
+                            (contains? #{\) \]} (.charAt visible after)))]
+          (if (and before-ok? after-ok?)
+            (let [start (skip-space-and-comments text after (count text))
+                  end (form-end-offset text start (count text))]
+              (when end [start end]))
+            (recur (+ found (count param)))))))))
+
+(defn pattern-value-ranges [text param]
+  (let [visible (code-visible-text text)]
+    (loop [idx 0
+           ranges []]
+      (if-let [found (let [found (.indexOf visible param idx)]
+                       (when (>= found 0) found))]
+        (let [before-ok? (or (zero? found)
+                             (Character/isWhitespace (.charAt visible (dec found)))
+                             (contains? #{\( \[} (.charAt visible (dec found))))
+              after (+ found (count param))
+              after-ok? (or (= after (count visible))
+                            (Character/isWhitespace (.charAt visible after))
+                            (contains? #{\) \]} (.charAt visible after)))]
+          (if (and before-ok? after-ok?)
+            (let [start (skip-space-and-comments text after (count text))
+                  end (form-end-offset text start (count text))]
+              (recur after (cond-> ranges end (conj [start end]))))
+            (recur after ranges)))
+        ranges))))
+
+(defn vector-close-range [text open limit]
+  (when-let [close (matching-close text open \[ \])]
+    (when (<= close limit)
+      [open (inc close)])))
+
+(defn first-vector-deeper-than [text [start end] allowed-depth]
+  (loop [idx start
+         vector-depth 0
+         in-string? false
+         escape? false
+         in-comment? false]
+    (when (< idx end)
+      (let [ch (.charAt text idx)]
+        (cond
+          in-comment?
+          (recur (inc idx) vector-depth in-string? false (not= ch \newline))
+
+          escape?
+          (recur (inc idx) vector-depth in-string? false false)
+
+          (and in-string? (= ch \\))
+          (recur (inc idx) vector-depth true true false)
+
+          (= ch \")
+          (recur (inc idx) vector-depth (not in-string?) false false)
+
+          in-string?
+          (recur (inc idx) vector-depth true false false)
+
+          (= ch \;)
+          (recur (inc idx) vector-depth false false true)
+
+          (= ch \[)
+          (let [next-depth (inc vector-depth)]
+            (if (> next-depth allowed-depth)
+              (vector-close-range text idx end)
+              (recur (inc idx) next-depth false false false)))
+
+          (= ch \])
+          (recur (inc idx) (max 0 (dec vector-depth)) false false false)
+
+          :else
+          (recur (inc idx) vector-depth false false false))))))
+
+(defn source-diagnostic-for-message [source message]
+  (when (live-number-or-note-error? message)
+    (or
+      (when-let [range (some #(first-vector-deeper-than source % 2)
+                             (pattern-value-ranges source ":note"))]
+          {:range range
+           :message (str "expected number or note in :note pattern; "
+                         "nested vectors are not valid here. Use [e3 f3] for a chord, not [[e3 f3]].")})
+      (when-let [range (some #(first-vector-deeper-than source % 1)
+                             (pattern-value-ranges source ":sample-data"))]
+          {:range range
+           :message "expected number or note in :sample-data; sample data cells must be numbers or notes"}))))
+
+(defn source-error-exception [source message]
+  (if-let [{:keys [range message]} (source-diagnostic-for-message source message)]
+    (let [[start end] range
+          {:keys [line column]} (line-column-for-offset source start)]
+      (ex-info message
+               {:offset start
+                :end-offset end
+                :line line
+                :column column}))
+    (ex-info message {})))
+
 (defn error-offset [^JTextComponent editor ex]
   (let [data (ex-data ex)
         text (.getText editor)]
@@ -1813,11 +1923,19 @@
         (when-let [{:keys [line column]} (line-column-from-message (.getMessage ex))]
           (offset-for-line-column text line column)))))
 
+(defn error-range [^JTextComponent editor ex]
+  (let [data (ex-data ex)
+        text (.getText editor)]
+    (when-let [start (error-offset editor ex)]
+      [start (or (:end-offset data)
+                 (:end data)
+                 (min (count text) (inc start)))])))
+
 (defn focus-source-error! [^JTextComponent editor ^JLabel status ex]
-  (when-let [offset (error-offset editor ex)]
+  (when-let [[start end] (error-range editor ex)]
     (let [text (.getText editor)
-          start (max 0 (min offset (count text)))
-          end (min (count text) (inc start))]
+          start (max 0 (min start (count text)))
+          end (max start (min end (count text)))]
       (.requestFocusInWindow editor)
       (highlight-editor-range! editor start end)
       (set-status! status (clean-error-message ex)))))

@@ -25,7 +25,8 @@
          :live-cycle nil
          :live-highlight-scheduled false
          :audio-device nil
-         :remove-insert-comments true}))
+         :remove-insert-comments true
+         :remove-playback-highlighting false}))
 
 (defn resource-slurp [path]
   (when-let [resource (io/resource path)]
