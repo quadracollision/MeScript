@@ -7655,16 +7655,19 @@ fn sample_oscillator_insert_uses_sample_form() {
         snippet
     );
     assert!(
+        snippet.contains(":sample-data null")
+            && snippet.contains(":gate null")
+            && snippet.contains(":note null")
+            && snippet.contains(":dur null")
+            && snippet.contains(":amp null"),
+        "sample oscillator insert should use blank null placeholders: {}",
+        snippet
+    );
+    assert!(
         !snippet.contains(":src :sample"),
         "sample oscillator insert should not teach the low-level :src :sample form: {}",
         snippet
     );
-
-    let mut runtime = Runtime::new();
-    eval_program(&mut runtime, &format!("{}\n(start!)", snippet))
-        .unwrap_or_else(|err| panic!("sample oscillator snippet did not evaluate: {}", err));
-    assert!(runtime.tracks.contains_key("sample"));
-    assert!(runtime.running);
 }
 
 #[test]
@@ -9243,37 +9246,36 @@ fn live_step_highlight_caches_step_rects_until_range_or_document_changes() {
 }
 
 #[test]
-fn live_step_highlight_reuses_focused_range_until_caret_or_document_changes() {
+fn live_step_highlight_ignores_caret_focus_and_marks_all_active_tracks() {
     let script = r#"
       (load-file "src/glitchlisp/swing/shared.clj")
       (load-file "src/glitchlisp/swing/editor.clj")
       (let [pane (javax.swing.JTextPane.)
-            source "(d :kick :src :click :gate (p [1 0]))\n(start!)"]
+            source "(d :kick :src :click :gate (p [1 0]))\n(d :hat :src :hat-909 :gate (p [1 0]))\n(start!)"
+            highlighted (fn []
+                          (->> (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-key)
+                               (map (fn [[start end]] (subs source start end)))
+                               vec))]
         (.setText pane source)
         (glitchlisp.swing.editor/install-live-gate-range-cache! pane)
-        (.setCaretPosition pane (.indexOf source ":gate"))
+        (.setCaretPosition pane (.indexOf source ":kick"))
         (glitchlisp.swing.editor/highlight-live-step! pane 0 nil)
-        (let [cached-caret (.getClientProperty pane glitchlisp.swing.editor/live-focus-caret-key)
-              cached-range (.getClientProperty pane glitchlisp.swing.editor/live-focus-range-key)]
-          (glitchlisp.swing.editor/highlight-live-step! pane 1 nil)
-          (println (= cached-caret (.getClientProperty pane glitchlisp.swing.editor/live-focus-caret-key)))
-          (println (= cached-range (.getClientProperty pane glitchlisp.swing.editor/live-focus-range-key))))
-        (.setCaretPosition pane 0)
+        (let [ranges (highlighted)]
+          (println (every? #(= "1" %) ranges))
+          (println (= 2 (count ranges))))
+        (.setCaretPosition pane (.indexOf source ":hat"))
         (glitchlisp.swing.editor/highlight-live-step! pane 0 nil)
-        (println (= 0 (.getClientProperty pane glitchlisp.swing.editor/live-focus-caret-key)))
-        (.setText pane source)
-        (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-focus-caret-key)))
-        (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-focus-range-key))))
+        (println (= 2 (count (highlighted)))))
     "#;
     let output = Command::new("clojure")
         .arg("-J-Djava.awt.headless=true")
         .arg("-e")
         .arg(script)
         .output()
-        .expect("run live focused range cache smoke");
+        .expect("run all active live highlight smoke");
     assert!(
         output.status.success(),
-        "live focused range cache smoke failed: {}",
+        "all active live highlight smoke failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -9284,8 +9286,8 @@ fn live_step_highlight_reuses_focused_range_until_caret_or_document_changes() {
         .collect::<Vec<_>>();
     assert_eq!(
         results,
-        vec!["true", "true", "true", "true", "true"],
-        "live highlight should cache focused range until caret or document changes: {}",
+        vec!["true", "true", "true"],
+        "live highlight should mark all active tracks regardless of caret: {}",
         stdout
     );
 }
@@ -9437,64 +9439,6 @@ fn live_step_highlight_reuses_active_gate_entries_until_document_changes() {
     );
 }
 
-#[test]
-fn live_step_highlight_reuses_focused_active_gate_entries_until_focus_changes() {
-    let script = r#"
-      (load-file "src/glitchlisp/swing/shared.clj")
-      (load-file "src/glitchlisp/swing/editor.clj")
-      (let [pane (javax.swing.JTextPane.)
-            source (str "(def click\n"
-                        "  (d :click :src :click :gate (p [1 0])))\n"
-                        "(def hat\n"
-                        "  (d :hat :src :click :gate (p [0 1])))\n"
-                        "(scene :intro :loop true\n"
-                        "  click\n"
-                        "  hat)\n"
-                        "(play-scene :intro)")]
-        (.setText pane source)
-        (glitchlisp.swing.editor/install-live-gate-range-cache! pane)
-        (.setCaretPosition pane (.indexOf source ":click"))
-        (glitchlisp.swing.editor/highlight-live-step! pane 0 "intro")
-        (let [cache (.getClientProperty pane glitchlisp.swing.editor/live-focused-active-gate-entries-key)
-              first-key (first (keys cache))
-              first-entries (get cache first-key)]
-          (println (count first-entries))
-          (glitchlisp.swing.editor/highlight-live-step! pane 1 "intro")
-          (println (identical? first-entries
-                               (get (.getClientProperty pane glitchlisp.swing.editor/live-focused-active-gate-entries-key)
-                                    first-key))))
-        (.setCaretPosition pane (.indexOf source ":hat"))
-        (glitchlisp.swing.editor/highlight-live-step! pane 0 "intro")
-        (let [cache (.getClientProperty pane glitchlisp.swing.editor/live-focused-active-gate-entries-key)]
-          (println (count cache))
-          (println (every? #(= 1 (count %)) (vals cache))))
-        (.setText pane source)
-        (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-focused-active-gate-entries-key))))
-    "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .expect("run live focused active gate entries cache smoke");
-    assert!(
-        output.status.success(),
-        "live focused active gate entries cache smoke failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let results = stdout
-        .lines()
-        .filter(|line| *line == "1" || *line == "2" || *line == "true" || *line == "false")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        results,
-        vec!["1", "true", "2", "true", "true"],
-        "live highlight should reuse focused active gate entries until focus changes: {}",
-        stdout
-    );
-}
 
 #[test]
 fn live_step_highlight_reuses_resolved_ranges_for_repeating_steps() {
@@ -11065,7 +11009,7 @@ fn pattern_insert_in_blank_editor_creates_runnable_gate_track() {
 }
 
 #[test]
-fn oscillator_insert_in_blank_editor_starts_playback() {
+fn oscillator_insert_uses_blank_parameter_form() {
     let script = r#"
       (load-file "src/main.clj")
       (let [blank (javax.swing.JTextPane.)
@@ -11105,33 +11049,23 @@ fn oscillator_insert_in_blank_editor_starts_playback() {
     assert!(
         blank.contains("(d :sine")
             && blank.contains(":src :sine-synth")
+            && blank.contains(":note null")
+            && blank.contains(":gate null")
+            && blank.contains(":dur null")
+            && blank.contains(":amp null")
             && blank.contains("(start!)"),
-        "blank Oscillator insertion should create runnable source: {}",
+        "blank Oscillator insertion should create a blank parameter form: {}",
         stdout
     );
     assert!(
         nonblank.contains("(bpm 100)")
             && nonblank.contains("(d :sine")
+            && nonblank.contains(":note null")
+            && nonblank.contains(":gate null")
             && !nonblank.contains("(start!)"),
-        "nonblank Oscillator insertion should keep track-only behavior: {}",
+        "nonblank Oscillator insertion should keep blank track-only behavior: {}",
         stdout
     );
-
-    let source = blank
-        .lines()
-        .skip_while(|line| *line != "blank")
-        .skip(1)
-        .take_while(|line| *line != "nonblank")
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut runtime = Runtime::new();
-    eval_program(&mut runtime, &source)
-        .unwrap_or_else(|err| panic!("blank Oscillator insertion did not evaluate: {}", err));
-    assert!(
-        runtime.running,
-        "blank Oscillator insertion should start playback"
-    );
-    assert!(runtime.tracks.contains_key("sine"));
 }
 
 #[test]

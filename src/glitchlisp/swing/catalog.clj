@@ -150,6 +150,7 @@
 
 (def oscillator-param-contracts
   {":src" "type: oscillator keyword"
+   ":sample-data" "type: vector<number|note>"
    ":note" "type: note or note-pattern"
    ":gate" "type: gate-pattern; range: 0 rest, 1 hit, nested subdivision, hold suffix"
    ":dur" "type: number seconds or number-pattern; range: 0.005..4"
@@ -178,28 +179,25 @@
   ([source]
    (oscillator-structure-snippet source true))
   ([source include-comments?]
-   (let [{:keys [note gate dur amp]} (defaults-for-source source)]
+   (let [blank-param (fn [param]
+                       (str "   " param " null"
+                            (param-contract oscillator-param-contracts param include-comments?)
+                            "\n"))]
      (if (= source "sample")
        (str "(sample :sample\n"
-            "   :sample-data [1 0.5 -0.25 0]\n"
-            "   :gate (p [1 0 0 0])"
-            (param-contract oscillator-param-contracts ":gate" include-comments?) "\n"
-            "   :note c3"
-            (param-contract oscillator-param-contracts ":note" include-comments?) "\n"
-            "   :dur 0.1"
-            (param-contract oscillator-param-contracts ":dur" include-comments?) "\n"
-            "   :amp 0.6"
-            (param-contract oscillator-param-contracts ":amp" include-comments?) "\n"
+            (blank-param ":sample-data")
+            (blank-param ":gate")
+            (blank-param ":note")
+            (blank-param ":dur")
+            (blank-param ":amp")
             ")\n")
        (str "(d :" (track-id-for-source source) "\n"
             "   :src :" source (param-contract oscillator-param-contracts ":src" include-comments?) "\n"
-            "   :note " note (param-contract oscillator-param-contracts ":note" include-comments?) "\n"
-            "   :gate " gate (param-contract oscillator-param-contracts ":gate" include-comments?) "\n"
-            "   :dur " dur (param-contract oscillator-param-contracts ":dur" include-comments?) "\n"
-            "   :amp " amp (param-contract oscillator-param-contracts ":amp" include-comments?) "\n"
-            (apply str (map (fn [param]
-                              (str "   " param " null" (param-contract oscillator-param-contracts param include-comments?) "\n"))
-                            (oscillator-parameter-examples source)))
+            (blank-param ":note")
+            (blank-param ":gate")
+            (blank-param ":dur")
+            (blank-param ":amp")
+            (apply str (map blank-param (oscillator-parameter-examples source)))
             ")\n")))))
 
 (defn oscillator-snippet [source]

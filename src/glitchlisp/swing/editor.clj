@@ -1573,7 +1573,6 @@
 
 (defn highlight-live-step! [^JTextComponent editor step scene]
   (let [text (cached-live-highlight-text editor)
-        focus-range (cached-focused-gate-range editor text)
         old-step-ranges (or (.getClientProperty editor live-step-repaint-key)
                             (.getClientProperty editor live-step-highlight-key)
                             [])
@@ -1584,8 +1583,7 @@
                       [start (inc end)])
         scene-segments (cached-live-scene-range-segments editor text scene scene-range)
         active-entries (cached-active-gate-entries editor text scene scene-context)
-        focused-entries (cached-focused-active-gate-entries editor scene focus-range active-entries)
-        ranges (cached-live-step-ranges editor scene focus-range step focused-entries)
+        ranges (cached-live-step-ranges editor scene nil step active-entries)
         scene-ranges-to-repaint (when (not= old-scene-range scene-range)
                                   (concat (when old-scene-range [old-scene-range])
                                           (when scene-range [scene-range])))
