@@ -1,5 +1,5 @@
 use crate::audio::open_output_stream;
-use crate::language::{apply_scene, compile_source_for_runtime, eval_program};
+use crate::language::{apply_scene, compile_source_for_runtime_with_base, eval_program};
 use crate::model::Runtime;
 use cpal::traits::StreamTrait;
 use std::fmt::Write as _;
@@ -118,8 +118,16 @@ pub(crate) fn apply_runtime_source(
     runtime: &Arc<Mutex<Runtime>>,
     source: &str,
 ) -> Result<Runtime, String> {
+    apply_runtime_source_with_base(runtime, source, None)
+}
+
+pub(crate) fn apply_runtime_source_with_base(
+    runtime: &Arc<Mutex<Runtime>>,
+    source: &str,
+    source_path: Option<&Path>,
+) -> Result<Runtime, String> {
     let mut next = Runtime::new();
-    let source = compile_source_for_runtime(source)?;
+    let source = compile_source_for_runtime_with_base(source, source_path)?;
     eval_program(&mut next, &source)?;
     *runtime.lock().expect("runtime lock poisoned") = next.clone();
     Ok(next)
@@ -328,8 +336,12 @@ fn has_top_level_playable(source: &str) -> bool {
         .any(|form| matches!(form.head.as_str(), "d" | "sample"))
 }
 
-fn eval_live_form(runtime: &Arc<Mutex<Runtime>>, source: &str) -> Result<Runtime, String> {
-    let source = compile_source_for_runtime(source)?;
+fn eval_live_form_with_base(
+    runtime: &Arc<Mutex<Runtime>>,
+    source: &str,
+    source_path: Option<&Path>,
+) -> Result<Runtime, String> {
+    let source = compile_source_for_runtime_with_base(source, source_path)?;
     let mut runtime_guard = runtime.lock().expect("runtime lock poisoned");
     eval_program(&mut runtime_guard, &source)?;
     Ok(runtime_guard.clone())
@@ -788,9 +800,17 @@ impl EditorApp {
             self.buffer.source()
         };
         let snapshot = if self.active_block.is_some() {
-            eval_live_form(&self.runtime, &editor_preview_source(&source))?
+            eval_live_form_with_base(
+                &self.runtime,
+                &editor_preview_source(&source),
+                self.buffer.path.as_deref(),
+            )?
         } else {
-            apply_runtime_source(&self.runtime, &editor_preview_source(&source))?
+            apply_runtime_source_with_base(
+                &self.runtime,
+                &editor_preview_source(&source),
+                self.buffer.path.as_deref(),
+            )?
         };
         self.message = editor_run_message(&snapshot);
         Ok(())
@@ -801,7 +821,10 @@ impl EditorApp {
             "put cursor on a (scene :name ...), (block :name ...), or (play-scene :name) line",
         )?;
         let mut runtime = Runtime::new();
-        let source = compile_source_for_runtime(&self.buffer.source())?;
+        let source = compile_source_for_runtime_with_base(
+            &self.buffer.source(),
+            self.buffer.path.as_deref(),
+        )?;
         eval_program(&mut runtime, &source)?;
         apply_scene(&mut runtime, &scene)?;
         let message = editor_scene_message("cued", &scene, &runtime);
@@ -815,7 +838,10 @@ impl EditorApp {
             "put cursor on a (scene :name ...), (block :name ...), or (play-scene :name) line",
         )?;
         let mut runtime = Runtime::new();
-        let source = compile_source_for_runtime(&self.buffer.source())?;
+        let source = compile_source_for_runtime_with_base(
+            &self.buffer.source(),
+            self.buffer.path.as_deref(),
+        )?;
         eval_program(&mut runtime, &source)?;
         let Some(scene_def) = runtime.scenes.get_mut(&scene) else {
             return Err(format!("unknown scene ':{}'", scene));

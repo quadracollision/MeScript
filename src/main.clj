@@ -2,13 +2,13 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str])
   (:import
-    [java.awt BorderLayout Color Dimension Font GraphicsEnvironment]
-    [java.awt.event ActionListener WindowAdapter]
+    [java.awt BorderLayout Color Cursor Dimension Font GraphicsEnvironment]
+    [java.awt.event ActionListener MouseAdapter MouseEvent WindowAdapter]
     [java.io BufferedReader ByteArrayInputStream ByteArrayOutputStream File InputStreamReader OutputStreamWriter PushbackReader StringReader]
     [javax.sound.sampled AudioFileFormat$Type AudioFormat AudioInputStream AudioSystem Clip]
-    [javax.swing.event CaretListener DocumentListener]
+    [javax.swing.event CaretListener ChangeListener DocumentListener]
     [javax.swing.text DefaultHighlighter$DefaultHighlightPainter JTextComponent SimpleAttributeSet StyleConstants StyledDocument]
-    [javax.swing AbstractAction BorderFactory Box BoxLayout JButton JCheckBoxMenuItem JComboBox JFileChooser JComponent JFrame JLabel JMenu JMenuBar JMenuItem JOptionPane JPanel JScrollPane JTextField JTextPane KeyStroke SwingUtilities Timer]))
+    [javax.swing AbstractAction BorderFactory Box BoxLayout JButton JCheckBoxMenuItem JComboBox JFileChooser JComponent JFrame JLabel JMenu JMenuBar JMenuItem JOptionPane JPanel JScrollPane JTabbedPane JTextField JTextPane KeyStroke SwingUtilities Timer]))
 
 (defn load-swing-module! [resource-path file-path]
   (when-not (.exists (java.io.File. file-path))
@@ -334,12 +334,318 @@
               (schedule-live-auto-update! editor status)))
           (changedUpdate [_ _] nil))))))
 
-(defn save-current! [^JFrame frame ^JTextComponent editor ^JLabel status]
-  (let [file (or (:file @state) (choose-file frame "Save"))]
+(defn file-title [^File file untitled-index]
+  (if file
+    (.getName file)
+    (str "Untitled " untitled-index)))
+
+(defn editor-file [^JTextComponent editor]
+  (.getClientProperty editor "mescript.file"))
+
+(defn editor-tab-name [^JTextComponent editor untitled-index]
+  (or (.getClientProperty editor "mescript.tab-name")
+      (file-title (editor-file editor) untitled-index)))
+
+(defn set-editor-tab-name! [^JTextComponent editor name]
+  (.putClientProperty editor "mescript.tab-name" name))
+
+(defn editor-dirty? [^JTextComponent editor]
+  (boolean (.getClientProperty editor "mescript.dirty")))
+
+(defn set-editor-dirty! [^JTextComponent editor dirty?]
+  (.putClientProperty editor "mescript.dirty" (boolean dirty?)))
+
+(defn set-editor-file! [^JTextComponent editor ^File file]
+  (.putClientProperty editor "mescript.file" file)
+  (swap! state assoc :file file))
+
+(defn tab-editor [component]
+  (cond
+    (instance? JScrollPane component)
+    (let [view (.getView (.getViewport ^JScrollPane component))]
+      (when (instance? JTextComponent view)
+        view))
+
+    (instance? JTextComponent component)
+    component
+
+    :else nil))
+
+(defn active-editor [^JTabbedPane tabs]
+  (when tabs
+    (tab-editor (.getSelectedComponent tabs))))
+
+(defn active-file [^JTabbedPane tabs]
+  (some-> (active-editor tabs) editor-file))
+
+(defn sync-active-file! [^JTabbedPane tabs]
+  (swap! state assoc :file (active-file tabs)))
+
+(def tab-text-color (Color. 24 24 24))
+(def tab-close-color (Color. 70 70 70))
+(def tab-close-hover-color (Color. 180 40 40))
+
+(defn refresh-tab-header-style! [^JTabbedPane tabs ^JTextComponent editor]
+  (when-let [scroll (.getClientProperty editor "mescript.scroll")]
+    (let [idx (.indexOfComponent tabs scroll)]
+      (when (>= idx 0)
+        (let [header (.getTabComponentAt tabs idx)]
+          (when header
+            (.setOpaque ^JComponent header false)
+            (.setBorder ^JComponent header (BorderFactory/createEmptyBorder 2 5 2 4))
+            (.revalidate ^JComponent header)
+            (.repaint ^JComponent header)))
+        (when-let [label (.getClientProperty editor "mescript.tab-label")]
+          (.setForeground ^JLabel label tab-text-color))))))
+
+(defn refresh-all-tab-headers! [^JTabbedPane tabs]
+  (doseq [idx (range (.getTabCount tabs))]
+    (when-let [editor (tab-editor (.getComponentAt tabs idx))]
+      (refresh-tab-header-style! tabs editor)))
+  (.revalidate tabs)
+  (.repaint tabs))
+
+(defn refresh-tab-title! [^JTabbedPane tabs ^JTextComponent editor]
+  (when-let [scroll (.getClientProperty editor "mescript.scroll")]
+    (let [idx (.indexOfComponent tabs scroll)]
+      (when (>= idx 0)
+        (let [title (str (when (editor-dirty? editor) "*")
+                         (editor-tab-name editor (inc idx)))]
+          (.setTitleAt tabs idx title)
+          (when-let [label (.getClientProperty editor "mescript.tab-label")]
+            (.setText ^JLabel label title))
+          (refresh-tab-header-style! tabs editor))))))
+
+(declare close-tab!)
+(declare rename-tab!)
+
+(defn select-editor-tab! [^JTabbedPane tabs ^JTextComponent editor]
+  (when-let [scroll (.getClientProperty editor "mescript.scroll")]
+    (let [idx (.indexOfComponent tabs scroll)]
+      (when (>= idx 0)
+        (.setSelectedIndex tabs idx)
+        (sync-active-file! tabs)
+        (refresh-all-tab-headers! tabs)
+        true))))
+
+(defn install-tab-header! [^JTabbedPane tabs ^JTextComponent editor]
+  (when-let [scroll (.getClientProperty editor "mescript.scroll")]
+    (let [idx (.indexOfComponent tabs scroll)]
+      (when (>= idx 0)
+        (let [title-label (doto (JLabel. "")
+                            (.setFocusable false)
+                            (.setRequestFocusEnabled false)
+                            (.setBorder (BorderFactory/createEmptyBorder 0 4 0 5)))
+              close-label (doto (JLabel. "x")
+                            (.setFont (Font. Font/SANS_SERIF Font/BOLD 11))
+                            (.setForeground tab-close-color)
+                            (.setFocusable false)
+                            (.setRequestFocusEnabled false)
+                            (.setBorder (BorderFactory/createEmptyBorder 0 3 0 3))
+                            (.setCursor (Cursor/getPredefinedCursor Cursor/HAND_CURSOR))
+                            (.setToolTipText "Close tab"))
+              header (JPanel.)]
+          (.setOpaque header false)
+          (.setFocusable header false)
+          (.setRequestFocusEnabled header false)
+          (.setLayout header (BoxLayout. header BoxLayout/X_AXIS))
+          (.putClientProperty editor "mescript.tab-label" title-label)
+          (.addMouseListener header
+                             (proxy [MouseAdapter] []
+                               (mousePressed [^MouseEvent _]
+                                 (select-editor-tab! tabs editor))))
+          (.addMouseListener title-label
+                             (proxy [MouseAdapter] []
+                               (mousePressed [^MouseEvent _]
+                                 (select-editor-tab! tabs editor))
+                               (mouseClicked [^MouseEvent event]
+                                 (when (= 2 (.getClickCount event))
+                                   (rename-tab!
+                                     (.getClientProperty tabs "mescript.frame")
+                                     tabs
+                                     editor)))))
+          (.addMouseListener close-label
+                             (proxy [MouseAdapter] []
+                               (mouseClicked [^MouseEvent _]
+                                 (close-tab!
+                                   (.getClientProperty tabs "mescript.frame")
+                                   tabs
+                                   editor
+                                   (.getClientProperty tabs "mescript.status")))
+                               (mouseEntered [^MouseEvent _]
+                                 (.setForeground close-label tab-close-hover-color))
+                               (mouseExited [^MouseEvent _]
+                                 (.setForeground close-label tab-close-color))))
+          (.add header title-label)
+          (.add header close-label)
+          (.setTabComponentAt tabs idx header)
+          (refresh-tab-title! tabs editor))))))
+
+(defn normalize-save-name [name]
+  (let [trimmed (str/trim (or name ""))]
+    (when-not (str/blank? trimmed)
+      (if (re-find #"\.[^/\\]+$" trimmed)
+        trimmed
+        (str trimmed ".gl")))))
+
+(defn suggested-save-file [^JTextComponent editor]
+  (when-let [name (normalize-save-name (editor-tab-name editor 1))]
+    (File. name)))
+
+(defn choose-file-for-editor [^JFrame frame title ^JTextComponent editor]
+  (let [chooser (JFileChooser. ".")]
+    (.setDialogTitle chooser title)
+    (when-let [file (suggested-save-file editor)]
+      (.setSelectedFile chooser file))
+    (when (= JFileChooser/APPROVE_OPTION (.showSaveDialog chooser frame))
+      (.getSelectedFile chooser))))
+
+(defn rename-tab! [^JFrame frame ^JTabbedPane tabs ^JTextComponent editor]
+  (let [current (editor-tab-name editor 1)
+        value (JOptionPane/showInputDialog frame "Tab name" current)
+        renamed (some-> value str/trim)]
+    (when-not (str/blank? renamed)
+      (set-editor-tab-name! editor renamed)
+      (refresh-tab-title! tabs editor)
+      (.repaint tabs)
+      true)))
+
+(defn save-editor! [^JFrame frame ^JTabbedPane tabs ^JTextComponent editor ^JLabel status]
+  (let [file (or (editor-file editor) (choose-file-for-editor frame "Save" editor))]
     (when file
       (write-file! file (.getText editor))
-      (swap! state assoc :file file)
+      (set-editor-file! editor file)
+      (set-editor-dirty! editor false)
+      (refresh-tab-title! tabs editor)
+      (set-status! status (str "saved " (.getPath file)))
+      true)))
+
+(defn prompt-save-tab! [^JFrame frame ^JTabbedPane tabs ^JTextComponent editor ^JLabel status]
+  (if-not (editor-dirty? editor)
+    true
+    (let [choice (JOptionPane/showConfirmDialog
+                   frame
+                   (str "Save changes to " (editor-tab-name editor 1) "?")
+                   "Unsaved Changes"
+                   JOptionPane/YES_NO_CANCEL_OPTION
+                   JOptionPane/WARNING_MESSAGE)]
+      (cond
+        (= choice JOptionPane/YES_OPTION)
+        (boolean (save-editor! frame tabs editor status))
+
+        (= choice JOptionPane/NO_OPTION)
+        true
+
+        :else
+        false))))
+
+(defn configure-editor! [^JTextComponent editor ^JLabel status source file]
+  (.setText editor source)
+  (clear-editor-undo-history! editor)
+  (.setFont editor (Font. Font/MONOSPACED Font/PLAIN 13))
+  (.setBackground editor Color/WHITE)
+  (.putClientProperty editor "mescript.file" file)
+  (set-editor-dirty! editor false)
+  (install-auto-indent! editor)
+  (install-syntax-highlighter! editor)
+  (install-paren-highlighter! editor)
+  (install-live-gate-range-cache! editor)
+  (install-live-auto-update! editor status)
+  editor)
+
+(defn add-editor-tab! [^JTabbedPane tabs ^JLabel status source file]
+  (let [editor (configure-editor! (editor-pane) status source file)
+        scroll (JScrollPane. editor)]
+    (.setBackground (.getViewport scroll) Color/WHITE)
+    (.setRowHeaderView scroll (line-number-gutter editor))
+    (.setPreferredSize scroll (Dimension. 712 520))
+    (.putClientProperty editor "mescript.scroll" scroll)
+    (.setName editor "mescript-editor")
+    (.addTab tabs (file-title file (inc (.getTabCount tabs))) scroll)
+    (.addDocumentListener
+      (.getDocument editor)
+      (reify DocumentListener
+        (insertUpdate [_ _]
+          (set-editor-dirty! editor true)
+          (refresh-tab-title! tabs editor))
+        (removeUpdate [_ _]
+          (set-editor-dirty! editor true)
+          (refresh-tab-title! tabs editor))
+        (changedUpdate [_ _] nil)))
+    (.setSelectedComponent tabs scroll)
+    (install-tab-header! tabs editor)
+    (sync-active-file! tabs)
+    editor))
+
+(defn close-tab! [^JFrame frame ^JTabbedPane tabs ^JTextComponent editor ^JLabel status]
+  (when (or (nil? frame)
+            (prompt-save-tab! frame tabs editor status))
+    (when-let [scroll (.getClientProperty editor "mescript.scroll")]
+      (let [idx (.indexOfComponent tabs scroll)]
+        (when (>= idx 0)
+          (.removeTabAt tabs idx)
+          (when (zero? (.getTabCount tabs))
+            (add-editor-tab! tabs (or status (JLabel.)) "" nil))
+          (sync-active-file! tabs)
+          (when status
+            (set-status! status "closed tab"))
+          true)))))
+
+(defn close-all-tabs! [^JFrame frame ^JTabbedPane tabs ^JLabel status]
+  (loop []
+    (if (zero? (.getTabCount tabs))
+      true
+      (let [component (.getComponentAt tabs 0)
+            editor (tab-editor component)]
+        (if (and editor (prompt-save-tab! frame tabs editor status))
+          (do
+            (.removeTabAt tabs 0)
+            (recur))
+          false)))))
+
+(defn save-current! [^JFrame frame ^JTabbedPane tabs ^JLabel status]
+  (when-let [editor (active-editor tabs)]
+    (save-editor! frame tabs editor status)))
+
+(defn save-as! [^JFrame frame ^JTabbedPane tabs ^JLabel status]
+  (when-let [editor (active-editor tabs)]
+    (when-let [file (choose-file-for-editor frame "Save As" editor)]
+      (write-file! file (.getText editor))
+      (set-editor-file! editor file)
+      (set-editor-dirty! editor false)
+      (refresh-tab-title! tabs editor)
       (set-status! status (str "saved " (.getPath file))))))
+
+(defn new-file! [^JTabbedPane tabs ^JLabel status]
+  (add-editor-tab! tabs status "" nil)
+  (set-status! status "new file"))
+
+(defn open-file-in-tab! [^JTabbedPane tabs ^JLabel status ^File file]
+  (if-let [existing (some (fn [idx]
+                            (let [component (.getComponentAt tabs idx)
+                                  editor (tab-editor component)
+                                  open-file (some-> editor editor-file)]
+                              (when (and open-file (= (.getCanonicalFile open-file)
+                                                      (.getCanonicalFile file)))
+                                component)))
+                          (range (.getTabCount tabs)))]
+    (do
+      (.setSelectedComponent tabs existing)
+      (sync-active-file! tabs)
+      (set-status! status (str "opened " (.getPath file))))
+    (do
+      (add-editor-tab! tabs status (read-file file) file)
+      (set-status! status (str "opened " (.getPath file))))))
+
+(defn save-audio-to-file! [^JFrame frame ^JTextComponent editor ^JLabel status ^File file]
+  (render-audio! frame editor status (.getPath file) (.getText editor) false false))
+
+(declare choose-wav-file)
+
+(defn save-audio! [^JFrame frame ^JTabbedPane tabs ^JLabel status]
+  (when-let [editor (active-editor tabs)]
+    (when-let [file (choose-wav-file frame)]
+      (save-audio-to-file! frame editor status file))))
 
 (defn menu-item [text f]
   (doto (JMenuItem. text)
@@ -354,7 +660,7 @@
     item))
 
 (def about-text
-  "MeScript v0.31\nJune 7, 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
+  "MeScript v0.33\nJune 8, 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
 
 (defn show-about! [^JFrame frame]
   (JOptionPane/showMessageDialog frame about-text "About MeScript" JOptionPane/INFORMATION_MESSAGE))
@@ -364,13 +670,6 @@
     (.setSelectedFile chooser (File. "render.wav"))
     (when (= JFileChooser/APPROVE_OPTION (.showSaveDialog chooser parent))
       (.getSelectedFile chooser))))
-
-(defn save-audio-to-file! [^JFrame frame ^JTextComponent editor ^JLabel status ^File file]
-  (render-audio! frame editor status (.getPath file) (.getText editor) false false))
-
-(defn save-audio! [^JFrame frame ^JTextComponent editor ^JLabel status]
-  (when-let [file (choose-wav-file frame)]
-    (save-audio-to-file! frame editor status file)))
 
 (def post-fx-only-labels
   #{"reverse" "tape-stop" "granular" "granular-stretch" "spectral-freeze"
@@ -390,7 +689,7 @@
   (filter #(post-fx-label? (:label %)) effect-options))
 
 (def insert-form-categories
-  ["Oscillator" "FX" "Post FX" "Scene" "Math / Logic" "Pattern" "Playback"])
+  ["Oscillator" "FX" "Post FX" "Scene" "Playback"])
 
 (defn insert-form-options [category]
   (case category
@@ -421,9 +720,9 @@
         "  (d :lead\n"
         "     :src :sine-synth\n"
         "     :note c3\n"
-        "     :gate (p [1 0 1 0])\n"
         "     :dur 0.12\n"
-        "     :amp 0.2))\n\n"
+        "     :amp 0.2\n"
+        "     :gate (p [1 0 1 0])))\n\n"
         "(play-scene :" scene ")\n")))
 
 (defn effect-form-for-label
@@ -447,9 +746,9 @@
   (str "(d :post-fx-demo\n"
        "   :src :sine-synth\n"
        "   :note c3\n"
-       "   :gate (p [1 0 1 0])\n"
        "   :dur 0.12\n"
-       "   :amp 0.2)\n\n"
+       "   :amp 0.2\n"
+       "   :gate (p [1 0 1 0]))\n\n"
        post-fx
        "\n(start!)\n"))
 
@@ -572,21 +871,21 @@
   (str "(d :fx-demo\n"
        "   :src :sine-synth\n"
        "   :note c3\n"
-       "   :gate (p [1 0 1 0])\n"
        "   :dur 0.12\n"
        "   :amp 0.2\n"
        "   :fx [\n"
        (indent-lines (str/trim effect) "     ")
-       "\n   ])\n\n"
+       "\n   ]\n"
+       "   :gate (p [1 0 1 0]))\n\n"
        "(start!)\n"))
 
 (defn standalone-pattern-track-snippet [gate]
   (str "(d :pattern-demo\n"
        "   :src :click\n"
        "   :note c3\n"
-       "   :gate " gate "\n"
        "   :dur 0.05\n"
-       "   :amp 0.4)\n\n"
+       "   :amp 0.4\n"
+       "   :gate " gate ")\n\n"
        "(start!)\n"))
 
 (defn enclosing-list-range [text caret]
@@ -918,24 +1217,24 @@
                                     "  (d :lead\n"
                                     "     :src :sine-synth\n"
                                     "     :note c3\n"
-                                    "     :gate (p [1 0 1 0])\n"
                                     "     :dur 0.12\n"
-                                    "     :amp 0.2))\n\n"
+                                    "     :amp 0.2\n"
+                                    "     :gate (p [1 0 1 0])))\n\n"
                                     "(play-scene :" scene ")\n")
                "scene chain" (str "(scene :" scene " :repeat 1 :next :next-scene\n"
                                   "  (d :lead\n"
                                   "     :src :sine-synth\n"
                                   "     :note c3\n"
-                                  "     :gate (p [1 0 1 0])\n"
                                   "     :dur 0.12\n"
-                                  "     :amp 0.2))\n\n"
+                                  "     :amp 0.2\n"
+                                  "     :gate (p [1 0 1 0])))\n\n"
                                   "(scene :next-scene :loop true\n"
                                   "  (d :lead\n"
                                   "     :src :sine-synth\n"
                                   "     :note e3\n"
-                                  "     :gate (p [1 1 0 1])\n"
                                   "     :dur 0.12\n"
-                                  "     :amp 0.2))\n\n"
+                                  "     :amp 0.2\n"
+                                  "     :gate (p [1 1 0 1])))\n\n"
                                   "(play-scene :" scene ")\n")
                "by-scene track" (str "(def lead\n"
                                      "  (d :lead\n"
@@ -944,12 +1243,12 @@
                                      "            :" scene " c3\n"
                                      "            :next-scene e3\n"
                                      "            :else g3)\n"
+                                     "     :dur 0.12\n"
+                                     "     :amp 0.2\n"
                                      "     :gate (by-scene\n"
                                      "            :" scene " (p [1 0 1 0])\n"
                                      "            :next-scene (p [1 1 0 1])\n"
-                                     "            :else (p [1 0 0 0]))\n"
-                                     "     :dur 0.12\n"
-                                     "     :amp 0.2))\n\n"
+                                     "            :else (p [1 0 0 0]))))\n\n"
                                      "(scene :" scene " :repeat 1 :next :next-scene\n"
                                      "  lead)\n\n"
                                      "(scene :next-scene :loop true\n"
@@ -1116,22 +1415,32 @@
 
 (defn build-ui [initial-file]
   (let [frame (JFrame. "temporaworkstation")
-        editor (editor-pane)
+        tabs (JTabbedPane.)
         status (JLabel. "ready")
         insert-category-combo (JComboBox. (into-array String insert-form-categories))
         insert-form-combo (JComboBox.)
         tools (JPanel.)
         source (if initial-file (read-file initial-file) default-source)]
-    (swap! state assoc :file initial-file)
-    (.setText editor source)
-    (clear-editor-undo-history! editor)
-    (.setFont editor (Font. Font/MONOSPACED Font/PLAIN 13))
-    (.setBackground editor Color/WHITE)
-    (install-auto-indent! editor)
-    (install-syntax-highlighter! editor)
-    (install-paren-highlighter! editor)
-    (install-live-gate-range-cache! editor)
-    (install-live-auto-update! editor status)
+    (.setName tabs "mescript-editor-tabs")
+    (.setFocusable tabs false)
+    (.setRequestFocusEnabled tabs false)
+    (.setTabLayoutPolicy tabs JTabbedPane/SCROLL_TAB_LAYOUT)
+    (.setFont tabs (Font. Font/SANS_SERIF Font/PLAIN 12))
+    (.setBorder tabs (BorderFactory/createEmptyBorder 2 2 0 2))
+    (.putClientProperty tabs "mescript.frame" frame)
+    (.putClientProperty tabs "mescript.status" status)
+    (add-editor-tab! tabs status source initial-file)
+    (.addChangeListener tabs
+                        (reify ChangeListener
+                          (stateChanged [_ _]
+                            (sync-active-file! tabs)
+                            (refresh-all-tab-headers! tabs)
+                            (SwingUtilities/invokeLater
+                              #(do
+                                 (refresh-all-tab-headers! tabs)
+                                 (.repaint tabs)))
+                            (when-let [editor (active-editor tabs)]
+                              (.putClientProperty (.getRootPane frame) "mescript.editor" editor)))))
     (.setLayout tools (BoxLayout. tools BoxLayout/Y_AXIS))
     (.setBorder tools (BorderFactory/createEmptyBorder 6 8 6 8))
     (.setPreferredSize tools (Dimension. 148 480))
@@ -1165,20 +1474,24 @@
                                                    (str (.getSelectedItem insert-category-combo))))))
       (add-label! "Playback")
       (add-control! (button "Play"
-                            #(live-update! frame editor status (:audio-device @state)))
+                            #(when-let [editor (active-editor tabs)]
+                               (sync-active-file! tabs)
+                               (live-update! frame editor status (:audio-device @state))))
                     27)
       (add-control! (button "Stop"
-                            #(live-stop! editor status))
+                            #(when-let [editor (active-editor tabs)]
+                               (live-stop! editor status)))
                     27)
 
       (add-label! "Insert Form")
       (add-control! insert-category-combo 25)
       (add-control! insert-form-combo 25)
       (add-control! (button "Insert"
-                            #(insert-selected-form! editor
-                                                    insert-category-combo
-                                                    insert-form-combo
-                                                    (or (first-scene-name (.getText editor)) "intro")))
+                            #(when-let [editor (active-editor tabs)]
+                               (insert-selected-form! editor
+                                                      insert-category-combo
+                                                      insert-form-combo
+                                                      (or (first-scene-name (.getText editor)) "intro"))))
                     27)
       (let [menu-bar (JMenuBar.)
             file-menu (JMenu. "File")
@@ -1212,14 +1525,20 @@
                           #(set-status! status (str "audio device refresh failed: " (.getMessage ex))))))))]
           (set-device-items! [])
           (.add file-menu
+                (menu-item "New"
+                           #(new-file! tabs status)))
+          (.add file-menu
                 (menu-item "Open..."
                            #(when-let [file (choose-file frame "Open")]
-                              (.setText editor (read-file file))
-                              (clear-editor-undo-history! editor)
-                              (swap! state assoc :file file)
-                              (set-status! status (str "opened " (.getPath file))))))
-          (.add file-menu (menu-item "Save" #(save-current! frame editor status)))
-          (.add file-menu (menu-item "Save Audio..." #(save-audio! frame editor status)))
+                              (open-file-in-tab! tabs status file))))
+          (.add file-menu (menu-item "Save" #(save-current! frame tabs status)))
+          (.add file-menu (menu-item "Save As..." #(save-as! frame tabs status)))
+          (.add file-menu (menu-item "Save Audio..." #(save-audio! frame tabs status)))
+          (.add file-menu
+                (menu-item "Exit"
+                           #(when (close-all-tabs! frame tabs status)
+                              (close-live-process!)
+                              (.dispose frame))))
           (.add preferences-menu
                 (checkbox-menu-item "Remove Insert Comments"
                                     (:remove-insert-comments @state)
@@ -1235,14 +1554,16 @@
                                     #(do
                                        (swap! state assoc :remove-playback-highlighting %)
                                        (when %
-                                         (clear-live-step-highlight! editor))
+                                         (when-let [editor (active-editor tabs)]
+                                           (clear-live-step-highlight! editor)))
                                        (set-status! status
                                                     (if %
                                                       "playback highlighting: removed"
                                                       "playback highlighting: shown")))))
           (.add preferences-menu
                 (menu-item "Clear Null Parameters"
-                           #(clear-null-parameters! editor status)))
+                           #(when-let [editor (active-editor tabs)]
+                              (clear-null-parameters! editor status))))
           (.add audio-menu devices-menu)
           (.add audio-menu (menu-item "Refresh Devices" #(refresh-devices!)))
           (.add about-menu (menu-item "Language Reference" #(show-language-reference! frame)))
@@ -1254,24 +1575,23 @@
           (.setJMenuBar frame menu-bar)
           (refresh-devices!)))
 
-      (let [editor-scroll (JScrollPane. editor)]
-        (.setBackground (.getViewport editor-scroll) Color/WHITE)
-        (.setRowHeaderView editor-scroll (line-number-gutter editor))
-        (.setPreferredSize editor-scroll (Dimension. 712 520))
-        (.add (.getContentPane frame) editor-scroll BorderLayout/CENTER)
+      (let [editor (active-editor tabs)]
+        (.putClientProperty (.getRootPane frame) "mescript.editor" editor)
+        (.add (.getContentPane frame) tabs BorderLayout/CENTER)
         (.add (.getContentPane frame) tools BorderLayout/EAST)
         (.add (.getContentPane frame) status BorderLayout/SOUTH)))
 
-    (.setDefaultCloseOperation frame JFrame/EXIT_ON_CLOSE)
+    (.setDefaultCloseOperation frame JFrame/DO_NOTHING_ON_CLOSE)
     (.setName frame "mescript-workstation-frame")
-    (.setName editor "mescript-editor")
     (.setName status "mescript-status")
-    (.putClientProperty (.getRootPane frame) "mescript.editor" editor)
+    (.putClientProperty (.getRootPane frame) "mescript.editor-tabs" tabs)
     (.putClientProperty (.getRootPane frame) "mescript.status" status)
     (.addWindowListener frame
                         (proxy [WindowAdapter] []
                           (windowClosing [_]
-                            (close-live-process!))))
+                            (when (close-all-tabs! frame tabs status)
+                              (close-live-process!)
+                              (.dispose frame)))))
     (.pack frame)
     (.setLocationRelativeTo frame nil)
     (.setVisible frame true)

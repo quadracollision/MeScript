@@ -30,7 +30,8 @@ use crate::effects::offline::{
 };
 use crate::gui_render;
 use crate::language::{
-    compile_source_for_runtime, eval_program, load_runtime, source_needs_compiler,
+    compile_source_for_runtime, compile_source_for_runtime_with_base, eval_program, load_runtime,
+    source_needs_compiler,
 };
 use crate::model::{NoteMode, Runtime, SceneState};
 use crate::sequencer;
@@ -65,7 +66,7 @@ fn parses_and_evaluates_track() {
 fn workstation_about_text_shows_current_version_date() {
     let source = fs::read_to_string("src/main.clj").unwrap();
     assert!(
-        source.contains("MeScript v0.31\\nJune 7, 2026"),
+        source.contains("MeScript v0.33\\nJune 8, 2026"),
         "about text should show current version/date"
     );
 }
@@ -4740,6 +4741,62 @@ fn native_file_loading_accepts_compiler_forms() {
 }
 
 #[test]
+fn native_file_loading_expands_relative_includes() {
+    let dir = PathBuf::from(format!("/tmp/glitchlisp-include-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("parts")).unwrap();
+    let instruments = dir.join("parts/instruments.gl");
+    let song = dir.join("song.gl");
+    std::fs::write(
+        &instruments,
+        "(def click
+           (d :click :src :click :gate (p [1 0]) :dur 0.02 :amp 0.2))",
+    )
+    .unwrap();
+    std::fs::write(
+        &song,
+        "(include \"parts/instruments.gl\")
+         (scene :intro :loop true
+           click)
+         (play-scene :intro)",
+    )
+    .unwrap();
+
+    let runtime = load_runtime(song.to_str().unwrap()).unwrap();
+    assert!(runtime.running);
+    assert!(runtime.tracks.contains_key("click"));
+    assert_eq!(
+        runtime
+            .scene_state
+            .as_ref()
+            .map(|state| state.current.as_str()),
+        Some("intro")
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn include_cycles_report_clear_error() {
+    let dir = PathBuf::from(format!(
+        "/tmp/glitchlisp-include-cycle-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.gl");
+    let b = dir.join("b.gl");
+    std::fs::write(&a, "(include \"b.gl\")").unwrap();
+    std::fs::write(&b, "(include \"a.gl\")").unwrap();
+
+    let source = std::fs::read_to_string(&a).unwrap();
+    let err = compile_source_for_runtime_with_base(&source, Some(&a)).unwrap_err();
+    assert!(err.contains("include cycle detected"), "{}", err);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn native_interactive_eval_accepts_compiler_forms() {
     let mut runtime = Runtime::new();
     cli::eval_interactive_source(
@@ -5236,6 +5293,8 @@ fn swing_loop_inference_follows_finite_scene_chains() {
     let results = stdout
         .lines()
         .filter(|line| *line == "true" || *line == "false")
+        .rev()
+        .take(2)
         .collect::<Vec<_>>();
     assert_eq!(
         results,
@@ -7664,6 +7723,11 @@ fn sample_oscillator_insert_uses_sample_form() {
         snippet
     );
     assert!(
+        snippet.rfind(":gate null") > snippet.rfind(":amp null"),
+        "sample oscillator insert should place :gate at the bottom: {}",
+        snippet
+    );
+    assert!(
         !snippet.contains(":src :sample"),
         "sample oscillator insert should not teach the low-level :src :sample form: {}",
         snippet
@@ -9293,6 +9357,51 @@ fn live_step_highlight_ignores_caret_focus_and_marks_all_active_tracks() {
 }
 
 #[test]
+fn live_step_highlight_uses_active_by_scene_branch_for_def_tracks() {
+    let script = r#"
+      (load-file "src/glitchlisp/swing/shared.clj")
+      (load-file "src/glitchlisp/swing/editor.clj")
+      (let [pane (javax.swing.JTextPane.)
+            source "(def hat\n  (d :hat\n     :src :hat-909\n     :note c6\n     :gate (by-scene\n             :intro (p [1 0 1 0])\n             :drop (p (then\n                        (times 4 [1 0 1 0])\n                        [1 1 0 1])))\n     :dur 0.025\n     :amp 0.08))\n\n(scene :intro :repeat 1 :next :drop\n  hat)\n\n(scene :drop :loop true\n  hat)\n\n(play-scene :intro)"
+            highlighted (fn []
+                          (->> (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-key)
+                               (map (fn [[start end]] (subs source start end)))
+                               vec))]
+        (.setText pane source)
+        (glitchlisp.swing.editor/install-live-gate-range-cache! pane)
+        (glitchlisp.swing.editor/highlight-live-step! pane 0 "intro")
+        (println (some #(= "1" %) (highlighted)))
+        (glitchlisp.swing.editor/highlight-live-step! pane 0 "drop")
+        (println (some #(clojure.string/starts-with? % "(times 4") (highlighted)))
+        (glitchlisp.swing.editor/highlight-live-step! pane 4 "drop")
+        (println (some #(= "1" %) (highlighted))))
+    "#;
+    let output = Command::new("clojure")
+        .arg("-J-Djava.awt.headless=true")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run by-scene live highlight smoke");
+    assert!(
+        output.status.success(),
+        "by-scene live highlight smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter(|line| *line == "true" || *line == "false" || *line == "nil")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec!["true", "true", "true"],
+        "live highlight should use active by-scene branch for def tracks: {}",
+        stdout
+    );
+}
+
+#[test]
 fn live_step_highlight_reuses_scene_range_until_document_changes() {
     let script = r#"
       (load-file "src/glitchlisp/swing/shared.clj")
@@ -9438,7 +9547,6 @@ fn live_step_highlight_reuses_active_gate_entries_until_document_changes() {
         stdout
     );
 }
-
 
 #[test]
 fn live_step_highlight_reuses_resolved_ranges_for_repeating_steps() {
@@ -10141,6 +10249,48 @@ fn language_reference_effect_examples_show_required_context() {
         "missing on-gate reference example: {}",
         stdout
     );
+}
+
+#[test]
+fn language_reference_effect_rows_show_keyword_choices() {
+    let script = r#"
+      (load-file "src/glitchlisp/swing/shared.clj")
+      (load-file "src/glitchlisp/swing/catalog.clj")
+      (load-file "src/glitchlisp/swing/docs.clj")
+      (doseq [[name desc _] (glitchlisp.swing.docs/effect-rows)]
+        (when (#{"filter" "formant" "distort" "haas" "ams-reverb" "la2a" "sem-filter" "obxa-filter"} name)
+          (println (str name "\t" desc))))
+    "#;
+    let output = Command::new("clojure")
+        .arg("-J-Djava.awt.headless=true")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("extract language reference effect keyword docs");
+    assert!(
+        output.status.success(),
+        "language reference effect keyword extraction failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for required in [
+        "filter\tApply filter. Keywords: :type :lowpass, :lp",
+        "formant\tApply formant. Keywords: :vowel :a, :e, :i, :o, :u",
+        "distort\tApply distort. Keywords: :type :tanh, :hard-clip, :hard_clip",
+        "haas\tApply haas. Keywords: :side :left, :right",
+        "ams-reverb\tApply ams-reverb. Keywords: :program :nonlin, :non-linear, :nonlinear, :ambience, :ambient, :plate",
+        "la2a\tApply la2a. Keywords: :mode :compress, :limit",
+        "sem-filter\tApply sem-filter. Keywords: :type :lowpass, :lp",
+        "obxa-filter\tApply obxa-filter. Keywords: :type :lowpass, :lp",
+    ] {
+        assert!(
+            stdout.contains(required),
+            "missing keyword choices '{}': {}",
+            required,
+            stdout
+        );
+    }
 }
 
 #[test]
@@ -11058,6 +11208,11 @@ fn oscillator_insert_uses_blank_parameter_form() {
         stdout
     );
     assert!(
+        blank.rfind(":gate null") > blank.rfind(":amp null"),
+        "blank Oscillator insertion should place :gate at the bottom: {}",
+        stdout
+    );
+    assert!(
         nonblank.contains("(bpm 100)")
             && nonblank.contains("(d :sine")
             && nonblank.contains(":note null")
@@ -11160,6 +11315,278 @@ fn swing_main_load_does_not_launch_ui_in_headless_mode() {
         !stderr.contains("HeadlessException"),
         "headless load should not launch Swing UI: {}",
         stderr
+    );
+}
+
+#[test]
+fn file_menu_source_lists_new_save_as_and_exit() {
+    let source = std::fs::read_to_string("src/main.clj").expect("read Swing main source");
+    for label in [
+        "(menu-item \"New\"",
+        "(menu-item \"Open...\"",
+        "(menu-item \"Save\"",
+        "(menu-item \"Save As...\"",
+        "(menu-item \"Save Audio...\"",
+        "(menu-item \"Exit\"",
+    ] {
+        assert!(source.contains(label), "missing File menu item {}", label);
+    }
+}
+
+#[test]
+fn insert_form_categories_hide_math_logic_and_pattern() {
+    let source = std::fs::read_to_string("src/main.clj").expect("read Swing main source");
+    assert!(
+        source.contains(
+            "(def insert-form-categories\n  [\"Oscillator\" \"FX\" \"Post FX\" \"Scene\" \"Playback\"]"
+        ),
+        "insert form categories should hide Math / Logic and Pattern"
+    );
+}
+
+#[test]
+fn new_file_adds_blank_tab_and_clears_active_file_state() {
+    let script = r#"
+      (load-file "src/main.clj")
+      (let [tabs (javax.swing.JTabbedPane.)
+            status (javax.swing.JLabel. "stale")]
+        (glitchlisp-swing/add-editor-tab! tabs status "(d :lead :src :click :gate 1)" (java.io.File. "old.gl"))
+        (swap! glitchlisp-swing/state assoc :file (java.io.File. "old.gl"))
+        (glitchlisp-swing/new-file! tabs status)
+        (let [editor (glitchlisp-swing/active-editor tabs)]
+          (println (= 2 (.getTabCount tabs)))
+          (println (= "" (.getText editor)))
+          (println (nil? (glitchlisp-swing/editor-file editor)))
+          (println (not (glitchlisp-swing/editor-dirty? editor))))
+        (println (nil? (:file @glitchlisp-swing/state)))
+        (println (.getText status))
+        (flush)
+        (System/exit 0))
+    "#;
+    let output = Command::new("clojure")
+        .arg("-J-Djava.awt.headless=true")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run new file helper smoke");
+    assert!(
+        output.status.success(),
+        "new file helper smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter(|line| *line == "true" || *line == "new file")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec!["true", "true", "true", "true", "true", "new file"],
+        "new-file should add a blank active tab and clear active file state: {}",
+        stdout
+    );
+}
+
+#[test]
+fn editor_tabs_mark_dirty_and_install_close_header() {
+    let script = r#"
+      (load-file "src/main.clj")
+      (let [tabs (javax.swing.JTabbedPane.)
+            status (javax.swing.JLabel. "stale")
+            editor (glitchlisp-swing/add-editor-tab! tabs status "(bpm 118)" nil)]
+        (.insertString (.getDocument editor) (.getLength (.getDocument editor)) "\n" nil)
+        (println (glitchlisp-swing/editor-dirty? editor))
+        (println (clojure.string/starts-with? (.getTitleAt tabs 0) "*"))
+        (println (some? (.getTabComponentAt tabs 0)))
+        (flush)
+        (System/exit 0))
+    "#;
+    let output = Command::new("clojure")
+        .arg("-J-Djava.awt.headless=true")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run editor tab dirty smoke");
+    assert!(
+        output.status.success(),
+        "editor tab dirty smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter(|line| *line == "true")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec!["true", "true", "true"],
+        "editor tab should mark dirty and install close header: {}",
+        stdout
+    );
+}
+
+#[test]
+fn editor_tab_rename_sets_save_suggestion() {
+    let script = r#"
+      (load-file "src/main.clj")
+      (let [tabs (javax.swing.JTabbedPane.)
+            status (javax.swing.JLabel. "stale")
+            editor (glitchlisp-swing/add-editor-tab! tabs status "(bpm 118)" nil)]
+        (glitchlisp-swing/set-editor-tab-name! editor "drums")
+        (glitchlisp-swing/refresh-tab-title! tabs editor)
+        (println (= "drums" (glitchlisp-swing/editor-tab-name editor 1)))
+        (println (= "drums" (.getText (.getClientProperty editor "mescript.tab-label"))))
+        (println (= "drums.gl" (.getName (glitchlisp-swing/suggested-save-file editor))))
+        (flush)
+        (System/exit 0))
+    "#;
+    let output = Command::new("clojure")
+        .arg("-J-Djava.awt.headless=true")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run editor tab rename smoke");
+    assert!(
+        output.status.success(),
+        "editor tab rename smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter(|line| *line == "true")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec!["true", "true", "true"],
+        "renamed tab should update title and save suggestion: {}",
+        stdout
+    );
+}
+
+#[test]
+fn custom_tab_header_selection_selects_clicked_tab() {
+    let script = r#"
+      (load-file "src/main.clj")
+      (let [tabs (javax.swing.JTabbedPane.)
+            status (javax.swing.JLabel. "stale")
+            first (glitchlisp-swing/add-editor-tab! tabs status "(bpm 118)" (java.io.File. "first.gl"))
+            second (glitchlisp-swing/add-editor-tab! tabs status "(bpm 120)" (java.io.File. "second.gl"))]
+        (glitchlisp-swing/select-editor-tab! tabs first)
+        (println (= first (glitchlisp-swing/active-editor tabs)))
+        (println (= (java.io.File. "first.gl") (:file @glitchlisp-swing/state)))
+        (glitchlisp-swing/select-editor-tab! tabs second)
+        (println (= second (glitchlisp-swing/active-editor tabs)))
+        (println (= (java.io.File. "second.gl") (:file @glitchlisp-swing/state)))
+        (flush)
+        (System/exit 0))
+    "#;
+    let output = Command::new("clojure")
+        .arg("-J-Djava.awt.headless=true")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run tab header selection smoke");
+    assert!(
+        output.status.success(),
+        "tab header selection smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter(|line| *line == "true")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec!["true", "true", "true", "true"],
+        "custom tab header selection should select clicked tab: {}",
+        stdout
+    );
+}
+
+#[test]
+fn line_numbers_use_four_digit_minimum_width() {
+    let script = r#"
+      (load-file "src/glitchlisp/swing/shared.clj")
+      (load-file "src/glitchlisp/swing/editor.clj")
+      (let [pane (javax.swing.JTextPane.)]
+        (.setText pane "a\nb\nc")
+        (println (pr-str (glitchlisp.swing.editor/line-number-text pane))))
+    "#;
+    let output = Command::new("clojure")
+        .arg("-J-Djava.awt.headless=true")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run line number width smoke");
+    assert!(
+        output.status.success(),
+        "line number width smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.starts_with('"'))
+        .unwrap_or_else(|| panic!("missing line number output: {}", stdout));
+    let gutter = unescape_clojure_pr_str(line);
+    assert!(
+        gutter.starts_with("1    "),
+        "line numbers should reserve four left-aligned digits by default: {:?}",
+        gutter
+    );
+}
+
+#[test]
+fn swing_compile_expands_includes_relative_to_current_file() {
+    let script = r#"
+      (load-file "src/glitchlisp/swing/shared.clj")
+      (load-file "src/glitchlisp/swing/editor.clj")
+      (load-file "src/glitchlisp/swing/render.clj")
+      (let [dir (java.io.File. (str "/tmp/glitchlisp-swing-include-" (.getName (java.io.File. "."))))
+            _ (.mkdirs (java.io.File. dir "parts"))
+            song (java.io.File. dir "song.gl")
+            inst (java.io.File. dir "parts/instruments.gl")]
+        (spit (.getPath inst) "(def click\n  (d :click :src :click :gate (p [1 0]) :dur 0.02 :amp 0.2))\n")
+        (spit (.getPath song) "(include \"parts/instruments.gl\")\n(scene :intro :loop true click)\n(play-scene :intro)\n")
+        (swap! glitchlisp.swing.shared/state assoc :file song)
+        (let [compiled (glitchlisp.swing.render/compile-glitchlisp-source (slurp (.getPath song)))]
+          (println (clojure.string/includes? compiled "(d :click"))
+          (println (not (clojure.string/includes? compiled "(include"))))
+        (doseq [file [inst song]] (.delete file))
+        (.delete (java.io.File. dir "parts"))
+        (.delete dir))
+    "#;
+    let output = Command::new("clojure")
+        .arg("-J-Djava.awt.headless=true")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run Swing include compile smoke");
+    assert!(
+        output.status.success(),
+        "Swing include compile smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter(|line| *line == "true" || *line == "false")
+        .collect::<Vec<_>>();
+    let results = results.into_iter().rev().take(2).collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec!["true", "true"],
+        "Swing compile should expand includes: {}",
+        stdout
     );
 }
 

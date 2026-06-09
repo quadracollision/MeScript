@@ -186,25 +186,25 @@
      (if (= source "sample")
        (str "(sample :sample\n"
             (blank-param ":sample-data")
-            (blank-param ":gate")
             (blank-param ":note")
             (blank-param ":dur")
             (blank-param ":amp")
+            (blank-param ":gate")
             ")\n")
        (str "(d :" (track-id-for-source source) "\n"
             "   :src :" source (param-contract oscillator-param-contracts ":src" include-comments?) "\n"
             (blank-param ":note")
-            (blank-param ":gate")
             (blank-param ":dur")
             (blank-param ":amp")
             (apply str (map blank-param (oscillator-parameter-examples source)))
+            (blank-param ":gate")
             ")\n")))))
 
 (defn oscillator-snippet [source]
   (let [{:keys [note gate dur amp extra]} (defaults-for-source source)
         id (track-id-for-source source)]
-    (format "(d :%s\n   :src :%s\n   :note %s\n   :gate %s\n   :dur %s\n   :amp %s%s)\n"
-            id source note gate dur amp extra)))
+    (format "(d :%s\n   :src :%s\n   :note %s\n   :dur %s\n   :amp %s%s\n   :gate %s)\n"
+            id source note dur amp extra gate)))
 
 (defn load-effects []
   (try
@@ -221,10 +221,16 @@
 (defn effect-option-for-label [label]
   (some #(when (= (:label %) label) %) effect-options))
 
+(def filter-type-contract
+  "type: keyword; range: :lowpass|:lp|:highpass|:hp|:bandpass|:bp|:notch|:allpass|:ap|:peaking|:peak|:bell|:low-shelf|:low_shelf|:lowshelf|:high-shelf|:high_shelf|:highshelf")
+
+(def distortion-type-contract
+  "type: keyword; range: :tanh|:hard-clip|:hard_clip|:soft-clip|:soft_clip|:sine-fold|:sine_fold|:rectify|:half-rectify|:half_rectify|:waveshape")
+
 (def effect-type-contracts
-  {"filter" {":type" "type: keyword; range: :lowpass|:highpass|:bandpass|:notch|:allpass|:peaking|:low-shelf|:high-shelf"}
-   "distort" {":type" "type: keyword; range: :tanh|:hard-clip|:soft-clip|:sine-fold|:rectify|:half-rectify|:waveshape"}
-   "distortion" {":type" "type: keyword; range: :tanh|:hard-clip|:soft-clip|:sine-fold|:rectify|:half-rectify|:waveshape"}
+  {"filter" {":type" filter-type-contract}
+   "distort" {":type" distortion-type-contract}
+   "distortion" {":type" distortion-type-contract}
    "formant" {":vowel" "type: keyword; range: :a|:e|:i|:o|:u"}
    "bitcrush" {":bits" "type: integer; range: 2..16"
                ":bit-depth" "type: integer; range: 2..16"
@@ -316,7 +322,7 @@
                   ":damping" "type: number; range: 0..1"}
    "ams-reverb" {":decay" "type: number; range: 0.1..5"
                  ":damping" "type: number; range: 0..1"
-                 ":program" "type: keyword; range: :nonlin|:ambience|:plate"}
+                 ":program" "type: keyword; range: :nonlin|:non-linear|:nonlinear|:ambience|:ambient|:plate"}
    "moog" {":drive" "type: number; range: 0..1"}
    "moog-ladder" {":drive" "type: number; range: 0..1"}
    "tb-303" {":env-mod" "type: number; range: 0..1"
@@ -400,6 +406,9 @@
               ":depth" "type: number; range: 0..1"}
    "tape-stop" {":duration" "type: number; range: 0.1..1"
                 ":duration-pct" "type: number; range: 0.1..1"}
+   "sem-filter" {":type" filter-type-contract}
+   "sem" {":type" filter-type-contract}
+   "obxa-filter" {":type" filter-type-contract}
    "haas" {":side" "type: keyword; range: :left|:right"}
    })
 

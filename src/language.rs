@@ -8,7 +8,7 @@ use crate::sequencer;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
@@ -189,9 +189,79 @@ fn expr_needs_compiler(expr: &Expr) -> bool {
     }
 }
 
-pub(crate) fn compile_source_for_runtime(source: &str) -> Result<String, String> {
-    if !source_needs_compiler(source) {
-        return Ok(source.to_string());
+fn include_path_from_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("(include")?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let after = rest[end + 1..].trim();
+    (after == ")").then_some(&rest[..end])
+}
+
+fn include_display_path(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn expand_source_includes_inner(
+    source: &str,
+    base_dir: &Path,
+    stack: &mut Vec<PathBuf>,
+) -> Result<String, String> {
+    let mut expanded = String::new();
+    for line in source.lines() {
+        if let Some(include_path) = include_path_from_line(line) {
+            let path = Path::new(include_path);
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                base_dir.join(path)
+            };
+            let key = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+            if stack.iter().any(|existing| existing == &key) {
+                return Err(format!(
+                    "include cycle detected at {}",
+                    include_display_path(&resolved)
+                ));
+            }
+            let included = fs::read_to_string(&resolved).map_err(|error| {
+                format!("include {}: {}", include_display_path(&resolved), error)
+            })?;
+            stack.push(key);
+            let child_base = resolved.parent().unwrap_or(base_dir);
+            expanded.push_str(&expand_source_includes_inner(&included, child_base, stack)?);
+            if !expanded.ends_with('\n') {
+                expanded.push('\n');
+            }
+            stack.pop();
+        } else {
+            expanded.push_str(line);
+            expanded.push('\n');
+        }
+    }
+    Ok(expanded)
+}
+
+pub(crate) fn expand_source_includes(
+    source: &str,
+    source_path: Option<&Path>,
+) -> Result<String, String> {
+    let base_dir = source_path
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+    let mut stack = Vec::new();
+    if let Some(path) = source_path {
+        stack.push(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    }
+    expand_source_includes_inner(source, base_dir, &mut stack)
+}
+
+pub(crate) fn compile_source_for_runtime_with_base(
+    source: &str,
+    source_path: Option<&Path>,
+) -> Result<String, String> {
+    let source = expand_source_includes(source, source_path)?;
+    if !source_needs_compiler(&source) {
+        return Ok(source);
     }
     let compiler_path = Path::new("src/compiler.clj");
     if !compiler_path.exists() {
@@ -232,6 +302,10 @@ pub(crate) fn compile_source_for_runtime(source: &str) -> Result<String, String>
     }
 }
 
+pub(crate) fn compile_source_for_runtime(source: &str) -> Result<String, String> {
+    compile_source_for_runtime_with_base(source, None)
+}
+
 fn clean_compiler_error(stderr: &str) -> String {
     let mut lines = stderr
         .lines()
@@ -250,7 +324,7 @@ fn clean_compiler_error(stderr: &str) -> String {
 
 pub(crate) fn load_runtime(path: &str) -> Result<Runtime, String> {
     let source = fs::read_to_string(path).map_err(|error| format!("{}: {}", path, error))?;
-    let source = compile_source_for_runtime(&source)?;
+    let source = compile_source_for_runtime_with_base(&source, Some(Path::new(path)))?;
     let mut runtime = Runtime::new();
     eval_program(&mut runtime, &source)?;
     Ok(runtime)

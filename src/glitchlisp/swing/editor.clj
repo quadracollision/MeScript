@@ -1193,6 +1193,32 @@
             (recur (inc end) (conj stages entry))
             (recur (inc idx) stages)))))))
 
+(defn scene-key-token->name [token]
+  (when (and token (.startsWith token ":") (> (count token) 1))
+    (subs token 1)))
+
+(defn by-scene-range-entry [text args-start close]
+  (loop [idx args-start
+         scene-entries []]
+    (let [idx (skip-space-and-comments text idx close)]
+      (if (>= idx close)
+        (when (seq scene-entries)
+          {:by-scene scene-entries
+           :cells []
+           :loop-start 0})
+        (let [scene-range (token-range text idx close)
+              scene-token (when scene-range (subs text (first scene-range) (second scene-range)))
+              scene-name (scene-key-token->name scene-token)
+              pattern-start (when scene-range (second scene-range))
+              pattern-start (when pattern-start (skip-space-and-comments text pattern-start close))
+              pattern-end (when pattern-start (form-end-offset text pattern-start close))
+              entry (when (and scene-name pattern-start pattern-end)
+                      (gate-pattern-range-entry text pattern-start pattern-end))]
+          (if (and scene-name pattern-end entry)
+            (recur (inc pattern-end)
+                   (conj scene-entries (assoc entry :scene scene-name)))
+            (recur (inc idx) scene-entries)))))))
+
 (defn gate-pattern-range-entry [text idx limit]
   (let [idx (skip-space-and-comments text idx limit)]
     (when (< idx limit)
@@ -1211,6 +1237,7 @@
                 "then" (then-range-entry text args-start close)
                 "times" (when-let [entry (times-range-entry text idx args-start close)]
                           (assoc entry :head "times"))
+                "by-scene" (by-scene-range-entry text args-start close)
                 nil)))
 
           :else nil)))))
@@ -1549,6 +1576,15 @@
                             (bounded-cache-assoc cache cache-key ranges live-resolved-step-ranges-limit))
         ranges))))
 
+(defn entry-for-live-scene [entry scene]
+  (if-let [scene-entries (:by-scene entry)]
+    (or (some #(when (= (:scene %) scene) %) scene-entries)
+        (first scene-entries))
+    entry))
+
+(defn entries-for-live-scene [entries scene]
+  (vec (keep #(entry-for-live-scene % scene) entries)))
+
 (defn clear-live-gate-range-cache! [^JTextComponent editor]
   (.putClientProperty editor live-gate-ranges-text-key nil)
   (.putClientProperty editor live-gate-ranges-key nil)
@@ -1583,7 +1619,8 @@
                       [start (inc end)])
         scene-segments (cached-live-scene-range-segments editor text scene scene-range)
         active-entries (cached-active-gate-entries editor text scene scene-context)
-        ranges (cached-live-step-ranges editor scene nil step active-entries)
+        live-entries (entries-for-live-scene active-entries scene)
+        ranges (cached-live-step-ranges editor scene nil step live-entries)
         scene-ranges-to-repaint (when (not= old-scene-range scene-range)
                                   (concat (when old-scene-range [old-scene-range])
                                           (when scene-range [scene-range])))
@@ -1947,9 +1984,9 @@
 
 (defn line-number-text [^JTextComponent editor]
   (let [line-count (text-line-count (.getText editor))
-        width (count (str line-count))]
+        width (max 4 (count (str line-count)))]
     (->> (range 1 (inc line-count))
-         (map #(format (str "%" width "d ") %))
+         (map #(format (str "%-" width "d ") %))
          (clojure.string/join "\n"))))
 
 (defn refresh-line-numbers! [^JTextComponent editor ^JTextComponent line-numbers]
@@ -1961,9 +1998,9 @@
     (.setFocusable line-numbers false)
     (.setFont line-numbers (.getFont editor))
     (.setOpaque line-numbers true)
-    (.setBackground line-numbers (Color. 242 242 242))
-    (.setForeground line-numbers (Color. 105 105 105))
-    (.setBorder line-numbers (BorderFactory/createEmptyBorder 0 4 0 6))
+    (.setBackground line-numbers (Color. 224 224 224))
+    (.setForeground line-numbers (Color. 82 82 82))
+    (.setBorder line-numbers (BorderFactory/createEmptyBorder 0 3 0 8))
     (refresh-line-numbers! editor line-numbers)
     (.addDocumentListener
       (.getDocument editor)

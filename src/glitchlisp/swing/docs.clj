@@ -74,6 +74,7 @@
   [["(bpm N)" "Set tempo from 20 to 320 BPM." "(bpm 120)"]
    ["(d :id ...)" "Define a playable pattern." "(d :lead :src :sine-synth :note c3 :gate 1)\n(start!)"]
    ["(sample :id SOURCE ...)" "Define a sample track from a wav file or inline data." "(sample :hit :sample-data [0 1 0 -1] :gate (p [1 0 0 0]))\n(start!)"]
+   ["(include \"file.gl\")" "Load another .gl file before compiling; relative paths resolve from the including file." "(include \"examples/include-parts/drums.gl\")\n(scene :intro :loop true kick hat)\n(play-scene :intro)"]
    ["(scene :name ...)" "Define a scene." "(scene :intro :loop true (d :lead :src :sine-synth :gate 1))\n(play-scene :intro)"]
    ["(play-scene :name)" "Start a scene." "(scene :intro :loop true (d :lead :src :sine-synth :gate 1))\n(play-scene :intro)"]
    ["(start!)" "Start top-level tracks." "(d :lead :src :sine-synth :note c3 :gate 1)\n(start!)"]
@@ -287,11 +288,35 @@
     (contains? post-effect-labels label) (str "(d :lead :src :sine-synth :note c3 :gate 1)\n(post-fx [" form "])\n(start!)")
     :else (str ":fx [" form "]")))
 
+(defn keyword-contract? [contract]
+  (and contract
+       (str/includes? contract "type: keyword")
+       (str/includes? contract "range:")))
+
+(defn keyword-contract-summary [[param contract]]
+  (let [choices (some-> contract
+                        (str/split #"range:")
+                        second
+                        str/trim
+                        (str/replace "|" ", "))]
+    (when-not (str/blank? choices)
+      (str param " " choices))))
+
+(defn effect-keyword-summary [label]
+  (let [summaries (->> (get catalog/effect-type-contracts label)
+                       (filter (fn [[_ contract]] (keyword-contract? contract)))
+                       (map keyword-contract-summary)
+                       (remove str/blank?))]
+    (when (seq summaries)
+      (str " Keywords: " (str/join "; " summaries) "."))))
+
 (defn effect-rows []
   (->> catalog/effect-options
        (remove #(= "FX Vector" (:label %)))
        (map (fn [{:keys [label form]}]
-              [label (str "Apply " label ".") (effect-reference-example {:label label :form form})]))))
+              [label
+               (str "Apply " label "." (or (effect-keyword-summary label) ""))
+               (effect-reference-example {:label label :form form})]))))
 
 (defn scale-rows []
   (map #(vector % "Scale name." (str ":note (p (scale c3 " % " 8))")) scale-kinds))

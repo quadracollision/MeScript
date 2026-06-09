@@ -31,12 +31,48 @@
 (defn write-file! [^File file text]
   (spit (.getPath file) text))
 
+(declare current-file-or-session!)
+
+(defn include-path-from-line [line]
+  (when-let [[_ path] (re-matches #"\s*\(include\s+\"([^\"]+)\"\)\s*" line)]
+    path))
+
+(defn canonical-file [^File file]
+  (try
+    (.getCanonicalFile file)
+    (catch Exception _
+      (.getAbsoluteFile file))))
+
+(defn expand-source-includes
+  ([source source-file]
+   (expand-source-includes source source-file #{}))
+  ([source source-file seen]
+   (let [base (or (some-> ^File source-file .getParentFile)
+                  (File. "."))]
+     (apply str
+            (mapcat
+              (fn [line]
+                (if-let [include-path (include-path-from-line line)]
+                  (let [file (File. include-path)
+                        file (if (.isAbsolute file) file (File. base include-path))
+                        canonical (canonical-file file)]
+                    (when (contains? seen canonical)
+                      (throw (ex-info (str "include cycle detected at " (.getPath file))
+                                      {:file file})))
+                    (let [included (slurp (.getPath file))]
+                      [(expand-source-includes included file (conj seen canonical))
+                       (when-not (clojure.string/ends-with? included "\n")
+                         "\n")]))
+                  [line "\n"]))
+              (clojure.string/split-lines source))))))
+
 (defn compile-glitchlisp-source [source]
   (if (.exists (File. "src/compiler.clj"))
     (load-file "src/compiler.clj")
     (when-let [compiler-source (resource-slurp "compiler.clj")]
       (load-string compiler-source)))
-  (let [compiler (ns-resolve 'glitchlisp-compiler 'compile-source)]
+  (let [source (expand-source-includes source (current-file-or-session!))
+        compiler (ns-resolve 'glitchlisp-compiler 'compile-source)]
     (if compiler
       (compiler source)
       source)))

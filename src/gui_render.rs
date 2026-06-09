@@ -1,6 +1,6 @@
 use crate::audio;
 use crate::editor::editor_preview_source;
-use crate::language::{compile_source_for_runtime, eval_program};
+use crate::language::{compile_source_for_runtime_with_base, eval_program};
 use crate::model::Runtime;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -52,7 +52,7 @@ pub(crate) fn render_selected_file(
 ) -> Result<audio::RenderStats, String> {
     let source = std::fs::read_to_string(path_to_str(input)?).map_err(|error| error.to_string())?;
     let preview = editor_preview_source(&source);
-    let preview = compile_source_for_runtime(&preview)?;
+    let preview = compile_source_for_runtime_with_base(&preview, Some(input))?;
     let mut runtime = Runtime::new();
     eval_program(&mut runtime, &preview)?;
     audio::render(runtime, seconds, output)

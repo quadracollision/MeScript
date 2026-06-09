@@ -1,7 +1,9 @@
 use crate::audio;
 use crate::editor;
 use crate::gui_render;
-use crate::language::{compile_source_for_runtime, eval_program, load_runtime};
+use crate::language::{
+    compile_source_for_runtime, compile_source_for_runtime_with_base, eval_program, load_runtime,
+};
 use crate::model::Runtime;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::HashSet;
@@ -541,7 +543,8 @@ fn run_with_args_usage(args: &[String], show_usage: bool) -> Result<(), String> 
             let output = &positional[1];
             let source =
                 std::fs::read_to_string(input).map_err(|error| format!("{}: {}", input, error))?;
-            let mut compiled = compile_source_for_runtime(&source)?;
+            let mut compiled =
+                compile_source_for_runtime_with_base(&source, Some(std::path::Path::new(input)))?;
             let mut validation_runtime = Runtime::new();
             eval_program(&mut validation_runtime, &compiled)
                 .map_err(|error| format!("compiled source failed runtime validation: {}", error))?;
@@ -580,7 +583,9 @@ fn run_with_args_usage(args: &[String], show_usage: bool) -> Result<(), String> 
             let source =
                 std::fs::read_to_string(input).map_err(|error| format!("{}: {}", input, error))?;
             let mut runtime = Runtime::new();
-            apply_gui_live_source(&mut runtime, &source)?;
+            let source =
+                compile_source_for_runtime_with_base(&source, Some(std::path::Path::new(input)))?;
+            eval_program(&mut runtime, &source)?;
             println!("{}", gui_live_ok_summary(&runtime));
             Ok(())
         }
