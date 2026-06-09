@@ -3,7 +3,7 @@
             [clojure.string :as str])
   (:import
     [java.awt BorderLayout Color Cursor Dimension Font GraphicsEnvironment]
-    [java.awt.event ActionListener MouseAdapter MouseEvent WindowAdapter]
+    [java.awt.event ActionListener FocusAdapter MouseAdapter MouseEvent WindowAdapter]
     [java.io BufferedReader ByteArrayInputStream ByteArrayOutputStream File InputStreamReader OutputStreamWriter PushbackReader StringReader]
     [javax.sound.sampled AudioFileFormat$Type AudioFormat AudioInputStream AudioSystem Clip]
     [javax.swing.event CaretListener ChangeListener DocumentListener]
@@ -428,6 +428,61 @@
         (refresh-all-tab-headers! tabs)
         true))))
 
+(declare finish-inline-tab-rename!)
+
+(defn start-inline-tab-rename! [^JTabbedPane tabs ^JTextComponent editor]
+  (when-let [scroll (.getClientProperty editor "mescript.scroll")]
+    (let [idx (.indexOfComponent tabs scroll)]
+      (when (>= idx 0)
+        (when-let [header (.getTabComponentAt tabs idx)]
+          (when-let [label (.getClientProperty editor "mescript.tab-label")]
+            (let [current (editor-tab-name editor (inc idx))
+                  field (doto (JTextField. current)
+                          (.setColumns (max 8 (count current)))
+                          (.setBorder (BorderFactory/createEmptyBorder 0 3 0 3)))]
+              (.putClientProperty editor "mescript.tab-rename-field" field)
+              (.remove ^JPanel header ^JLabel label)
+              (.add ^JPanel header field 0)
+              (.revalidate ^JPanel header)
+              (.repaint ^JPanel header)
+              (.selectAll field)
+              (.requestFocusInWindow field)
+              (.addActionListener field
+                                  (proxy [ActionListener] []
+                                    (actionPerformed [_]
+                                      (finish-inline-tab-rename! tabs editor true))))
+              (.registerKeyboardAction field
+                                       (proxy [ActionListener] []
+                                         (actionPerformed [_]
+                                           (finish-inline-tab-rename! tabs editor false)))
+                                       (KeyStroke/getKeyStroke "ESCAPE")
+                                       JComponent/WHEN_FOCUSED)
+              (.addFocusListener field
+                                 (proxy [FocusAdapter] []
+                                   (focusLost [_]
+                                     (finish-inline-tab-rename! tabs editor true))))
+              true)))))))
+
+(defn finish-inline-tab-rename! [^JTabbedPane tabs ^JTextComponent editor commit?]
+  (when-let [field (.getClientProperty editor "mescript.tab-rename-field")]
+    (when-let [scroll (.getClientProperty editor "mescript.scroll")]
+      (let [idx (.indexOfComponent tabs scroll)]
+        (when (>= idx 0)
+          (when-let [header (.getTabComponentAt tabs idx)]
+            (when-let [label (.getClientProperty editor "mescript.tab-label")]
+              (.putClientProperty editor "mescript.tab-rename-field" nil)
+              (when commit?
+                (let [renamed (str/trim (.getText ^JTextField field))]
+                  (when-not (str/blank? renamed)
+                    (set-editor-tab-name! editor renamed))))
+              (.remove ^JPanel header ^JTextField field)
+              (.add ^JPanel header ^JLabel label 0)
+              (refresh-tab-title! tabs editor)
+              (.revalidate ^JPanel header)
+              (.repaint ^JPanel header)
+              (.repaint tabs)
+              true)))))))
+
 (defn install-tab-header! [^JTabbedPane tabs ^JTextComponent editor]
   (when-let [scroll (.getClientProperty editor "mescript.scroll")]
     (let [idx (.indexOfComponent tabs scroll)]
@@ -460,10 +515,7 @@
                                  (select-editor-tab! tabs editor))
                                (mouseClicked [^MouseEvent event]
                                  (when (= 2 (.getClickCount event))
-                                   (rename-tab!
-                                     (.getClientProperty tabs "mescript.frame")
-                                     tabs
-                                     editor)))))
+                                   (start-inline-tab-rename! tabs editor)))))
           (.addMouseListener close-label
                              (proxy [MouseAdapter] []
                                (mouseClicked [^MouseEvent _]
@@ -501,14 +553,7 @@
       (.getSelectedFile chooser))))
 
 (defn rename-tab! [^JFrame frame ^JTabbedPane tabs ^JTextComponent editor]
-  (let [current (editor-tab-name editor 1)
-        value (JOptionPane/showInputDialog frame "Tab name" current)
-        renamed (some-> value str/trim)]
-    (when-not (str/blank? renamed)
-      (set-editor-tab-name! editor renamed)
-      (refresh-tab-title! tabs editor)
-      (.repaint tabs)
-      true)))
+  (start-inline-tab-rename! tabs editor))
 
 (defn save-editor! [^JFrame frame ^JTabbedPane tabs ^JTextComponent editor ^JLabel status]
   (let [file (or (editor-file editor) (choose-file-for-editor frame "Save" editor))]
@@ -660,7 +705,7 @@
     item))
 
 (def about-text
-  "MeScript v0.33\nJune 8, 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
+  "MeScript v0.34\nJune 9, 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
 
 (defn show-about! [^JFrame frame]
   (JOptionPane/showMessageDialog frame about-text "About MeScript" JOptionPane/INFORMATION_MESSAGE))
@@ -714,16 +759,10 @@
   ([scene]
    (insert-scene-template scene true))
   ([scene include-comments?]
-   (str "(scene :" scene " :repeat 1\n"
+   (str "(scene :" scene " :repeat 4\n"
         (when include-comments?
           "  ; :loop true\n  ; :steps 16\n  ; :bars 1\n")
-        "  (d :lead\n"
-        "     :src :sine-synth\n"
-        "     :note c3\n"
-        "     :dur 0.12\n"
-        "     :amp 0.2\n"
-        "     :gate (p [1 0 1 0])))\n\n"
-        "(play-scene :" scene ")\n")))
+        "  )\n")))
 
 (defn effect-form-for-label
   ([label]
@@ -1396,11 +1435,13 @@
         (undo []
           (proxy-super undo)
           (set-editor-text-without-undo-event! editor before)
-          (.setCaretPosition editor 0))
+          (.setCaretPosition editor 0)
+          (refresh-syntax-colors! editor))
         (redo []
           (proxy-super redo)
           (set-editor-text-without-undo-event! editor after)
-          (.setCaretPosition editor 0))))))
+          (.setCaretPosition editor 0)
+          (refresh-syntax-colors! editor))))))
 
 (defn clear-null-parameters! [^JTextComponent editor status]
   (let [before (.getText editor)
@@ -1411,6 +1452,7 @@
         (replace-editor-text-undoably! editor before after "Clear Null Parameters")
         (.setCaretPosition editor 0)
         (.requestFocusInWindow editor)
+        (refresh-syntax-colors! editor)
         (set-status! status "null parameters: cleared")))))
 
 (defn build-ui [initial-file]

@@ -271,8 +271,6 @@ pub(crate) fn compile_source_for_runtime_with_base(
     }
     let mut child = Command::new("clojure")
         .args([
-            "-J-XX:+PerfDisableSharedMem",
-            "-M",
             "-e",
             "(do (load-file \"src/compiler.clj\") (print (glitchlisp-compiler/compile-source (slurp *in*))))",
         ])
@@ -383,6 +381,7 @@ fn eval_form(runtime: &mut Runtime, expr: &Expr) -> Result<(), String> {
                     gate_loop_start: 0,
                     step_every: 1,
                     step_offset: 0,
+                    drunk: 0.0,
                     amp: 0.35,
                     dur_seconds: 0.2,
                     param_patterns: ParamPatterns::default(),
@@ -822,6 +821,7 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
         gate_loop_start: 0,
         step_every: 1,
         step_offset: 0,
+        drunk: 0.0,
         amp: 0.2,
         dur_seconds: 0.12,
         param_patterns: ParamPatterns::default(),
@@ -979,6 +979,7 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
             }
             "every" => track.step_every = positive_usize_value(value, "every")?,
             "offset" => track.step_offset = usize_value(value, "offset")?,
+            "drunk" => track.drunk = drunk_value(value)?,
             "amp" => {
                 set_bounded_f32_param_pattern_or_scalar(
                     value,
@@ -1059,6 +1060,17 @@ fn loop_true_value(expr: &Expr) -> Result<(), String> {
     } else {
         Err("scene :loop only accepts true; use :repeat N for finite scenes".to_string())
     }
+}
+
+fn drunk_value(expr: &Expr) -> Result<f32, String> {
+    let value = number_value(expr)?;
+    if !(0.0..=100.0).contains(&value) {
+        return Err(format!(
+            "drunk must be between 0 and 1, or 0 and 100 percent, got {}",
+            trim_float(value)
+        ));
+    }
+    Ok(if value > 1.0 { value / 100.0 } else { value })
 }
 
 fn numeric_param_pattern(

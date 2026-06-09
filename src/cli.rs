@@ -279,6 +279,7 @@ pub(crate) fn live_status_summary(runtime: &Runtime) -> String {
     runtime.status_summary()
 }
 
+#[cfg(test)]
 pub(crate) fn apply_gui_live_source(
     runtime: &mut Runtime,
     source: &str,
@@ -336,7 +337,11 @@ fn gui_live(device_name: Option<&str>) -> Result<(), String> {
             if event.step == audio::TRANSPORT_STOPPED_STEP {
                 let _ = writeln!(stdout, "STOPPED");
             } else if let Some(scene) = event.scene {
-                let _ = writeln!(stdout, "STEP {} :{}", event.step, scene);
+                if let Some(cycle) = event.cycle {
+                    let _ = writeln!(stdout, "STEP {} :{} cycle={}", event.step, scene, cycle);
+                } else {
+                    let _ = writeln!(stdout, "STEP {} :{}", event.step, scene);
+                }
             } else {
                 let _ = writeln!(stdout, "STEP {}", event.step);
             }
@@ -458,7 +463,7 @@ fn usage() {
 }
 
 pub(crate) fn capabilities() -> &'static str {
-    "glitchlisp-native capabilities null-params empty-gate-silent gui-live live-audio-info check-live-source gate-then-times scene-loop-true scene-loop-by sample-form gui-render-preview drum-note-pitch native-compiler-source native-compile-command"
+    "glitchlisp-native capabilities null-params empty-gate-silent gui-live live-audio-info check-live-source gate-then-times scene-loop-true scene-loop-by sample-form gui-render-preview drum-note-pitch native-compiler-source native-compile-command drunk"
 }
 
 pub(crate) fn run() -> Result<(), String> {
@@ -470,6 +475,7 @@ pub(crate) fn run_with_args(args: &[String]) -> Result<(), String> {
     run_with_args_usage(args, true)
 }
 
+#[cfg(test)]
 pub(crate) fn run_with_args_quiet(args: &[String]) -> Result<(), String> {
     run_with_args_usage(args, false)
 }

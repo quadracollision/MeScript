@@ -1219,28 +1219,66 @@
                    (conj scene-entries (assoc entry :scene scene-name)))
             (recur (inc idx) scene-entries)))))))
 
-(defn gate-pattern-range-entry [text idx limit]
-  (let [idx (skip-space-and-comments text idx limit)]
-    (when (< idx limit)
-      (let [ch (.charAt text idx)]
-        (cond
-          (= ch \[)
-          (when-let [close (matching-close text idx \[ \])]
-            {:cells (top-level-vector-cell-ranges text idx close)
-             :loop-start 0})
+(defn def-value-range-by-name [text name]
+  (let [visible (code-visible-text text)
+        needle "(def"
+        text-length (count text)]
+    (loop [idx 0]
+      (let [start (.indexOf visible needle idx)]
+        (when (>= start 0)
+          (if-let [close (matching-close text start \( \))]
+            (let [name-range (token-range text (+ start (count needle)) close)
+                  def-name (when name-range (subs text (first name-range) (second name-range)))
+                  value-start (when name-range
+                                (skip-space-and-comments text (second name-range) close))]
+              (if (= def-name name)
+                (when (< value-start close)
+                  (when-let [value-end (form-end-offset text value-start close)]
+                    [value-start value-end]))
+                (recur (inc close))))
+            (recur (min text-length (+ start (count needle))))))))))
 
-          (= ch \()
-          (when-let [close (matching-close text idx \( \))]
-            (when-let [{:keys [head args-start]} (list-head-and-args text idx close)]
-              (case head
-                "p" (p-range-entry text args-start close)
-                "then" (then-range-entry text args-start close)
-                "times" (when-let [entry (times-range-entry text idx args-start close)]
-                          (assoc entry :head "times"))
-                "by-scene" (by-scene-range-entry text args-start close)
-                nil)))
+(defn resolvable-pattern-symbol? [token]
+  (and token
+       (not (clojure.string/blank? token))
+       (not (.startsWith token ":"))
+       (not (#{"null" "true" "false"} token))
+       (not (re-matches #"-?\d+(\.\d+)?" token))))
 
-          :else nil)))))
+(defn gate-pattern-range-entry
+  ([text idx limit]
+   (gate-pattern-range-entry text idx limit #{}))
+  ([text idx limit seen-symbols]
+   (let [idx (skip-space-and-comments text idx limit)]
+     (when (< idx limit)
+       (let [ch (.charAt text idx)]
+         (cond
+           (= ch \[)
+           (when-let [close (matching-close text idx \[ \])]
+             {:cells (top-level-vector-cell-ranges text idx close)
+              :loop-start 0})
+
+           (= ch \()
+           (when-let [close (matching-close text idx \( \))]
+             (when-let [{:keys [head args-start]} (list-head-and-args text idx close)]
+               (case head
+                 "p" (p-range-entry text args-start close)
+                 "then" (then-range-entry text args-start close)
+                 "times" (when-let [entry (times-range-entry text idx args-start close)]
+                           (assoc entry :head "times"))
+                 "by-scene" (by-scene-range-entry text args-start close)
+                 nil)))
+
+           :else
+           (when-let [[token-start token-end] (token-range text idx limit)]
+             (let [token (subs text token-start token-end)]
+               (when (and (resolvable-pattern-symbol? token)
+                          (not (contains? seen-symbols token)))
+                 (when-let [[value-start value-end] (def-value-range-by-name text token)]
+                   (gate-pattern-range-entry text
+                                             value-start
+                                             value-end
+                                             (conj seen-symbols token))))))))))))
 
 (defn gate-pattern-vector-ranges [text]
   (let [visible (code-visible-text text)]

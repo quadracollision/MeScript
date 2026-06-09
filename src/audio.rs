@@ -18,6 +18,7 @@ pub(crate) const TRANSPORT_STOPPED_STEP: usize = usize::MAX;
 pub(crate) struct StepEvent {
     pub(crate) step: usize,
     pub(crate) scene: Option<String>,
+    pub(crate) cycle: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -269,6 +270,11 @@ impl AudioEngine {
         Self::with_shared_runtime(runtime, sample_rate, step_samples, revision)
     }
 
+    #[cfg(test)]
+    pub(crate) fn runtime_for_test(&self) -> Runtime {
+        self.runtime.lock().expect("runtime lock poisoned").clone()
+    }
+
     fn with_shared_runtime(
         runtime: Arc<Mutex<Runtime>>,
         sample_rate: f32,
@@ -327,6 +333,7 @@ impl AudioEngine {
                     let _ = sender.send(StepEvent {
                         step: TRANSPORT_STOPPED_STEP,
                         scene: None,
+                        cycle: None,
                     });
                 }
             }
@@ -335,12 +342,17 @@ impl AudioEngine {
 
         let playback_step = playback_step_for_runtime(&runtime, self.step);
         if let Some(sender) = &self.step_sender {
+            let cycle = runtime
+                .scene_state
+                .as_ref()
+                .map(|state| runtime.scene_cycle_summary(state));
             let _ = sender.send(StepEvent {
                 step: playback_step,
                 scene: runtime
                     .scene_state
                     .as_ref()
                     .map(|state| state.current.clone()),
+                cycle,
             });
         }
 
@@ -378,7 +390,7 @@ impl AudioEngine {
                     let hold_seconds = hold as f32 * self.step_samples / self.sample_rate;
                     let param_index = self.next_param_index_for_track(track);
                     for freq in freqs {
-                        self.push_track_voices(
+                        self.trigger_or_delay_track_voice(
                             track,
                             freq,
                             self.step,
@@ -386,6 +398,7 @@ impl AudioEngine {
                             0,
                             param_index,
                             hold_seconds,
+                            self.step_samples,
                         );
                     }
                 } else if matches!(track.note_mode, NoteMode::Tick) {
@@ -409,7 +422,7 @@ impl AudioEngine {
                 let param_index = self.next_param_index_for_track(track);
                 if idx == 0 {
                     for freq in freqs {
-                        self.push_track_voices(
+                        self.trigger_or_delay_track_voice(
                             track,
                             freq,
                             seed_step,
@@ -417,12 +430,20 @@ impl AudioEngine {
                             idx,
                             param_index,
                             hold_seconds,
+                            sub_step_samples,
                         );
                     }
                 } else {
                     for freq in freqs {
                         self.pending_triggers.push(PendingTrigger {
-                            samples_until: sub_step_samples * idx as f32,
+                            samples_until: sub_step_samples * idx as f32
+                                + self.drunk_delay_samples(
+                                    track,
+                                    seed_step,
+                                    track_step,
+                                    idx,
+                                    sub_step_samples,
+                                ),
                             track: track.clone(),
                             freq,
                             seed_step,
@@ -518,6 +539,67 @@ impl AudioEngine {
                 amp,
                 dur_seconds,
             ));
+        }
+    }
+
+    fn drunk_delay_samples(
+        &self,
+        track: &crate::model::Track,
+        seed_step: usize,
+        track_step: usize,
+        sub_index: usize,
+        slot_samples: f32,
+    ) -> f32 {
+        if track.drunk <= 0.0 || slot_samples <= 1.0 {
+            return 0.0;
+        }
+        let mut hash = seed_step as u64;
+        hash ^= (track_step as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        hash ^= (sub_index as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        for byte in track.id.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        hash ^= hash >> 33;
+        let unit = (hash as f64 / u64::MAX as f64) as f32;
+        unit * track.drunk.clamp(0.0, 1.0) * slot_samples
+    }
+
+    fn trigger_or_delay_track_voice(
+        &mut self,
+        track: &crate::model::Track,
+        freq: f32,
+        seed_step: usize,
+        track_step: usize,
+        sub_index: usize,
+        param_index: usize,
+        hold_seconds: f32,
+        slot_samples: f32,
+    ) {
+        let delay = self.drunk_delay_samples(track, seed_step, track_step, sub_index, slot_samples);
+        if delay <= 1.0 {
+            self.push_track_voices(
+                track,
+                freq,
+                seed_step,
+                track_step,
+                sub_index,
+                param_index,
+                hold_seconds,
+            );
+        } else {
+            self.pending_triggers.push(PendingTrigger {
+                samples_until: delay,
+                track: track.clone(),
+                freq,
+                seed_step,
+                track_step,
+                sub_index,
+                param_index,
+                hold_seconds,
+            });
         }
     }
 

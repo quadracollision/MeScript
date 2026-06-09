@@ -66,7 +66,7 @@ fn parses_and_evaluates_track() {
 fn workstation_about_text_shows_current_version_date() {
     let source = fs::read_to_string("src/main.clj").unwrap();
     assert!(
-        source.contains("MeScript v0.33\\nJune 8, 2026"),
+        source.contains("MeScript v0.34\\nJune 9, 2026"),
         "about text should show current version/date"
     );
 }
@@ -172,11 +172,13 @@ fn gui_live_step_event_coalescing_keeps_latest_cursor_position() {
     tx.send(crate::audio::StepEvent {
         step: 1,
         scene: Some("intro".to_string()),
+        cycle: Some("0/4".to_string()),
     })
     .unwrap();
     tx.send(crate::audio::StepEvent {
         step: 2,
         scene: Some("drop".to_string()),
+        cycle: Some("1/loop".to_string()),
     })
     .unwrap();
 
@@ -184,6 +186,7 @@ fn gui_live_step_event_coalescing_keeps_latest_cursor_position() {
         crate::audio::StepEvent {
             step: 0,
             scene: Some("intro".to_string()),
+            cycle: Some("0/4".to_string()),
         },
         &rx,
     );
@@ -192,7 +195,8 @@ fn gui_live_step_event_coalescing_keeps_latest_cursor_position() {
         event,
         crate::audio::StepEvent {
             step: 2,
-            scene: Some("drop".to_string())
+            scene: Some("drop".to_string()),
+            cycle: Some("1/loop".to_string())
         }
     );
     assert!(rx.try_recv().is_err());
@@ -318,7 +322,7 @@ fn gui_live_source_application_accepts_nulls_and_advances_revision() {
         summary
     );
     assert!(
-        summary.contains("scene=:intro") && summary.contains("cycle=1/2"),
+        summary.contains("scene=:intro") && summary.contains("cycle=0/2"),
         "gui-live OK summary should expose active scene and cycle: {}",
         summary
     );
@@ -908,6 +912,86 @@ fn parses_python_oscillator_parameters() {
 }
 
 #[test]
+fn compiler_def_track_parameter_splices_evaluate_like_inline_args() {
+    let source = "(def params
+                    :lead
+                    :src :additive
+                    :note c4
+                    :dur 0.25
+                    :amp 0.31
+                    :gain 1.2
+                    :gate (p [1 0 0 1]))
+                  (d params)
+                  (start!)";
+    let compiled = compile_source_for_runtime(source).unwrap();
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &compiled).unwrap();
+
+    let track = &runtime.tracks["lead"];
+    assert!(matches!(track.waveform, crate::model::Waveform::Additive));
+    assert_eq!(track.notes.len(), 1);
+    assert!(track.notes[0] > 0.0, "expected parsed note frequency");
+    assert_eq!(track.gates, vec![true, false, false, true]);
+    assert_eq!(track.dur_seconds, 0.25);
+    assert_eq!(track.amp, 0.31);
+    assert_eq!(track.oscillator.gain, 1.2);
+    assert!(runtime.running);
+}
+
+#[test]
+fn compiler_def_track_option_splices_allow_inline_track_id_and_gate_defs() {
+    let source = "(def gate-pattern (p [1 0 1 0]))
+                  (def params
+                    :src :pulse
+                    :pw 0.25
+                    :note (p [c3 d3])
+                    :gate gate-pattern)
+                  (d :bass params :amp 0.4)
+                  (start!)";
+    let compiled = compile_source_for_runtime(source).unwrap();
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &compiled).unwrap();
+
+    let track = &runtime.tracks["bass"];
+    assert!(matches!(track.waveform, crate::model::Waveform::Pulse));
+    assert_eq!(track.gates, vec![true, false, true, false]);
+    assert_eq!(track.notes.len(), 2);
+    assert!(track.notes[0] < track.notes[1]);
+    assert_eq!(track.oscillator.pulse_width, 0.25);
+    assert_eq!(track.amp, 0.4);
+}
+
+#[test]
+fn compiler_def_track_parameter_splices_still_reject_duplicates() {
+    let source = "(def params
+                    :src :sine-synth
+                    :gate (p [1 0]))
+                  (d :lead params :gate (p [0 1]))
+                  (start!)";
+    let compiled = compile_source_for_runtime(source).unwrap();
+    let mut runtime = Runtime::new();
+    let err = eval_program(&mut runtime, &compiled).unwrap_err();
+    assert!(err.contains("duplicate track parameter ':gate'"), "{}", err);
+}
+
+#[test]
+fn compiler_def_track_parameter_splices_still_reject_malformed_pairs() {
+    let source = "(def params
+                    :src :sine-synth
+                    :gate)
+                  (d :lead params)
+                  (start!)";
+    let compiled = compile_source_for_runtime(source).unwrap();
+    let mut runtime = Runtime::new();
+    let err = eval_program(&mut runtime, &compiled).unwrap_err();
+    assert!(
+        err.contains("track parameter ':gate' requires a value"),
+        "{}",
+        err
+    );
+}
+
+#[test]
 fn harmonics_reject_out_of_range_values_instead_of_clamping() {
     let mut runtime = Runtime::new();
     let err = eval_program(
@@ -1124,6 +1208,74 @@ fn offset_rejects_negative_and_fractional_values() {
         err.contains("offset must be a non-negative integer"),
         "{}",
         err
+    );
+}
+
+#[test]
+fn drunk_accepts_normalized_and_percent_values() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(d :loose :src :click :gate 1 :drunk 0.25)
+         (d :percent :src :click :gate 1 :drunk 25)",
+    )
+    .unwrap();
+
+    assert_eq!(runtime.tracks["loose"].drunk, 0.25);
+    assert_eq!(runtime.tracks["percent"].drunk, 0.25);
+}
+
+#[test]
+fn drunk_rejects_out_of_range_values() {
+    let mut runtime = Runtime::new();
+    let err = eval_program(
+        &mut runtime,
+        "(d :loose :src :click :gate 1 :drunk -0.1)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("drunk must be between 0 and 1, or 0 and 100 percent"),
+        "{}",
+        err
+    );
+
+    let mut runtime = Runtime::new();
+    let err = eval_program(
+        &mut runtime,
+        "(d :loose :src :click :gate 1 :drunk 101)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("drunk must be between 0 and 1, or 0 and 100 percent"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn drunk_delays_gate_hits_without_changing_step_events() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(bpm 120)
+         (d :tight :src :click :gate 1 :amp 0.5 :dur 0.02)
+         (d :loose :src :click :gate 1 :amp 0.5 :dur 0.02 :drunk 1)
+         (start!)",
+    )
+    .unwrap();
+    let mut engine = AudioEngine::new(runtime, 48_000.0);
+    engine.next_frame();
+
+    assert!(
+        engine.active_voice_count_for_test() < 2,
+        "drunk track should not fire immediately with the tight track"
+    );
+    for _ in 0..6_000 {
+        engine.next_frame();
+    }
+    assert!(
+        engine.active_voice_count_for_test() > 0,
+        "drunk delayed hit should eventually fire within the step"
     );
 }
 
@@ -6682,6 +6834,7 @@ fn native_capabilities_cover_current_gui_language_features() {
         "drum-note-pitch",
         "native-compiler-source",
         "native-compile-command",
+        "drunk",
     ] {
         assert!(capabilities.contains(required), "missing {}", required);
     }
@@ -7074,8 +7227,8 @@ fn native_live_status_summary_names_active_scene() {
         status
     );
     assert!(
-        status.contains("cycle=1/loop"),
-        "live status should show current scene cycle: {}",
+        status.contains("cycle=0/loop"),
+        "live status should show completed scene cycles: {}",
         status
     );
 
@@ -7123,8 +7276,8 @@ fn native_interactive_success_summary_names_active_scene() {
         success
     );
     assert!(
-        success.contains("cycle=1/loop"),
-        "interactive success should show active scene cycle: {}",
+        success.contains("cycle=0/loop"),
+        "interactive success should show completed scene cycles: {}",
         success
     );
 }
@@ -7153,8 +7306,8 @@ fn native_editor_run_message_names_active_scene() {
         message
     );
     assert!(
-        message.contains("cycle=1/4"),
-        "editor run message should show counted scene cycle: {}",
+        message.contains("cycle=0/4"),
+        "editor run message should show completed scene cycles: {}",
         message
     );
 
@@ -7182,9 +7335,39 @@ fn native_editor_run_message_names_active_scene() {
             && cued.contains("running=true")
             && cued.contains("tracks=1")
             && cued.contains("scene=:intro")
-            && cued.contains("cycle=1/4"),
+            && cued.contains("cycle=0/4"),
         "editor cue message should include scene runtime status: {}",
         cued
+    );
+}
+
+#[test]
+fn native_scene_cycle_status_counts_completed_scene_loops() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(bpm 120)
+         (scene :intro :steps 1 :repeat 3
+           (d :a :src :sine-synth :note c3 :gate 1 :dur 0.01 :amp 0.2))
+         (play-scene :intro)",
+    )
+    .unwrap();
+    assert!(
+        cli::live_status_summary(&runtime).contains("cycle=0/3"),
+        "newly cued scene should show zero completed loops"
+    );
+
+    let mut engine = AudioEngine::new(runtime, 48_000.0);
+    engine.next_frame();
+    for _ in 0..5_999 {
+        engine.next_frame();
+    }
+
+    let status = cli::live_status_summary(&engine.runtime_for_test());
+    assert!(
+        status.contains("cycle=1/3"),
+        "status should advance after one completed scene loop: {}",
+        status
     );
 }
 
@@ -7304,7 +7487,7 @@ fn native_cli_usage_and_readme_list_supported_commands() {
         readme.contains("Native `live` status")
             && readme.contains("terminal editor run messages")
             && readme.contains("scene=:name")
-            && readme.contains("cycle=1/4"),
+            && readme.contains("cycle=0/4"),
         "README should explain native scene-aware status feedback"
     );
 }
@@ -8628,6 +8811,7 @@ fn swing_live_step_lines_parse_without_regex_path() {
       (load-file "src/glitchlisp/swing/live.clj")
       (doseq [line ["STEP 32"
                     "STEP 32 :drop"
+                    "STEP 33 :drop cycle=2/100"
                     "STEP   7   :intro"
                     "STEP "
                     "STEP x"
@@ -8655,9 +8839,10 @@ fn swing_live_step_lines_parse_without_regex_path() {
     assert_eq!(
         parsed,
         vec![
-            "[32 nil]",
-            "[32 \"drop\"]",
-            "[7 \"intro\"]",
+            "[32 nil nil]",
+            "[32 \"drop\" nil]",
+            "[33 \"drop\" \"2/100\"]",
+            "[7 \"intro\" nil]",
             "nil",
             "nil",
             "nil",
@@ -8721,10 +8906,10 @@ fn swing_live_reader_step_state_matches_handler() {
              :live-ready true
              :live-highlight-scene "intro"
              :live-cycle "1/4")
-      (glitchlisp.swing.live/update-live-step-state! 48 "drop")
+      (glitchlisp.swing.live/update-live-step-state! 48 "drop" "2/4")
       (println (:live-highlight-step @glitchlisp.swing.shared/state))
       (println (:live-highlight-scene @glitchlisp.swing.shared/state))
-      (println (nil? (:live-cycle @glitchlisp.swing.shared/state)))
+      (println (:live-cycle @glitchlisp.swing.shared/state))
     "#;
     let output = Command::new("clojure")
         .arg("-J-Djava.awt.headless=true")
@@ -8742,7 +8927,7 @@ fn swing_live_reader_step_state_matches_handler() {
     assert!(
         stdout.lines().any(|line| line == "48")
             && stdout.lines().any(|line| line == "drop")
-            && stdout.lines().any(|line| line == "true"),
+            && stdout.lines().any(|line| line == "2/4"),
         "reader STEP state update should match handler behavior: {}",
         stdout
     );
@@ -9264,6 +9449,63 @@ fn syntax_refresh_forces_editor_repaint() {
 }
 
 #[test]
+fn clear_null_parameters_refreshes_syntax_highlighting() {
+    let script = r#"
+      (load-file "src/main.clj")
+      (let [repaints (atom 0)
+            revalidates (atom 0)
+            status (javax.swing.JLabel.)
+            pane (proxy [javax.swing.JTextPane] []
+                   (repaint
+                     ([]
+                      (swap! repaints inc)
+                      (proxy-super repaint))
+                     ([x y w h]
+                      (proxy-super repaint x y w h)))
+                   (revalidate []
+                     (swap! revalidates inc)
+                     (proxy-super revalidate)))]
+        (glitchlisp-swing/install-standard-edit-controls! pane)
+        (.setText pane "(d :lead\n   :src :sine-synth\n   :note null\n   :gate 1)")
+        (reset! repaints 0)
+        (reset! revalidates 0)
+        (glitchlisp-swing/clear-null-parameters! pane status)
+        (println (not (clojure.string/includes? (.getText pane) ":note null")))
+        (println (pos? @repaints))
+        (println (pos? @revalidates))
+        (println (.getText status)))
+    "#;
+    let output = {
+        let mut command = Command::new("clojure");
+        command
+            .env("GLITCHLISP_NO_GUI", "1")
+            .env("JAVA_TOOL_OPTIONS", "-Djava.awt.headless=true")
+            .arg("-e")
+            .arg(script);
+        command
+            .output()
+            .expect("run clear null syntax refresh smoke")
+    };
+    assert!(
+        output.status.success(),
+        "clear null syntax refresh smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter(|line| *line == "true" || *line == "false" || *line == "null parameters: cleared")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec!["true", "true", "true", "null parameters: cleared"],
+        "clear-null should rewrite text and force syntax repaint: {}",
+        stdout
+    );
+}
+
+#[test]
 fn live_step_highlight_caches_step_rects_until_range_or_document_changes() {
     let script = r#"
       (load-file "src/glitchlisp/swing/shared.clj")
@@ -9397,6 +9639,54 @@ fn live_step_highlight_uses_active_by_scene_branch_for_def_tracks() {
         results,
         vec!["true", "true", "true"],
         "live highlight should use active by-scene branch for def tracks: {}",
+        stdout
+    );
+}
+
+#[test]
+fn live_step_highlight_resolves_def_gate_patterns() {
+    let script = r#"
+      (load-file "src/glitchlisp/swing/shared.clj")
+      (load-file "src/glitchlisp/swing/editor.clj")
+      (let [pane (javax.swing.JTextPane.)
+            source "(def hello (p [1 0 1 0]))\n\n(def twen\n  (d\n    :additive\n    :src :additive\n    :note null\n    :dur null\n    :amp null\n    :gate hello))\n\n(scene :intro :repeat 4\n  twen)\n"
+            highlighted (fn []
+                          (->> (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-key)
+                               (map (fn [[start end]] (subs source start end)))
+                               vec))]
+        (.setText pane source)
+        (glitchlisp.swing.editor/install-live-gate-range-cache! pane)
+        (glitchlisp.swing.editor/highlight-live-step! pane 0 "intro")
+        (println (pr-str (highlighted)))
+        (glitchlisp.swing.editor/highlight-live-step! pane 1 "intro")
+        (println (pr-str (highlighted)))
+        (glitchlisp.swing.editor/highlight-live-step! pane 2 "intro")
+        (println (pr-str (highlighted))))
+    "#;
+    let output = {
+        let mut command = Command::new("clojure");
+        command
+            .env("GLITCHLISP_NO_GUI", "1")
+            .env("JAVA_TOOL_OPTIONS", "-Djava.awt.headless=true")
+            .arg("-e")
+            .arg(script);
+        command.output().expect("run def gate live highlight smoke")
+    };
+    assert!(
+        output.status.success(),
+        "def gate live highlight smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let highlighted = stdout
+        .lines()
+        .filter(|line| line.starts_with("["))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        highlighted,
+        vec!["[\"1\"]", "[\"0\"]", "[\"1\"]"],
+        "live highlight should follow :gate def symbols back to the def pattern: {}",
         stdout
     );
 }
@@ -10390,6 +10680,7 @@ fn language_reference_keeps_aliases_out_of_primary_sections() {
         (println (contains? track-param-names ":sample-path"))
         (println (not (contains? track-param-names ":sample")))
         (println (contains? aliases ":sample"))
+        (println (contains? track-param-names ":drunk"))
         (println (contains? pattern-names "(gate-seq [...])"))
         (println (contains? pattern-names "(g [...])"))
         (println (contains? pattern-names "(s [...])"))
@@ -10551,10 +10842,23 @@ fn scene_insert_template_honors_remove_comments_preference() {
         stdout
     );
     assert!(
+        with_comments.contains("(scene :intro :repeat 4")
+            && with_comments.contains("  )")
+            && !with_comments.contains("(d :lead")
+            && !with_comments.contains("(play-scene :intro)"),
+        "default scene template should insert an empty repeat-4 scene: {}",
+        stdout
+    );
+    assert!(
         !without_comments.contains("; :loop true")
             && !without_comments.contains("; :steps 16")
             && !without_comments.contains("; :bars 1"),
         "remove-comments scene template should omit comments: {}",
+        stdout
+    );
+    assert!(
+        without_comments.contains("(scene :intro :repeat 4\n  )"),
+        "remove-comments scene template should keep the empty scene body: {}",
         stdout
     );
     assert!(
@@ -11468,6 +11772,55 @@ fn editor_tab_rename_sets_save_suggestion() {
 }
 
 #[test]
+fn editor_tab_rename_uses_inline_header_field() {
+    let script = r#"
+      (load-file "src/main.clj")
+      (let [tabs (javax.swing.JTabbedPane.)
+            status (javax.swing.JLabel. "stale")
+            editor (glitchlisp-swing/add-editor-tab! tabs status "(bpm 118)" nil)]
+        (glitchlisp-swing/start-inline-tab-rename! tabs editor)
+        (let [field (.getClientProperty editor "mescript.tab-rename-field")
+              header (.getTabComponentAt tabs 0)]
+          (println (instance? javax.swing.JTextField field))
+          (println (some #(identical? field %) (.getComponents header)))
+          (.setText field "drums")
+          (.postActionEvent field)
+          (println (= "drums" (glitchlisp-swing/editor-tab-name editor 1)))
+          (println (= "drums" (.getText (.getClientProperty editor "mescript.tab-label"))))
+          (println (= "drums.gl" (.getName (glitchlisp-swing/suggested-save-file editor))))
+          (println (nil? (.getClientProperty editor "mescript.tab-rename-field"))))
+        (flush)
+        (System/exit 0))
+    "#;
+    let output = {
+        let mut command = Command::new("clojure");
+        command
+            .env("GLITCHLISP_NO_GUI", "1")
+            .env("JAVA_TOOL_OPTIONS", "-Djava.awt.headless=true")
+            .arg("-e")
+            .arg(script);
+        command.output().expect("run inline tab rename smoke")
+    };
+    assert!(
+        output.status.success(),
+        "inline tab rename smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter(|line| *line == "true" || *line == "false")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec!["true", "true", "true", "true", "true", "true"],
+        "inline rename should edit the tab header and update save suggestion: {}",
+        stdout
+    );
+}
+
+#[test]
 fn custom_tab_header_selection_selects_clicked_tab() {
     let script = r#"
       (load-file "src/main.clj")
@@ -11600,7 +11953,6 @@ fn run_sh_raw_clojure_fallback_reports_headless_display_error() {
 
     let output = Command::new("bash")
         .arg(&script)
-        .env("JAVA_TOOL_OPTIONS", "-Djava.awt.headless=true")
         .output()
         .expect("run copied run.sh in headless mode");
     let _ = fs::remove_dir_all(&dir);

@@ -56,14 +56,36 @@
 (defn complete-live-update! []
   (swap! shared/state assoc :live-awaiting-update false))
 
-(defn update-live-step-state! [step scene]
-  (swap! shared/state
-         (fn [current]
-           (cond-> (assoc current
-                          :live-highlight-step step
-                          :live-highlight-scene scene)
-             (not= scene (:live-highlight-scene current))
-             (assoc :live-cycle nil)))))
+(defn live-summary-with-step [summary scene cycle]
+  (when summary
+    (cond-> summary
+      scene
+      (str/replace #"scene=[^\s]+" (str "scene=:" scene))
+
+      cycle
+      (str/replace #"cycle=[^\s]+" (str "cycle=" cycle)))))
+
+(defn live-step-status-text []
+  (when-let [summary (:live-status-summary @shared/state)]
+    (str "live " summary)))
+
+(defn update-live-step-state!
+  ([step scene]
+   (update-live-step-state! step scene nil))
+  ([step scene cycle]
+   (swap! shared/state
+          (fn [current]
+            (cond-> (assoc current
+                           :live-highlight-step step
+                           :live-highlight-scene scene)
+              cycle
+              (assoc :live-cycle cycle)
+
+              (or scene cycle)
+              (update :live-status-summary live-summary-with-step scene cycle)
+
+              (and (nil? cycle) (not= scene (:live-highlight-scene current)))
+              (assoc :live-cycle nil))))))
 
 (defn queue-playback-highlight! [^JTextComponent editor-pane received-ns]
   (if (:remove-playback-highlighting @shared/state)
@@ -88,7 +110,7 @@
             (try
               (let [step (Long/parseLong (subs line step-start step-end))]
                 (if (= step-end length)
-                  [step nil]
+                  [step nil nil]
                   (let [scene-start (loop [idx step-end]
                                       (if (and (< idx length)
                                                (Character/isWhitespace ^char (.charAt line idx)))
@@ -96,10 +118,23 @@
                                         idx))]
                     (when (and (< scene-start length)
                                (= (.charAt line scene-start) \:)
-                               (< (inc scene-start) length)
-                               (not-any? #(Character/isWhitespace ^char %)
-                                         (subs line (inc scene-start))))
-                      [step (subs line (inc scene-start))]))))
+                               (< (inc scene-start) length))
+                      (let [scene-end (loop [idx (inc scene-start)]
+                                        (if (and (< idx length)
+                                                 (not (Character/isWhitespace ^char (.charAt line idx))))
+                                          (recur (inc idx))
+                                          idx))
+                            scene (subs line (inc scene-start) scene-end)
+                            rest-start (loop [idx scene-end]
+                                         (if (and (< idx length)
+                                                  (Character/isWhitespace ^char (.charAt line idx)))
+                                           (recur (inc idx))
+                                           idx))]
+                        (cond
+                          (str/blank? scene) nil
+                          (= rest-start length) [step scene nil]
+                          :else (when-let [[_ cycle] (re-matches #"cycle=([^\s]+)" (subs line rest-start))]
+                                  [step scene cycle])))))))
               (catch Exception _ nil))))))))
 
 (defn expire-live-update! [^JLabel status token]
@@ -128,12 +163,14 @@
 (defn handle-live-line! [^JTextComponent editor-pane ^JLabel status line]
   (cond
     (str/starts-with? line "STEP ")
-    (when-let [[step scene] (parse-step-line line)]
+    (when-let [[step scene cycle] (parse-step-line line)]
       (let [received-ns (System/nanoTime)]
-      (update-live-step-state! step scene)
+      (update-live-step-state! step scene cycle)
       (when (:live-awaiting-update @shared/state)
         (complete-live-update!)
         (shared/set-status! status "live running"))
+      (when-let [text (live-step-status-text)]
+        (shared/set-status! status text))
         (queue-playback-highlight! editor-pane received-ns)))
 
     (str/starts-with? line "AUDIO ")
@@ -164,11 +201,13 @@
       (let [[_ tracks scenes] (re-find #"tracks=([0-9]+).*scenes=([0-9]+)" line)
             [_ scene] (re-find #"scene=([^\s]+)" line)
             [_ cycle] (re-find #"cycle=([^\s]+)" line)
+            summary (subs line 3)
             scene (when (and scene (not= scene "-"))
                     (if (str/starts-with? scene ":") (subs scene 1) scene))
             cycle (when (and cycle (not= cycle "-")) cycle)]
         (swap! shared/state assoc
                :live-last-error nil
+               :live-status-summary summary
                :live-tracks (when tracks (Long/parseLong tracks))
                :live-scenes (when scenes (Long/parseLong scenes))
                :live-highlight-scene scene
@@ -198,12 +237,14 @@
       (with-open [reader (BufferedReader. (InputStreamReader. (.getInputStream process)))]
         (doseq [line (line-seq reader)]
           (if (str/starts-with? line "STEP ")
-            (when-let [[step scene] (parse-step-line line)]
+            (when-let [[step scene cycle] (parse-step-line line)]
               (let [received-ns (System/nanoTime)]
-              (update-live-step-state! step scene)
+              (update-live-step-state! step scene cycle)
               (when (:live-awaiting-update @shared/state)
                 (complete-live-update!)
                 (SwingUtilities/invokeLater #(shared/set-status! status "live running")))
+              (when-let [text (live-step-status-text)]
+                (SwingUtilities/invokeLater #(shared/set-status! status text)))
                 (queue-playback-highlight! editor-pane received-ns)))
             (SwingUtilities/invokeLater #(handle-live-line! editor-pane status line)))))
       (catch Exception ex

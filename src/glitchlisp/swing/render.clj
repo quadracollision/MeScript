@@ -155,7 +155,7 @@
 (def expected-renderer-capabilities
   #{"null-params" "empty-gate-silent" "gui-live" "live-audio-info" "check-live-source"
     "gate-then-times" "scene-loop-true" "scene-loop-by" "sample-form" "gui-render-preview" "drum-note-pitch"
-    "native-compiler-source" "native-compile-command"})
+    "native-compiler-source" "native-compile-command" "drunk"})
 
 (defn parse-renderer-capabilities [output]
   (->> (clojure.string/split output #"\s+")
@@ -970,7 +970,7 @@
     :morph :morph-pos :morph_pos :gain :unison :unison-detune :unison_detune
     :unison-spread :unison_spread :spread :fm-ratio :fm_ratio :fm-depth :fm_depth
     :harmonics :sample :sample-path :sample_path :sample-data :sample_data
-    :every :offset :amp :dur :fx})
+    :every :offset :drunk :amp :dur :fx})
 
 (defn track-param-canonical-key [key]
   (case key
@@ -1023,6 +1023,8 @@
           (validate-bounded-integer-track-param! (second remaining) 1 10 key "unison"))
         (when (= :offset key)
           (validate-non-negative-integer-param! (second remaining) key "offset"))
+        (when (= :drunk key)
+          (validate-bounded-track-param! (second remaining) 0.0 100.0 key "drunk"))
         (when (contains? #{:unison-detune :unison_detune} key)
           (validate-bounded-track-param! (second remaining) 0.0 100.0 key "unison-detune"))
         (when (contains? #{:unison-spread :unison_spread :spread} key)

@@ -14,6 +14,7 @@
          :live-ready false
          :live-last-error nil
          :live-audio-info nil
+         :live-status-summary nil
          :live-tracks nil
          :live-scenes nil
          :live-awaiting-update false

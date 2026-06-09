@@ -93,6 +93,7 @@ pub(crate) struct Track {
     pub(crate) gate_loop_start: usize,
     pub(crate) step_every: usize,
     pub(crate) step_offset: usize,
+    pub(crate) drunk: f32,
     pub(crate) amp: f32,
     pub(crate) dur_seconds: f32,
     pub(crate) param_patterns: ParamPatterns,
@@ -198,17 +199,7 @@ impl Runtime {
                 .as_ref()
                 .map(|state| {
                     let scene = format!(":{}", state.current);
-                    let cycle = self
-                        .scenes
-                        .get(&state.current)
-                        .map(|scene| {
-                            if scene.repeats == 0 {
-                                format!("{}/loop", state.cycle + 1)
-                            } else {
-                                format!("{}/{}", state.cycle + 1, scene.repeats)
-                            }
-                        })
-                        .unwrap_or_else(|| (state.cycle + 1).to_string());
+                    let cycle = self.scene_cycle_summary(state);
                     (scene, cycle)
                 })
                 .unwrap_or_else(|| ("-".to_string(), "-".to_string()))
@@ -225,5 +216,18 @@ impl Runtime {
             scene,
             cycle
         )
+    }
+
+    pub(crate) fn scene_cycle_summary(&self, state: &SceneState) -> String {
+        self.scenes
+            .get(&state.current)
+            .map(|scene| {
+                if scene.repeats == 0 {
+                    format!("{}/loop", state.cycle)
+                } else {
+                    format!("{}/{}", state.cycle, scene.repeats)
+                }
+            })
+            .unwrap_or_else(|| state.cycle.to_string())
     }
 }

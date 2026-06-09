@@ -182,6 +182,7 @@
    [":fx" "Track effect chain." ":fx [(delay :time 0.125)]"]
    [":every" "Play every positive N local steps." ":every 2"]
    [":offset" "Offset track step index." ":offset 1"]
+   [":drunk" "Randomly delay each gate by up to this amount of the step; accepts 0..1 or 0..100 percent." ":drunk 0.2"]
    [":detune-cents" "Detune in cents." ":detune-cents 7"]
    [":phase" "Oscillator phase." ":phase 0.25"]
    [":pulse-width" "Pulse width from 0.01 to 0.99." ":pulse-width 0.4"]
