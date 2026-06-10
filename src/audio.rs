@@ -1,7 +1,9 @@
 use crate::effects::EffectChain;
 use crate::effects::filters::{Biquad, FilterKind};
 use crate::effects::offline;
-use crate::model::{NoteMode, OscillatorParams, Runtime, TrackEffect, Waveform};
+use crate::model::{
+    EffectParamPatternMode, NoteMode, OscillatorParams, Runtime, TrackEffect, Waveform,
+};
 use crate::sequencer;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::HashMap;
@@ -80,6 +82,7 @@ impl Voice {
             step,
             track_step,
             sub_index,
+            param_index,
             hold_seconds,
             sample_rate,
             params,
@@ -95,6 +98,7 @@ impl Voice {
         step: usize,
         track_step: usize,
         sub_index: usize,
+        param_index: usize,
         hold_seconds: f32,
         sample_rate: f32,
         params: OscillatorParams,
@@ -112,7 +116,7 @@ impl Voice {
             Vec::new()
         };
         let phase = params.phase;
-        let effects = active_effect_specs(&track.effects, track_step, sub_index);
+        let effects = active_effect_specs(&track.effects, track_step, sub_index, param_index);
         let dur = (dur_seconds + hold_seconds.max(0.0)).max(0.005);
         Self {
             waveform: track.waveform,
@@ -141,6 +145,7 @@ pub(crate) fn active_effect_specs(
     effects: &[TrackEffect],
     track_step: usize,
     sub_index: usize,
+    param_index: usize,
 ) -> Vec<crate::effects::EffectSpec> {
     effects
         .iter()
@@ -154,8 +159,596 @@ pub(crate) fn active_effect_specs(
             }
             step_gates[sub_index % step_gates.len()]
         })
-        .map(|effect| effect.spec.clone())
+        .map(|effect| resolved_effect_spec(effect, track_step, sub_index, param_index))
         .collect()
+}
+
+fn effect_pattern_value(
+    effect: &TrackEffect,
+    key: &str,
+    track_step: usize,
+    sub_index: usize,
+    param_index: usize,
+) -> Option<f32> {
+    effect
+        .param_patterns
+        .iter()
+        .find(|pattern| pattern.key == key)
+        .and_then(|pattern| {
+            let index = match pattern.mode {
+                EffectParamPatternMode::Step => track_step,
+                EffectParamPatternMode::Hit => param_index,
+                EffectParamPatternMode::Gate => track_step.wrapping_add(sub_index),
+            };
+            pattern
+                .values
+                .get(index % pattern.values.len().max(1))
+                .copied()
+        })
+}
+
+fn resolved_effect_spec(
+    effect: &TrackEffect,
+    track_step: usize,
+    sub_index: usize,
+    param_index: usize,
+) -> crate::effects::EffectSpec {
+    let mut spec = effect.spec.clone();
+    macro_rules! value {
+        ($key:literal, $current:expr) => {
+            effect_pattern_value(effect, $key, track_step, sub_index, param_index)
+                .unwrap_or($current)
+        };
+    }
+    match &mut spec {
+        crate::effects::EffectSpec::Filter {
+            cutoff,
+            resonance,
+            gain_db,
+            ..
+        } => {
+            *cutoff = value!("cutoff", *cutoff);
+            *resonance = value!("resonance", *resonance);
+            *gain_db = value!("gain-db", *gain_db);
+        }
+        crate::effects::EffectSpec::Comb {
+            delay_ms,
+            feedback,
+            mix,
+        } => {
+            *delay_ms = value!("delay-ms", *delay_ms);
+            *feedback = value!("feedback", *feedback);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::Formant { mix, .. }
+        | crate::effects::EffectSpec::SubBass { mix }
+        | crate::effects::EffectSpec::Reverb { mix, .. } => *mix = value!("mix", *mix),
+        crate::effects::EffectSpec::Distortion { drive, .. } => *drive = value!("drive", *drive),
+        crate::effects::EffectSpec::Bitcrush {
+            bit_depth,
+            sample_rate_reduction,
+        } => {
+            *bit_depth = value!("bits", *bit_depth);
+            *sample_rate_reduction = value!("rate", *sample_rate_reduction);
+        }
+        crate::effects::EffectSpec::Delay {
+            time,
+            feedback,
+            mix,
+        }
+        | crate::effects::EffectSpec::SpaceEcho {
+            time,
+            feedback,
+            mix,
+            ..
+        } => {
+            *time = value!("time", *time);
+            *feedback = value!("feedback", *feedback);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::Wavefolder {
+            folds,
+            gain,
+            symmetry,
+        } => {
+            *folds = value!("folds", *folds);
+            *gain = value!("gain", *gain);
+            *symmetry = value!("symmetry", *symmetry);
+        }
+        crate::effects::EffectSpec::Resonator {
+            freq,
+            decay,
+            mix,
+            harmonics,
+        } => {
+            *freq = value!("freq", *freq);
+            *decay = value!("decay", *decay);
+            *mix = value!("mix", *mix);
+            *harmonics = value!("harmonics", *harmonics);
+        }
+        crate::effects::EffectSpec::Lofi { amount }
+        | crate::effects::EffectSpec::Warmth { amount }
+        | crate::effects::EffectSpec::Exciter { amount, .. } => *amount = value!("amount", *amount),
+        crate::effects::EffectSpec::Vinyl { crackle, hiss, wow } => {
+            *crackle = value!("crackle", *crackle);
+            *hiss = value!("hiss", *hiss);
+            *wow = value!("wow", *wow);
+        }
+        crate::effects::EffectSpec::Sidechain { rate, depth, shape } => {
+            *rate = value!("rate", *rate);
+            *depth = value!("depth", *depth);
+            *shape = value!("shape", *shape);
+        }
+        crate::effects::EffectSpec::Radio { intensity } => {
+            *intensity = value!("intensity", *intensity)
+        }
+        crate::effects::EffectSpec::Telephone { quality } => *quality = value!("quality", *quality),
+        crate::effects::EffectSpec::Underwater { depth }
+        | crate::effects::EffectSpec::Tremolo { depth, .. }
+        | crate::effects::EffectSpec::Vibrato { depth, .. } => *depth = value!("depth", *depth),
+        crate::effects::EffectSpec::Crystal { brightness, decay } => {
+            *brightness = value!("brightness", *brightness);
+            *decay = value!("decay", *decay);
+        }
+        crate::effects::EffectSpec::PitchShift { semitones, mix } => {
+            *semitones = value!("semitones", *semitones);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::Harmonizer { interval, mix } => {
+            *interval = value!("interval", *interval);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::Octaver {
+            octave_up,
+            octave_down,
+        } => {
+            *octave_up = value!("octave-up", *octave_up);
+            *octave_down = value!("octave-down", *octave_down);
+        }
+        crate::effects::EffectSpec::Shimmer {
+            shift_semitones,
+            feedback,
+            mix,
+        } => {
+            *shift_semitones = value!("shift-semitones", *shift_semitones);
+            *feedback = value!("feedback", *feedback);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::Stutter {
+            grain_size_ms,
+            repeats,
+            mix,
+        } => {
+            *grain_size_ms = value!("grain-size-ms", *grain_size_ms);
+            *repeats = value!("repeats", *repeats);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::Glitch { density, slice_ms } => {
+            *density = value!("density", *density);
+            *slice_ms = value!("slice-ms", *slice_ms);
+        }
+        crate::effects::EffectSpec::Adsr {
+            attack,
+            decay,
+            sustain,
+            release,
+            duration_seconds,
+        } => {
+            *attack = value!("attack", *attack);
+            *decay = value!("decay", *decay);
+            *sustain = value!("sustain", *sustain);
+            *release = value!("release", *release);
+            if let Some(duration) = duration_seconds {
+                *duration = value!("duration", *duration);
+            }
+        }
+        crate::effects::EffectSpec::Doppler { speed, depth } => {
+            *speed = value!("speed", *speed);
+            *depth = value!("depth", *depth);
+        }
+        crate::effects::EffectSpec::Chorus {
+            rate,
+            depth,
+            voices,
+            mix,
+        } => {
+            *rate = value!("rate", *rate);
+            *depth = value!("depth", *depth);
+            *voices = value!("voices", *voices);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::Ensemble {
+            voices,
+            depth,
+            rate,
+        } => {
+            *voices = value!("voices", *voices);
+            *depth = value!("depth", *depth);
+            *rate = value!("rate", *rate);
+        }
+        crate::effects::EffectSpec::Dimension { mode }
+        | crate::effects::EffectSpec::DimensionD { mode } => *mode = value!("mode", *mode),
+        crate::effects::EffectSpec::Ce1Chorus { rate, intensity } => {
+            *rate = value!("rate", *rate);
+            *intensity = value!("intensity", *intensity);
+        }
+        crate::effects::EffectSpec::Re301Chorus { rate, depth, tone } => {
+            *rate = value!("rate", *rate);
+            *depth = value!("depth", *depth);
+            *tone = value!("tone", *tone);
+        }
+        crate::effects::EffectSpec::H3000 {
+            detune_cents,
+            delay_ms,
+            feedback,
+            mix,
+        } => {
+            *detune_cents = value!("detune-cents", *detune_cents);
+            *delay_ms = value!("delay-ms", *delay_ms);
+            *feedback = value!("feedback", *feedback);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::Flanger {
+            rate,
+            depth,
+            feedback,
+            mix,
+        } => {
+            *rate = value!("rate", *rate);
+            *depth = value!("depth", *depth);
+            *feedback = value!("feedback", *feedback);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::Phaser {
+            rate,
+            depth,
+            stages,
+            mix,
+        } => {
+            *rate = value!("rate", *rate);
+            *depth = value!("depth", *depth);
+            *stages = value!("stages", *stages);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::SmallStone {
+            rate,
+            depth,
+            feedback,
+            ..
+        } => {
+            *rate = value!("rate", *rate);
+            *depth = value!("depth", *depth);
+            *feedback = value!("feedback", *feedback);
+        }
+        crate::effects::EffectSpec::RingMod { freq, mix } => {
+            *freq = value!("freq", *freq);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::Compressor {
+            threshold,
+            ratio,
+            attack,
+            release,
+            makeup_gain,
+        } => {
+            *threshold = value!("threshold", *threshold);
+            *ratio = value!("ratio", *ratio);
+            *attack = value!("attack", *attack);
+            *release = value!("release", *release);
+            *makeup_gain = value!("makeup", *makeup_gain);
+        }
+        crate::effects::EffectSpec::Tube { drive, asymmetry } => {
+            *drive = value!("drive", *drive);
+            *asymmetry = value!("asymmetry", *asymmetry);
+        }
+        crate::effects::EffectSpec::Tape {
+            saturation,
+            wow,
+            flutter,
+        } => {
+            *saturation = value!("saturation", *saturation);
+            *wow = value!("wow", *wow);
+            *flutter = value!("flutter", *flutter);
+        }
+        crate::effects::EffectSpec::Moog {
+            cutoff,
+            resonance,
+            drive,
+        } => {
+            *cutoff = value!("cutoff", *cutoff);
+            *resonance = value!("resonance", *resonance);
+            *drive = value!("drive", *drive);
+        }
+        crate::effects::EffectSpec::ProphetFilter { cutoff, resonance }
+        | crate::effects::EffectSpec::WaspFilter { cutoff, resonance }
+        | crate::effects::EffectSpec::Ms20 { cutoff, resonance }
+        | crate::effects::EffectSpec::JunoHpf { cutoff, resonance } => {
+            *cutoff = value!("cutoff", *cutoff);
+            *resonance = value!("resonance", *resonance);
+        }
+        crate::effects::EffectSpec::ObxaFilter {
+            cutoff, resonance, ..
+        }
+        | crate::effects::EffectSpec::Sem {
+            cutoff, resonance, ..
+        } => {
+            *cutoff = value!("cutoff", *cutoff);
+            *resonance = value!("resonance", *resonance);
+        }
+        crate::effects::EffectSpec::Diode303 {
+            cutoff,
+            resonance,
+            env_mod,
+            accent,
+            decay,
+        } => {
+            *cutoff = value!("cutoff", *cutoff);
+            *resonance = value!("resonance", *resonance);
+            *env_mod = value!("env-mod", *env_mod);
+            *accent = value!("accent", *accent);
+            *decay = value!("decay", *decay);
+        }
+        crate::effects::EffectSpec::Fade {
+            fade_in_ms,
+            fade_out_ms,
+            duration_seconds,
+        } => {
+            *fade_in_ms = value!("fade-in-ms", *fade_in_ms);
+            *fade_out_ms = value!("fade-out-ms", *fade_out_ms);
+            if let Some(duration) = duration_seconds {
+                *duration = value!("duration", *duration);
+            }
+        }
+        crate::effects::EffectSpec::Maximizer {
+            ceiling,
+            warmth,
+            release_ms,
+        } => {
+            *ceiling = value!("ceiling", *ceiling);
+            *warmth = value!("warmth", *warmth);
+            *release_ms = value!("release-ms", *release_ms);
+        }
+        crate::effects::EffectSpec::MultibandComp {
+            low_thresh,
+            mid_thresh,
+            high_thresh,
+            crossover_low,
+            crossover_high,
+        } => {
+            *low_thresh = value!("low-thresh", *low_thresh);
+            *mid_thresh = value!("mid-thresh", *mid_thresh);
+            *high_thresh = value!("high-thresh", *high_thresh);
+            *crossover_low = value!("crossover-low", *crossover_low);
+            *crossover_high = value!("crossover-high", *crossover_high);
+        }
+        crate::effects::EffectSpec::HarmonicEnhance {
+            low_harmonics,
+            high_harmonics,
+            air,
+        } => {
+            *low_harmonics = value!("low-harmonics", *low_harmonics);
+            *high_harmonics = value!("high-harmonics", *high_harmonics);
+            *air = value!("air", *air);
+        }
+        crate::effects::EffectSpec::Body { size, tone, mix } => {
+            *size = value!("size", *size);
+            *tone = value!("tone", *tone);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::Spatial {
+            room_size,
+            position,
+            height,
+        } => {
+            *room_size = value!("room-size", *room_size);
+            *position = value!("position", *position);
+            *height = value!("height", *height);
+        }
+        crate::effects::EffectSpec::ParallelComp {
+            threshold,
+            ratio,
+            mix,
+        } => {
+            *threshold = value!("threshold", *threshold);
+            *ratio = value!("ratio", *ratio);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::ArpRingMod {
+            freq,
+            depth,
+            diode_curve,
+        } => {
+            *freq = value!("freq", *freq);
+            *depth = value!("depth", *depth);
+            *diode_curve = value!("diode-curve", *diode_curve);
+        }
+        crate::effects::EffectSpec::Fairchild {
+            input_gain,
+            threshold,
+            time_constant,
+            mix,
+        } => {
+            *input_gain = value!("input-gain", *input_gain);
+            *threshold = value!("threshold", *threshold);
+            *time_constant = value!("time-constant", *time_constant);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::SslComp {
+            threshold,
+            ratio,
+            attack_ms,
+            release_ms,
+            makeup_db,
+        } => {
+            *threshold = value!("threshold", *threshold);
+            *ratio = value!("ratio", *ratio);
+            *attack_ms = value!("attack-ms", *attack_ms);
+            *release_ms = value!("release-ms", *release_ms);
+            *makeup_db = value!("makeup-db", *makeup_db);
+        }
+        crate::effects::EffectSpec::Dbx160 { threshold, ratio } => {
+            *threshold = value!("threshold", *threshold);
+            *ratio = value!("ratio", *ratio);
+        }
+        crate::effects::EffectSpec::La2a { peak_reduction, .. } => {
+            *peak_reduction = value!("peak-reduction", *peak_reduction);
+        }
+        crate::effects::EffectSpec::Urei1176 {
+            input_gain,
+            ratio,
+            attack,
+            release,
+        } => {
+            *input_gain = value!("input-gain", *input_gain);
+            *ratio = value!("ratio", *ratio);
+            *attack = value!("attack", *attack);
+            *release = value!("release", *release);
+        }
+        crate::effects::EffectSpec::Limiter { ceiling, release } => {
+            *ceiling = value!("ceiling", *ceiling);
+            *release = value!("release", *release);
+        }
+        crate::effects::EffectSpec::Gate {
+            threshold,
+            attack,
+            release,
+        } => {
+            *threshold = value!("threshold", *threshold);
+            *attack = value!("attack", *attack);
+            *release = value!("release", *release);
+        }
+        crate::effects::EffectSpec::Transient {
+            attack_gain,
+            sustain_gain,
+            sensitivity,
+        } => {
+            *attack_gain = value!("attack-gain", *attack_gain);
+            *sustain_gain = value!("sustain-gain", *sustain_gain);
+            *sensitivity = value!("sensitivity", *sensitivity);
+        }
+        crate::effects::EffectSpec::SpringReverb {
+            decay,
+            tone,
+            mix,
+            drip,
+        } => {
+            *decay = value!("decay", *decay);
+            *tone = value!("tone", *tone);
+            *mix = value!("mix", *mix);
+            *drip = value!("drip", *drip);
+        }
+        crate::effects::EffectSpec::EmtPlate {
+            decay,
+            damping,
+            mix,
+            pre_delay_ms,
+        } => {
+            *decay = value!("decay", *decay);
+            *damping = value!("damping", *damping);
+            *mix = value!("mix", *mix);
+            *pre_delay_ms = value!("pre-delay-ms", *pre_delay_ms);
+        }
+        crate::effects::EffectSpec::Lexicon224 {
+            size,
+            decay,
+            damping,
+            pre_delay_ms,
+            mix,
+        } => {
+            *size = value!("size", *size);
+            *decay = value!("decay", *decay);
+            *damping = value!("damping", *damping);
+            *pre_delay_ms = value!("pre-delay-ms", *pre_delay_ms);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::AmsReverb {
+            decay,
+            damping,
+            mix,
+            ..
+        } => {
+            *decay = value!("decay", *decay);
+            *damping = value!("damping", *damping);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::NevePreamp { gain, warmth } => {
+            *gain = value!("gain", *gain);
+            *warmth = value!("warmth", *warmth);
+        }
+        crate::effects::EffectSpec::MarshallAmp {
+            gain,
+            tone,
+            presence,
+        } => {
+            *gain = value!("gain", *gain);
+            *tone = value!("tone", *tone);
+            *presence = value!("presence", *presence);
+        }
+        crate::effects::EffectSpec::VoxAc30 { gain, treble, cut } => {
+            *gain = value!("gain", *gain);
+            *treble = value!("treble", *treble);
+            *cut = value!("cut", *cut);
+        }
+        crate::effects::EffectSpec::FenderTwin {
+            volume,
+            treble,
+            bass,
+            reverb_mix,
+        } => {
+            *volume = value!("volume", *volume);
+            *treble = value!("treble", *treble);
+            *bass = value!("bass", *bass);
+            *reverb_mix = value!("reverb-mix", *reverb_mix);
+        }
+        crate::effects::EffectSpec::PultecEq {
+            low_boost,
+            low_atten,
+            low_freq,
+            high_boost,
+            high_atten,
+            high_freq,
+        } => {
+            *low_boost = value!("low-boost", *low_boost);
+            *low_atten = value!("low-atten", *low_atten);
+            *low_freq = value!("low-freq", *low_freq);
+            *high_boost = value!("high-boost", *high_boost);
+            *high_atten = value!("high-atten", *high_atten);
+            *high_freq = value!("high-freq", *high_freq);
+        }
+        crate::effects::EffectSpec::Tc2290 {
+            time_ms,
+            feedback,
+            mod_rate,
+            mod_depth,
+            mix,
+        } => {
+            *time_ms = value!("time-ms", *time_ms);
+            *feedback = value!("feedback", *feedback);
+            *mod_rate = value!("mod-rate", *mod_rate);
+            *mod_depth = value!("mod-depth", *mod_depth);
+            *mix = value!("mix", *mix);
+        }
+        crate::effects::EffectSpec::StuderTape {
+            input_level,
+            speed,
+            bias,
+        } => {
+            *input_level = value!("input-level", *input_level);
+            *speed = value!("speed", *speed);
+            *bias = value!("bias", *bias);
+        }
+        crate::effects::EffectSpec::BuchlaLpg {
+            strike,
+            decay,
+            resonance,
+        } => {
+            *strike = value!("strike", *strike);
+            *decay = value!("decay", *decay);
+            *resonance = value!("resonance", *resonance);
+        }
+        crate::effects::EffectSpec::DcRemove => {}
+    }
+    spec
 }
 
 fn note_chord_at(values: &[Vec<f32>], index: usize) -> Vec<f32> {
@@ -532,6 +1125,7 @@ impl AudioEngine {
                 seed_step,
                 track_step,
                 sub_index,
+                param_index,
                 hold_seconds,
                 self.sample_rate,
                 params,

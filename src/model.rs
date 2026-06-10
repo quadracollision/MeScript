@@ -70,6 +70,21 @@ pub(crate) enum Waveform {
 pub(crate) struct TrackEffect {
     pub(crate) spec: EffectSpec,
     pub(crate) gate_subdivisions: Option<Vec<Vec<bool>>>,
+    pub(crate) param_patterns: Vec<EffectParamPattern>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EffectParamPattern {
+    pub(crate) key: String,
+    pub(crate) mode: EffectParamPatternMode,
+    pub(crate) values: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EffectParamPatternMode {
+    Step,
+    Hit,
+    Gate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

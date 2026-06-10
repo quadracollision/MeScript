@@ -90,7 +90,11 @@
 (defn queue-playback-highlight! [^JTextComponent editor-pane received-ns]
   (if (:remove-playback-highlighting @shared/state)
     (editor/clear-live-step-highlight! editor-pane)
-    (editor/queue-current-live-step-highlight! editor-pane received-ns)))
+    (if-let [highlight-fn (:live-highlight-fn @shared/state)]
+      (highlight-fn (:live-highlight-step @shared/state)
+                    (:live-highlight-scene @shared/state)
+                    received-ns)
+      (editor/queue-current-live-step-highlight! editor-pane received-ns))))
 
 (defn parse-step-line [line]
   (when (str/starts-with? line "STEP ")
@@ -356,9 +360,12 @@
       true)))
 
 (defn live-update!
-  [^JFrame frame ^JTextComponent editor-pane ^JLabel status device ensure-renderer! preview-source require-playback-form! compile-source]
+  ([^JFrame frame ^JTextComponent editor-pane ^JLabel status device ensure-renderer! preview-source require-playback-form! compile-source]
+   (live-update! frame editor-pane status device ensure-renderer! preview-source require-playback-form! compile-source nil))
+  ([^JFrame frame ^JTextComponent editor-pane ^JLabel status device ensure-renderer! preview-source require-playback-form! compile-source highlight-fn]
   (future
     (try
+      (swap! shared/state assoc :live-highlight-fn highlight-fn)
       (swap! shared/state assoc :live-awaiting-update false)
       (SwingUtilities/invokeLater #(shared/set-status! status "live compiling..."))
       (let [source (.getText editor-pane)
@@ -373,7 +380,7 @@
           #(do
              (editor/report-source-error! editor-pane status ex)
              (when-not (GraphicsEnvironment/isHeadless)
-               (JOptionPane/showMessageDialog frame (editor/clean-error-message ex) "Live update failed" JOptionPane/ERROR_MESSAGE))))))))
+               (JOptionPane/showMessageDialog frame (editor/clean-error-message ex) "Live update failed" JOptionPane/ERROR_MESSAGE)))))))))
 
 (defn live-stop! [^JTextComponent editor-pane ^JLabel status]
   (swap! shared/state assoc :live-awaiting-update false)

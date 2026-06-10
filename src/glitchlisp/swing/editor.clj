@@ -1645,7 +1645,7 @@
       (removeUpdate [_] (clear-live-gate-range-cache! editor))
       (changedUpdate [_] nil))))
 
-(defn highlight-live-step! [^JTextComponent editor step scene]
+(defn highlight-live-step-for-symbols! [^JTextComponent editor step scene symbols]
   (let [text (cached-live-highlight-text editor)
         old-step-ranges (or (.getClientProperty editor live-step-repaint-key)
                             (.getClientProperty editor live-step-highlight-key)
@@ -1657,6 +1657,12 @@
                       [start (inc end)])
         scene-segments (cached-live-scene-range-segments editor text scene scene-range)
         active-entries (cached-active-gate-entries editor text scene scene-context)
+        active-entries (if (seq symbols)
+                         (vec (filter (fn [entry]
+                                        (when-let [[def-name _ _] (def-name-range-at text (:gate-idx entry))]
+                                          (contains? symbols def-name)))
+                                      active-entries))
+                         active-entries)
         live-entries (entries-for-live-scene active-entries scene)
         ranges (cached-live-step-ranges editor scene nil step live-entries)
         scene-ranges-to-repaint (when (not= old-scene-range scene-range)
@@ -1680,6 +1686,9 @@
                               (concat old-step-ranges scene-ranges-to-repaint)
                               ranges))
       (clear-live-step-highlight! editor))))
+
+(defn highlight-live-step! [^JTextComponent editor step scene]
+  (highlight-live-step-for-symbols! editor step scene nil))
 
 (defn queue-live-step-highlight!
   ([^JTextComponent editor step]

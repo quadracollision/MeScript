@@ -217,6 +217,7 @@
 (def effect-forms
   [[":fx [...]" "Track effect chain." ":fx [(delay :time 0.125)]"]
    ["(on :gate PATTERN EFFECT)" "Gate an effect inside :fx; PATTERN accepts p, s, g, gate-seq, euclid, then, and times." "(d :lead :src :sine-synth :note c3 :gate 1 :fx [(on :gate (g [0 1]) (delay :mix 0.4))])\n(start!)"]
+   ["numeric effect params" "Numeric effect controls accept p, s, g, gate-seq, ranges, and math; p follows steps, s follows hits, and g follows gate slots." ":fx [(filter :type :lowpass :cutoff (p [400 1200]) :res (s [0.2 0.4]))]"]
    ["(post-fx [...])" "Render/master effect chain over an audio source." "(d :lead :src :sine-synth :note c3 :gate 1)\n(post-fx [(reverb :mix 0.2)])\n(start!)"]
    ["all-null effect" "An effect form whose provided controls are all null is skipped." ":fx [(filter :type null :cutoff null :res null)]"]
    [":mix" "Common effect wet mix from 0 to 1." ":mix 0.35"]

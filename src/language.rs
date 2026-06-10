@@ -1,8 +1,8 @@
 use crate::effects::offline::{OfflineEffectSpec, StereoSide};
 use crate::effects::{self, DistortionKind, EffectSpec, FilterKind};
 use crate::model::{
-    NoteMode, OscillatorParams, ParamPatterns, Runtime, Scene, SceneState, Track, TrackEffect,
-    Waveform,
+    EffectParamPattern, EffectParamPatternMode, NoteMode, OscillatorParams, ParamPatterns, Runtime,
+    Scene, SceneState, Track, TrackEffect, Waveform,
 };
 use crate::sequencer;
 use std::collections::HashSet;
@@ -1037,6 +1037,11 @@ fn number_value(expr: &Expr) -> Result<f32, String> {
     match expr {
         Expr::Number(value) => Ok(*value),
         Expr::Symbol(name) => note_freq(name).ok_or_else(|| format!("unknown symbol '{}'", name)),
+        Expr::Vector(values) if values.len() == 1 => number_value(&values[0]),
+        Expr::Vector(values) => Err(format!(
+            "expected one number or note, got vector with {} values",
+            values.len()
+        )),
         _ => Err("expected number or note".to_string()),
     }
 }
@@ -1106,6 +1111,76 @@ fn numeric_param_pattern(
 
 fn numeric_pattern_form(name: &str) -> bool {
     matches!(name, "p" | "s" | "g" | "gs" | "gate-seq" | "gate_seq")
+}
+
+fn numeric_pattern_mode(name: &str) -> Option<EffectParamPatternMode> {
+    match name {
+        "p" => Some(EffectParamPatternMode::Step),
+        "s" => Some(EffectParamPatternMode::Hit),
+        "g" | "gs" | "gate-seq" | "gate_seq" => Some(EffectParamPatternMode::Gate),
+        _ => None,
+    }
+}
+
+fn numeric_effect_param_pattern(
+    expr: &Expr,
+) -> Result<Option<(EffectParamPatternMode, Vec<f32>)>, String> {
+    match expr {
+        Expr::List(items) => {
+            let Some(Expr::Symbol(name)) = items.first() else {
+                return Ok(None);
+            };
+            if let Some(mode) = numeric_pattern_mode(name) {
+                return Ok(Some((mode, number_pattern(expr, false)?)));
+            }
+            if name == "rev" || name == "reverse" {
+                return Ok(Some((
+                    EffectParamPatternMode::Step,
+                    number_pattern(expr, false)?,
+                )));
+            }
+            Ok(None)
+        }
+        Expr::Vector(_) => Ok(Some((
+            EffectParamPatternMode::Step,
+            number_pattern(expr, false)?,
+        ))),
+        _ => Ok(None),
+    }
+}
+
+fn effect_param_patterns(
+    items: &[Expr],
+    form_name: &str,
+) -> Result<Vec<EffectParamPattern>, String> {
+    let mut patterns = Vec::new();
+    let mut index = 1;
+    while index + 1 < items.len() {
+        let Expr::Keyword(key) = &items[index] else {
+            index += 1;
+            continue;
+        };
+        let canonical_key = effect_param_canonical_key(form_name, key).to_string();
+        if let Some((mode, values)) = numeric_effect_param_pattern(&items[index + 1])
+            .map_err(|error| format!(":{} {}", key, error))?
+        {
+            if values.is_empty() {
+                return Err(format!(":{} pattern cannot be empty", key));
+            }
+            for value in &values {
+                let scalar = Expr::Number(*value);
+                validate_common_effect_param_value(form_name, key, &scalar)?;
+                validate_effect_specific_param_value(form_name, key, &scalar)?;
+            }
+            patterns.push(EffectParamPattern {
+                key: canonical_key,
+                mode,
+                values,
+            });
+        }
+        index += 2;
+    }
+    Ok(patterns)
 }
 
 fn set_f32_param_pattern_or_scalar(
@@ -1443,6 +1518,7 @@ fn track_effect(expr: &Expr) -> Option<Result<TrackEffect, String>> {
         return Some(effect_spec(expr).map(|spec| TrackEffect {
             spec,
             gate_subdivisions: None,
+            param_patterns: Vec::new(),
         }));
     };
 
@@ -1455,14 +1531,17 @@ fn track_effect(expr: &Expr) -> Option<Result<TrackEffect, String>> {
             }
             return None;
         }
-        return Some(effect_spec(expr).map(|spec| TrackEffect {
-            spec,
-            gate_subdivisions: None,
+        return Some(effect_spec(expr).and_then(|spec| {
+            Ok(TrackEffect {
+                spec,
+                gate_subdivisions: None,
+                param_patterns: effect_param_patterns(items, name)?,
+            })
         }));
     }
 
     let mut gate_subdivisions = None;
-    let mut effect: Option<Option<EffectSpec>> = None;
+    let mut effect: Option<Option<(EffectSpec, Vec<EffectParamPattern>)>> = None;
     let mut index = 1;
     while index < items.len() {
         match &items[index] {
@@ -1503,7 +1582,18 @@ fn track_effect(expr: &Expr) -> Option<Result<TrackEffect, String>> {
                     effect = Some(None);
                 } else {
                     match effect_spec(form) {
-                        Ok(spec) => effect = Some(Some(spec)),
+                        Ok(spec) => {
+                            let param_patterns = match effect_items.first() {
+                                Some(Expr::Symbol(effect_name)) => {
+                                    match effect_param_patterns(effect_items, effect_name) {
+                                        Ok(patterns) => patterns,
+                                        Err(error) => return Some(Err(error)),
+                                    }
+                                }
+                                _ => Vec::new(),
+                            };
+                            effect = Some(Some((spec, param_patterns)));
+                        }
                         Err(error) => return Some(Err(error)),
                     }
                 }
@@ -1518,9 +1608,10 @@ fn track_effect(expr: &Expr) -> Option<Result<TrackEffect, String>> {
     }
 
     match effect {
-        Some(Some(spec)) => Some(Ok(TrackEffect {
+        Some(Some((spec, param_patterns))) => Some(Ok(TrackEffect {
             spec,
             gate_subdivisions,
+            param_patterns,
         })),
         Some(None) => None,
         None => Some(Err("on requires an effect form".to_string())),
@@ -2263,6 +2354,14 @@ fn validate_common_effect_param_value(
     if null_value(value) {
         return Ok(());
     }
+    if let Some((_, values)) =
+        numeric_effect_param_pattern(value).map_err(|error| format!(":{} {}", key, error))?
+    {
+        for value in values {
+            validate_common_effect_param_value(form_name, key, &Expr::Number(value))?;
+        }
+        return Ok(());
+    }
     if form_name == "h3000" && matches!(key, "delay-ms" | "feedback") {
         return Err(format!(
             "h3000 :{} is not implemented by this port yet; remove it",
@@ -2296,6 +2395,14 @@ fn validate_effect_specific_param_value(
     value: &Expr,
 ) -> Result<(), String> {
     if null_value(value) {
+        return Ok(());
+    }
+    if let Some((_, values)) =
+        numeric_effect_param_pattern(value).map_err(|error| format!(":{} {}", key, error))?
+    {
+        for value in values {
+            validate_effect_specific_param_value(form_name, key, &Expr::Number(value))?;
+        }
         return Ok(());
     }
     match form_name {
@@ -3083,6 +3190,14 @@ fn number_param(items: &[Expr], key: &str, default: f32) -> Result<f32, String> 
             if null_value(&items[index + 1]) {
                 return Ok(default);
             }
+            if let Some((_, values)) = numeric_effect_param_pattern(&items[index + 1])
+                .map_err(|error| format!(":{} {}", key, error))?
+            {
+                return values
+                    .first()
+                    .copied()
+                    .ok_or_else(|| format!(":{} pattern cannot be empty", key));
+            }
             return number_value(&items[index + 1]).map_err(|error| format!(":{} {}", key, error));
         }
         index += 2;
@@ -3096,6 +3211,15 @@ fn optional_number_param(items: &[Expr], key: &str) -> Result<Option<f32>, Strin
         if matches!(&items[index], Expr::Keyword(value) if value == key) {
             if null_value(&items[index + 1]) {
                 return Ok(None);
+            }
+            if let Some((_, values)) = numeric_effect_param_pattern(&items[index + 1])
+                .map_err(|error| format!(":{} {}", key, error))?
+            {
+                return values
+                    .first()
+                    .copied()
+                    .map(Some)
+                    .ok_or_else(|| format!(":{} pattern cannot be empty", key));
             }
             return number_value(&items[index + 1])
                 .map(Some)

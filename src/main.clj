@@ -1,9 +1,10 @@
 (ns glitchlisp-swing
   (:require [clojure.java.io :as io]
+            [clojure.set :as set]
             [clojure.string :as str])
   (:import
     [java.awt BorderLayout Color Cursor Dimension Font GraphicsEnvironment]
-    [java.awt.event ActionListener FocusAdapter MouseAdapter MouseEvent WindowAdapter]
+    [java.awt.event ActionListener FocusAdapter InputEvent KeyEvent MouseAdapter MouseEvent WindowAdapter]
     [java.io BufferedReader ByteArrayInputStream ByteArrayOutputStream File InputStreamReader OutputStreamWriter PushbackReader StringReader]
     [javax.sound.sampled AudioFileFormat$Type AudioFormat AudioInputStream AudioSystem Clip]
     [javax.swing.event CaretListener ChangeListener DocumentListener]
@@ -145,6 +146,7 @@
 (def clear-live-gate-range-cache! glitchlisp.swing.editor/clear-live-gate-range-cache!)
 (def install-live-gate-range-cache! glitchlisp.swing.editor/install-live-gate-range-cache!)
 (def highlight-live-step! glitchlisp.swing.editor/highlight-live-step!)
+(def highlight-live-step-for-symbols! glitchlisp.swing.editor/highlight-live-step-for-symbols!)
 (def queue-live-step-highlight! glitchlisp.swing.editor/queue-live-step-highlight!)
 (def highlight-editor-range! glitchlisp.swing.editor/highlight-editor-range!)
 (def matching-open glitchlisp.swing.editor/matching-open)
@@ -161,6 +163,7 @@
 (def line-number-gutter glitchlisp.swing.editor/line-number-gutter)
 (def matching-close glitchlisp.swing.editor/matching-close)
 (def code-visible-text glitchlisp.swing.editor/code-visible-text)
+(def visible-symbol-set glitchlisp.swing.editor/visible-symbol-set)
 (def enclosing-track-range glitchlisp.swing.editor/enclosing-track-range)
 (def find-fx-vector glitchlisp.swing.editor/find-fx-vector)
 (def line-indent-before glitchlisp.swing.editor/line-indent-before)
@@ -192,6 +195,8 @@
 (def write-file! glitchlisp.swing.render/write-file!)
 (def compile-glitchlisp-source glitchlisp.swing.render/compile-glitchlisp-source)
 (def current-file-or-session! glitchlisp.swing.render/current-file-or-session!)
+(def include-path-from-line glitchlisp.swing.render/include-path-from-line)
+(def canonical-file glitchlisp.swing.render/canonical-file)
 (def stop-clip! glitchlisp.swing.render/stop-clip!)
 (def play-wav! glitchlisp.swing.render/play-wav!)
 (def run-command! glitchlisp.swing.render/run-command!)
@@ -268,9 +273,83 @@
 (def send-live-command! glitchlisp.swing.live/send-live-command!)
 (def send-compiled-live-update! glitchlisp.swing.live/send-compiled-live-update!)
 
+(declare tab-editor editor-file)
+
+(defn tab-editors [^JTabbedPane tabs]
+  (vec
+    (keep #(tab-editor (.getComponentAt tabs %))
+          (range (.getTabCount tabs)))))
+
+(defn included-files
+  ([source source-file]
+   (included-files source source-file #{}))
+  ([source source-file seen]
+   (let [base (or (some-> ^File source-file .getParentFile)
+                  (File. "."))
+         direct (keep (fn [line]
+                        (when-let [include-path (include-path-from-line line)]
+                          (let [file (File. include-path)]
+                            (canonical-file
+                              (if (.isAbsolute file) file (File. base include-path))))))
+                      (str/split-lines source))]
+     (reduce
+       (fn [result ^File file]
+         (if (contains? result file)
+           result
+           (let [result (conj result file)
+                 nested (try
+                          (included-files (slurp (.getPath file)) file result)
+                          (catch Exception _ result))]
+             nested)))
+       seen
+       direct))))
+
+(defn scene-symbols [source scene]
+  (when scene
+    (when-let [[start end] (glitchlisp.swing.editor/scene-form-range-by-id source scene)]
+      (visible-symbol-set (code-visible-text (subs source start (inc end)))))))
+
+(defn def-names-in-source [source]
+  (set (map second (re-seq #"\(def\s+([^\s\(\)\[\];]+)"
+                           (code-visible-text source)))))
+
+(defn open-include-editors [^JTabbedPane tabs include-files]
+  (vec
+    (filter (fn [^JTextComponent editor]
+              (when-let [file (editor-file editor)]
+                (contains? include-files (canonical-file file))))
+            (tab-editors tabs))))
+
+(defn live-highlight-fn [^JTabbedPane tabs ^JTextComponent root-editor]
+  (fn [step scene _received-ns]
+    (SwingUtilities/invokeLater
+      #(let [source (.getText root-editor)
+             include-files (included-files source (or (editor-file root-editor)
+                                                      (current-file-or-session!)))
+             scene-symbols (scene-symbols source scene)
+             include-editors (set (open-include-editors tabs include-files))]
+         (doseq [editor (tab-editors tabs)]
+           (cond
+             (= editor root-editor)
+             (highlight-live-step! editor step scene)
+
+             (contains? include-editors editor)
+             (let [symbols (when scene-symbols
+                             (set/intersection scene-symbols
+                                               (def-names-in-source (.getText editor))))]
+               (if (or (nil? scene-symbols) (seq symbols))
+                 (highlight-live-step-for-symbols! editor step nil symbols)
+                 (clear-live-step-highlight! editor)))
+
+             :else
+             (clear-live-step-highlight! editor)))))))
+
 (defn live-update! [^JFrame frame ^JTextComponent editor ^JLabel status device]
   (glitchlisp.swing.live/live-update!
-    frame editor status device ensure-renderer! preview-source require-playback-form! compile-glitchlisp-source))
+    frame editor status device ensure-renderer! preview-source require-playback-form! compile-glitchlisp-source
+    (some-> (.getRootPane frame)
+            (.getClientProperty "mescript.editor-tabs")
+            (live-highlight-fn editor))))
 
 (def live-stop! glitchlisp.swing.live/live-stop!)
 
@@ -661,6 +740,24 @@
       (refresh-tab-title! tabs editor)
       (set-status! status (str "saved " (.getPath file))))))
 
+(defn bind-app-action! [^JComponent component ^KeyStroke keystroke action-key f]
+  (.put (.getInputMap component JComponent/WHEN_IN_FOCUSED_WINDOW)
+        keystroke
+        action-key)
+  (.put (.getActionMap component)
+        action-key
+        (proxy [AbstractAction] []
+          (actionPerformed [_] (f)))))
+
+(def save-current-keystroke
+  (KeyStroke/getKeyStroke KeyEvent/VK_S InputEvent/ALT_DOWN_MASK))
+
+(defn install-save-shortcut! [^JFrame frame ^JTabbedPane tabs ^JLabel status]
+  (bind-app-action! (.getRootPane frame)
+                    save-current-keystroke
+                    "mescript-save-current"
+                    #(save-current! frame tabs status)))
+
 (defn new-file! [^JTabbedPane tabs ^JLabel status]
   (add-editor-tab! tabs status "" nil)
   (set-status! status "new file"))
@@ -705,7 +802,7 @@
     item))
 
 (def about-text
-  "MeScript v0.34\nJune 9, 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
+  "MeScript v0.35\nJune 10, 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
 
 (defn show-about! [^JFrame frame]
   (JOptionPane/showMessageDialog frame about-text "About MeScript" JOptionPane/INFORMATION_MESSAGE))
@@ -1573,7 +1670,9 @@
                 (menu-item "Open..."
                            #(when-let [file (choose-file frame "Open")]
                               (open-file-in-tab! tabs status file))))
-          (.add file-menu (menu-item "Save" #(save-current! frame tabs status)))
+          (.add file-menu
+                (doto (menu-item "Save" #(save-current! frame tabs status))
+                  (.setAccelerator save-current-keystroke)))
           (.add file-menu (menu-item "Save As..." #(save-as! frame tabs status)))
           (.add file-menu (menu-item "Save Audio..." #(save-audio! frame tabs status)))
           (.add file-menu
@@ -1628,6 +1727,7 @@
     (.setName status "mescript-status")
     (.putClientProperty (.getRootPane frame) "mescript.editor-tabs" tabs)
     (.putClientProperty (.getRootPane frame) "mescript.status" status)
+    (install-save-shortcut! frame tabs status)
     (.addWindowListener frame
                         (proxy [WindowAdapter] []
                           (windowClosing [_]

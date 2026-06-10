@@ -66,7 +66,7 @@ fn parses_and_evaluates_track() {
 fn workstation_about_text_shows_current_version_date() {
     let source = fs::read_to_string("src/main.clj").unwrap();
     assert!(
-        source.contains("MeScript v0.34\\nJune 9, 2026"),
+        source.contains("MeScript v0.35\\nJune 10, 2026"),
         "about text should show current version/date"
     );
 }
@@ -1228,11 +1228,7 @@ fn drunk_accepts_normalized_and_percent_values() {
 #[test]
 fn drunk_rejects_out_of_range_values() {
     let mut runtime = Runtime::new();
-    let err = eval_program(
-        &mut runtime,
-        "(d :loose :src :click :gate 1 :drunk -0.1)",
-    )
-    .unwrap_err();
+    let err = eval_program(&mut runtime, "(d :loose :src :click :gate 1 :drunk -0.1)").unwrap_err();
     assert!(
         err.contains("drunk must be between 0 and 1, or 0 and 100 percent"),
         "{}",
@@ -1240,11 +1236,7 @@ fn drunk_rejects_out_of_range_values() {
     );
 
     let mut runtime = Runtime::new();
-    let err = eval_program(
-        &mut runtime,
-        "(d :loose :src :click :gate 1 :drunk 101)",
-    )
-    .unwrap_err();
+    let err = eval_program(&mut runtime, "(d :loose :src :click :gate 1 :drunk 101)").unwrap_err();
     assert!(
         err.contains("drunk must be between 0 and 1, or 0 and 100 percent"),
         "{}",
@@ -2634,9 +2626,9 @@ fn supports_gated_track_effects_per_gate_hit() {
         Some(vec![vec![false, true], vec![false]])
     );
 
-    let first_sub_hit = active_effect_specs(&track.effects, 0, 0);
-    let second_sub_hit = active_effect_specs(&track.effects, 0, 1);
-    let next_step_hit = active_effect_specs(&track.effects, 1, 0);
+    let first_sub_hit = active_effect_specs(&track.effects, 0, 0, 0);
+    let second_sub_hit = active_effect_specs(&track.effects, 0, 1, 0);
+    let next_step_hit = active_effect_specs(&track.effects, 1, 0, 0);
 
     assert_eq!(first_sub_hit.len(), 1);
     assert_eq!(second_sub_hit.len(), 2);
@@ -2666,10 +2658,10 @@ fn supports_gated_adsr_effects() {
     let track = &runtime.tracks["lead"];
     assert_eq!(track.effects.len(), 1);
     assert!(matches!(
-        active_effect_specs(&track.effects, 0, 1)[0],
+        active_effect_specs(&track.effects, 0, 1, 0)[0],
         crate::effects::EffectSpec::Adsr { .. }
     ));
-    assert!(active_effect_specs(&track.effects, 0, 0).is_empty());
+    assert!(active_effect_specs(&track.effects, 0, 0, 0).is_empty());
 }
 
 #[test]
@@ -12356,6 +12348,126 @@ fn effect_parameters_are_validated_per_effect_not_globally() {
          (start!)",
     )
     .unwrap();
+}
+
+#[test]
+fn numeric_effect_parameters_accept_compiled_scalar_expressions() {
+    let compiled = compile_source_for_runtime(
+        "(d :lead
+            :src :sine-synth
+            :note c3
+            :gate 1
+            :fx [(filter :type :lowpass
+                         :cutoff (+ 1000 200)
+                         :res (/ 1 2))
+                 (bitcrush :bits (take 1 (range 8 9)))])
+         (start!)",
+    )
+    .unwrap();
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &compiled).unwrap();
+    let track = &runtime.tracks["lead"];
+
+    match &track.effects[0].spec {
+        crate::effects::EffectSpec::Filter {
+            cutoff, resonance, ..
+        } => {
+            assert_eq!(*cutoff, 1200.0);
+            assert_eq!(*resonance, 0.5);
+        }
+        other => panic!("expected filter effect, got {:?}", other),
+    }
+
+    match &track.effects[1].spec {
+        crate::effects::EffectSpec::Bitcrush { bit_depth, .. } => {
+            assert_eq!(*bit_depth, 8.0);
+        }
+        other => panic!("expected bitcrush effect, got {:?}", other),
+    }
+}
+
+#[test]
+fn numeric_effect_parameters_reject_multi_value_vectors() {
+    let compiled = compile_source_for_runtime(
+        "(d :lead
+            :src :sine-synth
+            :note c3
+            :gate 1
+            :fx [(filter :type :lowpass :cutoff (range 1200 1203))])
+         (start!)",
+    )
+    .unwrap();
+    let mut runtime = Runtime::new();
+    let err = eval_program(&mut runtime, &compiled).unwrap_err();
+    assert!(
+        err.contains(":cutoff expected one number or note, got vector with 3 values"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn track_effect_numeric_params_accept_step_hit_and_gate_patterns() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(d :lead
+            :src :sine-synth
+            :note c3
+            :gate (p [[1 1] 0])
+            :fx [(filter :type :lowpass
+                         :cutoff (p [400 800])
+                         :res (s [0.2 0.4]))
+                 (delay :time 0.1 :mix (g [0.1 0.7]))])
+         (start!)",
+    )
+    .unwrap();
+    let track = &runtime.tracks["lead"];
+
+    match active_effect_specs(&track.effects, 0, 0, 0)[0] {
+        crate::effects::EffectSpec::Filter {
+            cutoff, resonance, ..
+        } => {
+            assert_eq!(cutoff, 400.0);
+            assert_eq!(resonance, 0.2);
+        }
+        ref other => panic!("expected filter, got {:?}", other),
+    }
+
+    match active_effect_specs(&track.effects, 1, 0, 1)[0] {
+        crate::effects::EffectSpec::Filter {
+            cutoff, resonance, ..
+        } => {
+            assert_eq!(cutoff, 800.0);
+            assert_eq!(resonance, 0.4);
+        }
+        ref other => panic!("expected filter, got {:?}", other),
+    }
+
+    match active_effect_specs(&track.effects, 0, 1, 0)[1] {
+        crate::effects::EffectSpec::Delay { mix, .. } => assert_eq!(mix, 0.7),
+        ref other => panic!("expected delay, got {:?}", other),
+    }
+}
+
+#[test]
+fn track_effect_numeric_param_patterns_validate_every_value() {
+    let mut runtime = Runtime::new();
+    let err = eval_program(
+        &mut runtime,
+        "(d :lead
+            :src :sine-synth
+            :note c3
+            :gate 1
+            :fx [(filter :type :lowpass :cutoff 800 :res (p [0.2 3]))])
+         (start!)",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("filter :res resonance must be between 0 and 1, got 3"),
+        "{}",
+        err
+    );
 }
 
 #[test]
