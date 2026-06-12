@@ -1,0 +1,34 @@
+(include "gates.gl")
+
+(def kick-drum
+  (d :kick-808
+   :src :kick-808
+   :note (s [c1 e1 f1])
+   :dur 0.5
+   :amp 0.5
+   :drunk 100
+   :gate kick-drum-gate))
+   
+(def hats-1
+  (d :hat-909
+  :src :hat-909
+  :note c8
+  :drunk 100 
+  :dur 0.4
+  :amp 0.5
+  :gate hat-gate-1
+  ))
+
+(def snare-1
+  (d :snare-78
+   :src :snare-78
+   :note (s [c1 e1 f1])
+   :dur 0.5
+   :amp 0.5
+   :drunk 100
+   :gate snare-gate-1))
+
+
+
+
+

@@ -1,0 +1,16 @@
+(def kick-drum-gate
+  (p [0 1 0 1]))
+  
+(def hat-gate-1
+  (p (then
+    (times 3[1 1 1 1 0])
+    (times 4[1 1 [1 1 1] 1 1])
+    (times 1[1 0 0 1 1])
+    (times 3[1 1 0 1 1]))))
+    
+(def snare-gate-1
+  (p (then
+    (times 3[0 0 0 1 0])
+    (times 4[1 0 0 0 0])
+    (times 5[0 1 0 1 0]))))
+  
