@@ -1,0 +1,20 @@
+(def kick-gate-1
+    (by-scene
+      :intro (p [0 0 0 1])
+      :drop  (p [1 0 0 1])
+      :sum1  (p [0 0 0 1 0 0 0 1 0 0 0 1])))
+  
+(def hat-gate-1
+  (p (then
+    (times 4[0 1 0 1 0 1 0 1])
+    (times 4[0 1 0 1 0 1 0 1]))))
+    
+(def crash-gate-1
+  (p (then
+    (times 3[0 0 0 0])
+    (times 1[0 0 0 1]))))
+    
+(def snare-gate-1
+  (p (then
+    (times 3[0 0 0 0])
+    (times 1[0 0 0 0 0 0 0 1]))))

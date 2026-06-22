@@ -1,0 +1,28 @@
+(bpm 94)
+(include "gates.gl")
+(include "instruments.gl")
+
+(scene :intro :repeat 1 :steps-of :snare-1 :next :drop
+  kick-1
+  hat-1
+  crash-1
+  snare-1
+  )
+
+(scene :drop :repeat 1 :next :sum1
+  kick-1
+  hat-1
+  crash-1
+  )
+  
+(scene :sum1 :repeat 1 :next :intro
+  kick-1
+  hat-1
+  crash-1
+  snare-1
+  )
+  
+(play-scene :intro)
+
+
+

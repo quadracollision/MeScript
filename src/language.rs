@@ -1501,12 +1501,144 @@ fn waveform(expr: &Expr) -> Result<Waveform, String> {
 
 fn effect_chain(expr: &Expr) -> Result<Vec<TrackEffect>, String> {
     match expr {
-        Expr::Vector(items) => items.iter().filter_map(track_effect).collect(),
+        Expr::Vector(items) => {
+            let mut effects = Vec::new();
+            for item in items {
+                effects.extend(track_effects(item)?);
+            }
+            Ok(effects)
+        }
         Expr::List(_) => match track_effect(expr) {
             Some(effect) => Ok(vec![effect?]),
             None => Ok(Vec::new()),
         },
         _ => Err("fx must be a vector of effect forms".to_string()),
+    }
+}
+
+fn track_effects(expr: &Expr) -> Result<Vec<TrackEffect>, String> {
+    if effect_pattern_form(expr) {
+        return effect_pattern_chain(expr);
+    }
+    match track_effect(expr) {
+        Some(effect) => effect.map(|effect| vec![effect]),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn effect_pattern_form(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::List(items)
+            if matches!(
+                items.first(),
+                Some(Expr::Symbol(name))
+                    if numeric_pattern_form(name) || matches!(name.as_str(), "then" | "times" | "rev" | "reverse")
+            )
+    )
+}
+
+fn effect_pattern_chain(expr: &Expr) -> Result<Vec<TrackEffect>, String> {
+    let slots = effect_pattern_slots(expr, "fx")?;
+    let pattern_len = slots.len();
+    let mut effects = Vec::new();
+    for (index, slot) in slots.into_iter().enumerate() {
+        let mut effect = match track_effect(&slot) {
+            Some(effect) => effect?,
+            None => continue,
+        };
+        effect.gate_subdivisions = Some(effect_pattern_slot_gates(
+            pattern_len,
+            index,
+            effect.gate_subdivisions.take(),
+        ));
+        effects.push(effect);
+    }
+    Ok(effects)
+}
+
+fn effect_pattern_slot_gates(
+    pattern_len: usize,
+    active_index: usize,
+    inner: Option<Vec<Vec<bool>>>,
+) -> Vec<Vec<bool>> {
+    let mut gates = vec![vec![false]; pattern_len];
+    gates[active_index] = inner
+        .and_then(|inner_gates| inner_gates.first().cloned())
+        .unwrap_or_else(|| vec![true]);
+    gates
+}
+
+fn effect_pattern_slots(expr: &Expr, name: &str) -> Result<Vec<Expr>, String> {
+    match expr {
+        Expr::Vector(values) => Ok(values.clone()),
+        Expr::List(items) => {
+            let Some(Expr::Symbol(form_name)) = items.first() else {
+                if items.len() == 1 {
+                    return effect_pattern_slots(&items[0], name);
+                }
+                return Err(format!("{} requires effect forms", name));
+            };
+            match form_name.as_str() {
+                "times" => {
+                    let count_expr = items.get(1).ok_or("times requires a count")?;
+                    let source = items.get(2).ok_or("times requires a pattern")?;
+                    if items.len() > 3 {
+                        return Err("times expects count and one pattern".to_string());
+                    }
+                    let count = positive_usize_value(count_expr, "times")?;
+                    let pattern = effect_pattern_slots(source, "times")?;
+                    let mut slots = Vec::with_capacity(pattern.len() * count);
+                    for _ in 0..count {
+                        slots.extend(pattern.iter().cloned());
+                    }
+                    Ok(slots)
+                }
+                "then" => {
+                    if items.len() < 3 {
+                        return Err("then expects at least two patterns".to_string());
+                    }
+                    let mut slots = Vec::new();
+                    for stage in items.iter().skip(1) {
+                        slots.extend(effect_pattern_slots(stage, "then")?);
+                    }
+                    Ok(slots)
+                }
+                "rev" | "reverse" => {
+                    if items.len() > 2 {
+                        return Err("reverse expects one pattern".to_string());
+                    }
+                    let source = items.get(1).ok_or("reverse requires a pattern")?;
+                    let mut slots = effect_pattern_slots(source, "reverse")?;
+                    slots.reverse();
+                    Ok(slots)
+                }
+                wrapper if numeric_pattern_form(wrapper) => {
+                    let Some(source) = items.get(1) else {
+                        return Err(format!("{} requires a pattern", wrapper));
+                    };
+                    if items.len() > 2 {
+                        if items
+                            .iter()
+                            .skip(2)
+                            .any(|item| matches!(item, Expr::Symbol(name) if name == "then"))
+                        {
+                            return Err(
+                                format!(
+                                    "{} wraps exactly one pattern; use ({} (then A B)) instead of ({} A then B)",
+                                    wrapper, wrapper, wrapper
+                                )
+                                    .to_string(),
+                            );
+                        }
+                        return Err(format!("{} expects one pattern", wrapper));
+                    }
+                    effect_pattern_slots(source, wrapper)
+                }
+                _ => Ok(vec![expr.clone()]),
+            }
+        }
+        _ => Err(format!("{} requires effect forms", name)),
     }
 }
 

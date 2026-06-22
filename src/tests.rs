@@ -66,7 +66,7 @@ fn parses_and_evaluates_track() {
 fn workstation_about_text_shows_current_version_date() {
     let source = fs::read_to_string("src/main.clj").unwrap();
     assert!(
-        source.contains("MeScript v0.35\\nJune 10, 2026"),
+        source.contains("MeScript v0.36\\n21 June 2026"),
         "about text should show current version/date"
     );
 }
@@ -12448,6 +12448,87 @@ fn track_effect_numeric_params_accept_step_hit_and_gate_patterns() {
         crate::effects::EffectSpec::Delay { mix, .. } => assert_eq!(mix, 0.7),
         ref other => panic!("expected delay, got {:?}", other),
     }
+}
+
+#[test]
+fn track_fx_accepts_p_then_times_effect_patterns() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(d :crash
+            :src :cymbal-crash
+            :note null
+            :dur null
+            :amp null
+            :gate (p [1])
+            :fx [(p (then
+                   (times 1 (delay :time 0.3 :feedback 0.6 :mix 0.4))
+                   (times 2 ((delay :time 0.15 :feedback 0.2 :mix 0.1)))))] )
+         (start!)",
+    )
+    .unwrap();
+
+    let track = &runtime.tracks["crash"];
+    assert_eq!(track.effects.len(), 3);
+
+    match active_effect_specs(&track.effects, 0, 0, 0).as_slice() {
+        [
+            crate::effects::EffectSpec::Delay {
+                time,
+                feedback,
+                mix,
+            },
+        ] => {
+            assert_eq!(*time, 0.3);
+            assert_eq!(*feedback, 0.6);
+            assert_eq!(*mix, 0.4);
+        }
+        other => panic!("expected first delay slot, got {:?}", other),
+    }
+
+    match active_effect_specs(&track.effects, 1, 0, 1).as_slice() {
+        [
+            crate::effects::EffectSpec::Delay {
+                time,
+                feedback,
+                mix,
+            },
+        ] => {
+            assert_eq!(*time, 0.15);
+            assert_eq!(*feedback, 0.2);
+            assert_eq!(*mix, 0.1);
+        }
+        other => panic!("expected second delay slot, got {:?}", other),
+    }
+
+    match active_effect_specs(&track.effects, 2, 0, 2).as_slice() {
+        [crate::effects::EffectSpec::Delay { time, .. }] => assert_eq!(*time, 0.15),
+        other => panic!("expected repeated delay slot, got {:?}", other),
+    }
+}
+
+#[test]
+fn compiled_def_track_fx_accepts_p_then_times_effect_patterns() {
+    let source = "(def crash-1
+      (d :cymbal-crash
+         :src :cymbal-crash
+         :note null
+         :dur null
+         :amp null
+         :gate (p [1])
+         :fx [(p (then
+                (times 1 (delay :time 0.3 :feedback 0.6 :mix 0.4))
+                (times 2 ((delay :time 0.15 :feedback 0.2 :mix 0.1)))))]))
+      crash-1
+      (start!)";
+    let compiled = compile_source_for_runtime(source).unwrap();
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &compiled).unwrap();
+
+    let track = &runtime.tracks["cymbal-crash"];
+    assert_eq!(track.effects.len(), 3);
+    assert_eq!(active_effect_specs(&track.effects, 0, 0, 0).len(), 1);
+    assert_eq!(active_effect_specs(&track.effects, 1, 0, 1).len(), 1);
 }
 
 #[test]

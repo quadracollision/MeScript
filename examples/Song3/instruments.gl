@@ -1,0 +1,55 @@
+
+(def kick-1
+  (d :kick
+   :src :kick-synth
+   :note (p [c1])
+   :dur null
+   :amp null
+   :gain null
+   :unison null
+   :unison-detune null
+   :unison-spread null
+   :gate kick-gate-1
+))
+
+(def hat-1
+  (d :hat-808
+   :src :hat-808
+   :note (p [c8])
+   :dur null
+   :amp null
+   :gain null
+   :unison null
+   :unison-detune null
+   :unison-spread null
+   :gate hat-gate-1
+))
+
+(def crash-1
+  (d :cymbal-crash
+     :src :cymbal-crash
+     :note c9
+     :dur null
+     :amp null
+     :gain null
+     :unison null
+     :unison-detune null
+     :unison-spread null
+     :gate crash-gate-1
+     :fx [
+       (p (then
+         (times 1(delay :time 0.3 :feedback 0.6 :mix 0.4))
+         (times 2((delay :time 0.1 :feedback 0.6 :mix 0.4)))))]))
+         
+(def snare-1
+  (d :snare-808
+   :src :snare
+   :note (p [c4 c2])
+   :dur 1
+   :amp null
+   :gain null
+   :unison null
+   :unison-detune null
+   :unison-spread null
+   :gate snare-gate-1
+))

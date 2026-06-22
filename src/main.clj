@@ -802,7 +802,7 @@
     item))
 
 (def about-text
-  "MeScript v0.35\nJune 10, 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
+  "MeScript v0.36\n21 June 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
 
 (defn show-about! [^JFrame frame]
   (JOptionPane/showMessageDialog frame about-text "About MeScript" JOptionPane/INFORMATION_MESSAGE))
