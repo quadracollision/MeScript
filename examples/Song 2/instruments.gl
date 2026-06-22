@@ -1,0 +1,66 @@
+
+(def kick-1
+  (d :kick
+   :src :kick-synth
+   :note (p [c1])
+   :dur null
+   :amp null
+   :gain null
+   :unison null
+   :unison-detune null
+   :unison-spread null
+   :gate kick-gate-1
+))
+
+(def hat-1
+  (d :hat-1
+   :src :hat-78
+   :note (p [c8])
+   :dur (p [0.3 0.5 0.1 0.1 3.4])
+   :amp 0.4
+   :gain null
+   :unison null
+   :unison-detune null
+   :unison-spread null
+   :gate hat-gate-1
+))
+
+(def snare-1
+  (d :snare-1
+   :src :snare-707
+   :note (p [c4])
+   :dur null
+   :amp 0.42
+   :gain null
+   :unison null
+   :unison-detune null
+   :unison-spread null
+   :gate snare-gate-1
+))
+
+(def breath-1
+  (d :breath-1
+   :src :morph
+   :note (p
+     (then
+       (times 6[[a3 c4]])
+       (times 6[[c4 e4]])))
+   :dur null
+   :amp (p [0.02 0.01 0.01 0.02 0.01])
+   :gain null
+   :unison null
+   :unison-detune null
+   :unison-spread null
+   :gate breath-gate-1))
+   
+(def breath-2
+  (d :breath-2
+   :src :morph
+   :note (p [[c3 e5]])
+   :dur null
+   :amp (p [0.02 0.01 0.01 0.02 0.01])
+   :gain null
+   :unison null
+   :unison-detune null
+   :unison-spread null
+   :gate breath-gate-2))
