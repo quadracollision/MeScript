@@ -240,6 +240,32 @@
 
 (def compiler-forms
   [["(def name value)" "Bind reusable code." "(def lead (d :lead :src :sine-synth))"]
+   ["(with TRACK :param value ...)" "Reuse a track def or track form with scene-local parameter overrides." "(def kick-gate-a (p [1 0 0 0]))
+(def kick-gate-b
+  (p (then
+       (times 2 [1 0 0 0])
+       [1 1 0 1])))
+(def kick-1
+  (d :kick
+     :src :kick-synth
+     :note c2
+     :gate kick-gate-a))
+(scene :drop :repeat 1
+  (with kick-1 :gate kick-gate-b :amp 0.8))
+(play-scene :drop)"]
+   ["(section ...)" "Inside a scene, chain timed sections that each compile to an ordinary scene." "(def kick-gate-a (p [1 0 0 0]))
+(def kick-gate-b (p [1 1 0 1]))
+(def kick-1
+  (d :kick
+     :src :kick-synth
+     :note c2
+     :gate kick-gate-a))
+(scene :drop
+  (section :repeat 4
+    (with kick-1 :gate kick-gate-a))
+  (section :loop true
+    (with kick-1 :gate kick-gate-b :amp 0.8)))
+(play-scene :drop)"]
    ["(tracks ...)" "Group track forms." "(tracks (d :a :src :sine-synth :gate 1) (d :b :src :square-synth :gate 1))"]
    ["(by-scene ...)" "Choose value by scene." "(by-scene :intro c3 :else c4)"]
    ["(+ ...)" "Add numbers or transpose notes." "(+ c3 7)"]

@@ -40,6 +40,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 
+fn clojure_headless_command() -> Command {
+    let mut command = Command::new("clojure");
+    command.env("JAVA_TOOL_OPTIONS", "-Djava.awt.headless=true");
+    command
+}
+
 fn sum_abs_samples(engine: &mut AudioEngine, samples: usize) -> f32 {
     let mut sum = 0.0;
     for _ in 0..samples {
@@ -66,7 +72,7 @@ fn parses_and_evaluates_track() {
 fn workstation_about_text_shows_current_version_date() {
     let source = fs::read_to_string("src/main.clj").unwrap();
     assert!(
-        source.contains("MeScript v0.36\\n21 June 2026"),
+        source.contains("MeScript v0.37\\n22 June 2026"),
         "about text should show current version/date"
     );
 }
@@ -959,6 +965,138 @@ fn compiler_def_track_option_splices_allow_inline_track_id_and_gate_defs() {
     assert!(track.notes[0] < track.notes[1]);
     assert_eq!(track.oscillator.pulse_width, 0.25);
     assert_eq!(track.amp, 0.4);
+}
+
+#[test]
+fn compiler_with_overrides_reusable_track_params_in_scene() {
+    let source = "(def kick-gate-a
+                    (p [1 0 0 0]))
+                  (def kick-gate-b
+                    (p (then
+                         (times 2 [1 0 0 0])
+                         [1 1 0 1])))
+                  (def kick-1
+                    (d :kick
+                       :src :kick-synth
+                       :note c2
+                       :gate kick-gate-a
+                       :amp 0.4))
+                  (scene :drop :repeat 1
+                    (with kick-1
+                      :gate kick-gate-b
+                      :amp 0.8))
+                  (play-scene :drop)";
+    assert!(source_needs_compiler(source));
+    let compiled = compile_source_for_runtime(source).unwrap();
+    assert!(compiled.contains("(d :kick"), "{}", compiled);
+    assert!(!compiled.contains("(with"), "{}", compiled);
+
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &compiled).unwrap();
+    let track = &runtime.scenes["drop"].tracks["kick"];
+    assert_eq!(
+        track.gates,
+        vec![
+            true, false, false, false, true, false, false, false, true, true, false, true
+        ]
+    );
+    assert_eq!(track.amp, 0.8);
+}
+
+#[test]
+fn compiler_with_accepts_direct_track_form_and_pattern_overrides() {
+    let source = "(scene :a :repeat 1
+                    (with (d :lead :src :sine-synth :note c3 :gate 1 :dur 0.1)
+                      :note (p [c3 e3])
+                      :dur (p [0.1 0.2])
+                      :gate (p [1 0])))
+                  (play-scene :a)";
+    let compiled = compile_source_for_runtime(source).unwrap();
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &compiled).unwrap();
+
+    let track = &runtime.scenes["a"].tracks["lead"];
+    assert_eq!(track.note_chords.len(), 2);
+    assert_eq!(track.param_patterns.dur_seconds, Some(vec![0.1, 0.2]));
+    assert_eq!(track.gates, vec![true, false]);
+}
+
+#[test]
+fn compiler_with_replaces_scene_sensitive_base_param_before_resolving_it() {
+    let source = "(def kick-1
+                    (d :kick
+                       :src :kick-synth
+                       :note c2
+                       :gate (by-scene
+                               :intro (p [1 0 0 0]))))
+                  (scene :drop :repeat 1
+                    (with kick-1 :gate (p [0 1])))
+                  (play-scene :drop)";
+    let compiled = compile_source_for_runtime(source).unwrap();
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &compiled).unwrap();
+
+    assert_eq!(
+        runtime.scenes["drop"].tracks["kick"].gates,
+        vec![false, true]
+    );
+}
+
+#[test]
+fn compiler_section_expands_scene_into_chained_scene_parts() {
+    let source = "(def kick-gate-a (p [1 0 0 0]))
+                  (def kick-gate-b (p [1 1 0 1]))
+                  (def kick-1
+                    (d :kick
+                       :src :kick-synth
+                       :note c2
+                       :gate kick-gate-a
+                       :amp 0.4))
+                  (scene :drop
+                    (section :repeat 4
+                      (with kick-1 :gate kick-gate-a))
+                    (section :loop true
+                      (with kick-1 :gate kick-gate-b :amp 0.8)))
+                  (play-scene :drop)";
+    assert!(source_needs_compiler(source));
+    let compiled = compile_source_for_runtime(source).unwrap();
+    assert!(!compiled.contains("(section"), "{}", compiled);
+    assert!(!compiled.contains("(with"), "{}", compiled);
+
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &compiled).unwrap();
+
+    let first = &runtime.scenes["drop"];
+    assert_eq!(first.repeats, 4);
+    assert_eq!(first.next.as_deref(), Some("drop__section_2"));
+    assert_eq!(first.tracks["kick"].gates, vec![true, false, false, false]);
+
+    let second = &runtime.scenes["drop__section_2"];
+    assert_eq!(second.repeats, 0);
+    assert_eq!(second.tracks["kick"].gates, vec![true, true, false, true]);
+    assert_eq!(second.tracks["kick"].amp, 0.8);
+}
+
+#[test]
+fn compiler_section_applies_outer_next_to_final_section() {
+    let source = "(def click (d :click :src :click :gate 1))
+                  (scene :drop :next :outro
+                    (section :repeat 1 click)
+                    (section :repeat 2 click))
+                  (scene :outro :loop true click)
+                  (play-scene :drop)";
+    let compiled = compile_source_for_runtime(source).unwrap();
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &compiled).unwrap();
+
+    assert_eq!(
+        runtime.scenes["drop"].next.as_deref(),
+        Some("drop__section_2")
+    );
+    assert_eq!(
+        runtime.scenes["drop__section_2"].next.as_deref(),
+        Some("outro")
+    );
 }
 
 #[test]
@@ -5345,8 +5483,7 @@ fn swing_render_preview_inference_uses_top_level_forms_only() {
         (println (clojure.string/includes? recued-map "(play-scene :data)"))
         (println (not (clojure.string/includes? recued-map "(play-scene :old)"))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5385,8 +5522,7 @@ fn swing_loop_inference_counts_sample_tracks_like_tracks() {
         (println (= 4 (glitchlisp.swing.render/inferred-loop-steps scene)))
         (println (= 6 (glitchlisp.swing.render/inferred-loop-steps every))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5422,8 +5558,7 @@ fn swing_loop_inference_follows_finite_scene_chains() {
         (println (clojure.string/includes? looped "(scene :drop :steps 5 :repeat 1 :next :intro"))
         (println (= 10 (glitchlisp.swing.render/inferred-loop-steps cyclic))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5461,8 +5596,7 @@ fn swing_loop_inference_rejects_missing_next_scene_like_runtime() {
         (catch Exception ex
           (println (.getMessage ex))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5495,8 +5629,7 @@ fn swing_loop_inference_rejects_zero_count_times_like_runtime() {
         (catch Exception ex
           (println (.getMessage ex))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5537,8 +5670,7 @@ fn swing_loop_inference_rejects_invalid_gate_holds_like_runtime() {
         (println (= 4 (glitchlisp.swing.render/inferred-loop-steps
                        "(d :lead :src :click :gate (p [1 0 1_3 0]))\n(start!)"))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5577,8 +5709,7 @@ fn swing_loop_inference_rejects_non_numeric_gate_cells_like_runtime() {
         (check "(d :lead :src :click :gate (p [:bad]))\n(start!)")
         (check "(d :lead :src :click :gate (p [(unknown 1)]))\n(start!)"))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5622,8 +5753,7 @@ fn swing_loop_inference_rejects_invalid_note_cells_like_runtime() {
         (check "(d :lead :src :click :note (p [[c3 :bad]]) :gate 1)\n(start!)"
                "expected number or note"))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5659,8 +5789,7 @@ fn swing_loop_inference_rejects_zero_every_like_runtime() {
         (catch Exception ex
           (println (.getMessage ex))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5693,8 +5822,7 @@ fn swing_loop_inference_rejects_fractional_every_like_runtime() {
         (catch Exception ex
           (println (.getMessage ex))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5735,8 +5863,7 @@ fn swing_loop_inference_rejects_invalid_euclid_gates_like_runtime() {
         (check "(d :lead :src :click :gate (euclid-rot 4 16 -1))\n(start!)"
                "euclid-rot rotation must be a non-negative integer"))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5784,8 +5911,7 @@ fn swing_loop_inference_rejects_pattern_wrapper_arity_like_runtime() {
         (check "(d :lead :src :click :gate (then [1 0]))\n(start!)"
                "then expects at least two patterns"))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5829,8 +5955,7 @@ fn swing_loop_inference_rejects_malformed_track_params_like_runtime() {
           (catch Exception ex
             (println (= expected (.getMessage ex))))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5880,8 +6005,7 @@ fn swing_loop_inference_rejects_invalid_offset_like_runtime() {
           (catch Exception _
             (println "missing-error"))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5935,8 +6059,7 @@ fn swing_loop_inference_rejects_invalid_detune_and_phase_like_runtime() {
           (catch Exception _
             (println "missing-error"))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -5981,8 +6104,7 @@ fn swing_loop_inference_rejects_invalid_sources_like_runtime() {
           (catch Exception _
             (println "missing-error"))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6033,8 +6155,7 @@ fn swing_loop_inference_rejects_invalid_harmonics_like_runtime() {
           (catch Exception _
             (println "missing-error"))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6084,8 +6205,7 @@ fn swing_loop_inference_rejects_malformed_fx_values_like_runtime() {
           (catch Exception _
             (println "missing-error"))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6141,8 +6261,7 @@ fn swing_loop_inference_rejects_out_of_range_amp_and_dur_like_runtime() {
           (catch Exception _
             (println "missing-error"))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6204,8 +6323,7 @@ fn swing_loop_inference_rejects_out_of_range_oscillator_params_like_runtime() {
           (catch Exception _
             (println "missing-error"))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6263,8 +6381,7 @@ fn swing_loop_inference_rejects_invalid_unison_like_runtime() {
           (catch Exception _
             (println "missing-error"))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6336,8 +6453,7 @@ fn swing_loop_inference_rejects_malformed_sample_headers_like_runtime() {
                        "(sample :hit :sample-data [c3] :gate 1)\n(start!)")))
       )
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6376,8 +6492,7 @@ fn swing_loop_inference_rejects_zero_scene_steps_like_runtime() {
         (catch Exception ex
           (println (.getMessage ex))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6412,8 +6527,7 @@ fn swing_loop_inference_rejects_empty_scene_without_steps_like_runtime() {
       (println (= 8 (glitchlisp.swing.render/inferred-loop-steps
                      "(scene :intro :steps 8 :repeat 1)\n(play-scene :intro)")))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6451,8 +6565,7 @@ fn swing_loop_inference_rejects_loop_false_like_runtime() {
         (catch Exception ex
           (println (.getMessage ex))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6485,8 +6598,7 @@ fn swing_loop_inference_rejects_unknown_steps_of_track_like_runtime() {
         (catch Exception ex
           (println (.getMessage ex))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6519,8 +6631,7 @@ fn swing_loop_inference_rejects_duplicate_scene_options_like_runtime() {
         (catch Exception ex
           (println (.getMessage ex))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6553,8 +6664,7 @@ fn swing_loop_inference_rejects_unknown_scene_options_like_runtime() {
         (catch Exception ex
           (println (.getMessage ex))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6595,8 +6705,7 @@ fn swing_loop_inference_rejects_bad_scene_option_values_like_runtime() {
         (check "(scene :intro :steps-of 123\n  (d :kick :src :click :gate 1))\n(play-scene :intro)"
                "scene :steps-of requires a keyword argument"))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6644,8 +6753,7 @@ fn swing_loop_inference_supports_custom_scene_bar_steps() {
         (catch Exception ex
           (println (.getMessage ex))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6701,8 +6809,7 @@ fn swing_loop_inference_supports_scene_loop_by() {
         (catch Exception ex
           (println (.getMessage ex))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6747,8 +6854,7 @@ fn swing_loop_inference_rejects_invalid_repeat_counts_like_runtime() {
         (check "(scene :intro :repeat :twice\n  (d :kick :src :click :gate 1))\n(play-scene :intro)"
                "repeat must be numeric"))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -6783,8 +6889,7 @@ fn swing_loop_seconds_uses_top_level_runtime_bpm() {
         (println (= 120.0 (glitchlisp.swing.render/bpm-from-source repeated)))
         (println (= 1.0 (glitchlisp.swing.render/seconds-for-steps repeated 8))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -7928,8 +8033,7 @@ fn swing_auto_indent_handles_enter_before_first_form() {
         (doseq [caret carets]
           (run-case label text caret)))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -7985,8 +8089,7 @@ fn swing_editor_treats_sample_as_track_for_indent_helpers() {
         (println (some? align))
         (println (clojure.string/starts-with? (:text align) "(sample :hit")))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8029,8 +8132,7 @@ fn live_highlight_ignores_def_names_inside_scene_comments_and_strings() {
         (println (count ranges))
         (println (count active)))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8072,8 +8174,7 @@ fn live_scene_membership_context_precomputes_symbol_set() {
         (println (contains? (:symbols context) "unused"))
         (println (contains? (:symbols context) "fake")))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8122,8 +8223,7 @@ fn swing_scene_range_helpers_ignore_comments_and_strings() {
         (println (count scene-ranges))
         (println (count active)))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8186,8 +8286,7 @@ fn live_scene_highlight_uses_full_multiline_scene_range() {
         (println scene-end)
         (println (pr-str (.getClientProperty pane glitchlisp.swing.editor/live-scene-highlight-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8249,8 +8348,7 @@ fn live_scene_highlight_caches_line_segments_until_document_changes() {
         (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-scene-highlight-segments-key)))
         (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-scene-segments-cache-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8300,8 +8398,7 @@ fn live_scene_segment_bounds_include_last_character() {
           (println (>= (+ (.x scene-bounds) (.width scene-bounds)) header-right))
           (println (>= (+ (.x body-bounds) (.width body-bounds)) body-right))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8341,8 +8438,7 @@ fn live_overlay_clip_helper_skips_non_intersecting_regions() {
                    (java.awt.Rectangle. 20 20 4 4)))
         (.dispose graphics))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8382,8 +8478,7 @@ fn swing_gate_highlight_ignores_commented_and_string_gates() {
         (println (:gate-idx entry))
         (println (count (:cells entry))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8425,8 +8520,7 @@ fn live_highlight_clear_removes_scene_only_overlay() {
         (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-scene-highlight-key)))
         (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8465,8 +8559,7 @@ fn source_error_reporting_updates_status_even_without_offset() {
         (println (.getText status))
         (println (some? (.getClientProperty pane glitchlisp.swing.editor/error-highlight-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8511,8 +8604,7 @@ fn source_error_reporting_resolves_nested_note_vector_runtime_errors() {
         (println (subs source (:offset data) (:end-offset data)))
         (println (some? (.getClientProperty pane glitchlisp.swing.editor/error-highlight-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8551,8 +8643,7 @@ fn live_err_lines_highlight_resolved_source_error() {
         (println (.getText status))
         (println (some? (.getClientProperty pane glitchlisp.swing.editor/error-highlight-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8591,8 +8682,7 @@ fn render_session_file_does_not_become_current_save_target() {
         (println (= real-file (glitchlisp.swing.render/current-file-or-session!)))
         (println (= real-file (:file @glitchlisp.swing.shared/state))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8629,8 +8719,7 @@ fn live_status_lines_show_active_scene_name() {
                       :live-highlight-step 17})]
         (println line))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8672,8 +8761,7 @@ fn live_status_lines_hide_stale_scene_when_stopped() {
                       :live-highlight-step 99})]
         (println line))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8727,8 +8815,7 @@ fn swing_live_update_reports_unclosed_forms_before_playback_inference() {
         (println (.getText status))
         (shutdown-agents))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8765,8 +8852,7 @@ fn swing_live_ok_lines_parse_scene_cycle() {
         (println (:live-cycle @glitchlisp.swing.shared/state))
         (println (.getText status)))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8811,8 +8897,7 @@ fn swing_live_step_lines_parse_without_regex_path() {
                     "STEP 1 :drop extra"]]
         (println (pr-str (glitchlisp.swing.live/parse-step-line line))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8866,8 +8951,7 @@ fn swing_live_step_scene_change_clears_stale_cycle() {
         (println (some? (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-key)))
         (println (some? (.getClientProperty pane glitchlisp.swing.editor/live-scene-highlight-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8903,8 +8987,7 @@ fn swing_live_reader_step_state_matches_handler() {
       (println (:live-highlight-scene @glitchlisp.swing.shared/state))
       (println (:live-cycle @glitchlisp.swing.shared/state))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8945,8 +9028,7 @@ fn remove_playback_highlighting_preference_disables_live_step_overlay() {
         (javax.swing.SwingUtilities/invokeAndWait (fn [] nil))
         (println (some? (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -8986,8 +9068,7 @@ fn close_live_process_clears_cycle_state() {
       (println (nil? (:live-highlight-scene @glitchlisp.swing.shared/state)))
       (println (nil? (:live-cycle @glitchlisp.swing.shared/state))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9038,8 +9119,7 @@ fn ended_live_process_cleanup_clears_editor_overlay() {
         (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-key)))
         (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-scene-highlight-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9077,8 +9157,7 @@ fn live_step_highlight_queue_paints_on_next_edt_pass() {
         (println (some? (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-key)))
         (println (some? (.getClientProperty pane glitchlisp.swing.editor/live-scene-highlight-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9124,8 +9203,7 @@ fn live_cursor_profile_records_queue_and_highlight_timings_when_enabled() {
           (println (pos? (get-in stats [:highlight :n] 0)))))
       (System/clearProperty glitchlisp.swing.editor/live-cursor-profile-property)
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9169,8 +9247,7 @@ fn live_step_highlight_reuses_cached_text_between_document_edits() {
         (println (= (.getClientProperty pane glitchlisp.swing.editor/live-gate-ranges-text-key)
                     (.getText pane))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9215,8 +9292,7 @@ fn live_step_highlight_marks_active_note_times_stage() {
         (glitchlisp.swing.editor/highlight-live-step! pane 7 nil)
         (println (some #(clojure.string/starts-with? % "(times 5") (highlighted-forms))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9263,8 +9339,7 @@ fn live_step_highlight_skips_repaint_when_visible_range_is_unchanged() {
         (println @calls)
         (println (pr-str (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9317,8 +9392,7 @@ fn live_step_highlight_paints_dirty_region_immediately() {
         (println (pos? @repaints))
         (println (pos? @paints)))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9366,8 +9440,7 @@ fn live_repaint_pump_keeps_active_overlay_repainting() {
         (println (pos? @repaints))
         (.stop (.getClientProperty pane glitchlisp.swing.editor/live-repaint-pump-key)))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9415,8 +9488,7 @@ fn syntax_refresh_forces_editor_repaint() {
         (println (pos? @repaints))
         (println (pos? @revalidates)))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9518,8 +9590,7 @@ fn live_step_highlight_caches_step_rects_until_range_or_document_changes() {
         (.setText pane source)
         (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-rects-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9565,8 +9636,7 @@ fn live_step_highlight_ignores_caret_focus_and_marks_all_active_tracks() {
         (glitchlisp.swing.editor/highlight-live-step! pane 0 nil)
         (println (= 2 (count (highlighted)))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9610,8 +9680,7 @@ fn live_step_highlight_uses_active_by_scene_branch_for_def_tracks() {
         (glitchlisp.swing.editor/highlight-live-step! pane 4 "drop")
         (println (some #(= "1" %) (highlighted))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9703,8 +9772,7 @@ fn live_step_highlight_reuses_scene_range_until_document_changes() {
         (.setText pane source)
         (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-scene-ranges-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9752,8 +9820,7 @@ fn live_step_highlight_reuses_scene_membership_context_until_document_changes() 
         (.setText pane source)
         (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-scene-contexts-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9805,8 +9872,7 @@ fn live_step_highlight_reuses_active_gate_entries_until_document_changes() {
         (.setText pane source)
         (println (nil? (.getClientProperty pane glitchlisp.swing.editor/live-active-gate-entries-key))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9861,8 +9927,7 @@ fn live_step_highlight_reuses_resolved_ranges_for_repeating_steps() {
           (println (contains? (:values bounded) 0))
           (println (contains? (:values bounded) 299))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9900,8 +9965,7 @@ fn language_reference_next_scene_example_is_copy_safe() {
                                 glitchlisp.swing.docs/scene-options)]
         (println example))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9945,8 +10009,7 @@ fn language_reference_scene_option_examples_start_scenes() {
       (doseq [[name _ example] glitchlisp.swing.docs/scene-options]
         (println (str name "\t" (pr-str example))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -9997,8 +10060,7 @@ fn language_reference_top_level_examples_are_copy_safe() {
       (doseq [[name _ example] glitchlisp.swing.docs/top-level-forms]
         (println (str name "\t" (pr-str example))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -10088,8 +10150,7 @@ fn language_reference_playback_alias_examples_are_copy_safe() {
         (when (#{"(play-block :name)" "(cue :name)"} name)
           (println (str name "\t" (pr-str example)))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -10144,8 +10205,7 @@ fn language_reference_compatibility_alias_examples_show_context() {
       (doseq [[name description example] glitchlisp.swing.docs/compatibility-aliases]
         (println (str name "\t" (pr-str description) "\t" (pr-str example))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -10309,8 +10369,7 @@ fn language_reference_times_example_is_gate_safe() {
                                 glitchlisp.swing.docs/pattern-forms)]
         (println example))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -10362,8 +10421,7 @@ fn language_reference_compiler_examples_compile() {
           (catch Exception ex
             (println (str "ERR\t" name "\t" (.getMessage ex))))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -10431,8 +10489,7 @@ fn language_reference_effect_examples_show_required_context() {
                                         (glitchlisp.swing.docs/effect-rows))]
         (println (str name "\t" (pr-str example))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -10543,8 +10600,7 @@ fn language_reference_effect_rows_show_keyword_choices() {
         (when (#{"filter" "formant" "distort" "haas" "ams-reverb" "la2a" "sem-filter" "obxa-filter"} name)
           (println (str name "\t" desc))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -10585,8 +10641,7 @@ fn language_reference_scale_and_chord_examples_show_note_context() {
                                         (glitchlisp.swing.docs/chord-rows))]
         (println (str name "\t" (pr-str example))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -10700,8 +10755,7 @@ fn language_reference_keeps_aliases_out_of_primary_sections() {
         (println (contains? aliases ":gain_db"))
         (println (contains? aliases ":delay")))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -10734,8 +10788,7 @@ fn language_reference_quick_start_examples_are_runnable() {
         (doseq [[name _ example] glitchlisp.swing.docs/quick-start]
           (println (str name "\t" (pr-str example)))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -10776,8 +10829,7 @@ fn editor_defaults_are_blank_and_aligned() {
         (load-file "src/glitchlisp/swing/catalog.clj")
         (println (pr-str glitchlisp.swing.catalog/default-source)))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -10810,9 +10862,8 @@ fn scene_insert_template_honors_remove_comments_preference() {
       (println "---")
       (println (pr-str (glitchlisp-swing/scene-wrapper "intro" "(d :lead :src :click :gate 1)" false)))
     "#;
-    let output = Command::new("clojure")
+    let output = clojure_headless_command()
         .env("GLITCHLISP_NO_GUI", "1")
-        .arg("-J-Djava.awt.headless=true")
         .arg("-e")
         .arg(script)
         .output()
@@ -10878,9 +10929,8 @@ fn scene_insert_can_wrap_top_level_sample_track() {
         (glitchlisp-swing/insert-selected-form! pane category form "intro")
         (println (.getText pane)))
     "#;
-    let output = Command::new("clojure")
+    let output = clojure_headless_command()
         .env("GLITCHLISP_NO_GUI", "1")
-        .arg("-J-Djava.awt.headless=true")
         .arg("-e")
         .arg(script)
         .output()
@@ -10919,9 +10969,8 @@ fn arithmetic_insert_wrappers_keep_existing_token_parseable() {
           (glitchlisp-swing/insert-math-logic-form! pane "+" "(+ 1 1)")
           (println (str label "\t" (.getText pane)))))
     "#;
-    let output = Command::new("clojure")
+    let output = clojure_headless_command()
         .env("GLITCHLISP_NO_GUI", "1")
-        .arg("-J-Djava.awt.headless=true")
         .arg("-e")
         .arg(script)
         .output()
@@ -11011,9 +11060,8 @@ fn playback_track_snippets_infer_current_track_id() {
         (println (str "top-level-track\tclear-all\t"
                       (pr-str (glitchlisp-swing/insert-form-snippet top-level-track "Playback" "clear-all" "intro" false)))))
     "#;
-    let output = Command::new("clojure")
+    let output = clojure_headless_command()
         .env("GLITCHLISP_NO_GUI", "1")
-        .arg("-J-Djava.awt.headless=true")
         .arg("-e")
         .arg(script)
         .output()
@@ -11090,9 +11138,8 @@ fn blank_playback_state_and_scene_snippets_evaluate() {
           (println (str option "\t"
                         (pr-str (glitchlisp-swing/insert-form-snippet pane "Playback" option "intro" false))))))
     "#;
-    let output = Command::new("clojure")
+    let output = clojure_headless_command()
         .env("GLITCHLISP_NO_GUI", "1")
-        .arg("-J-Djava.awt.headless=true")
         .arg("-e")
         .arg(script)
         .output()
@@ -11206,9 +11253,8 @@ fn fx_insert_outside_track_creates_runnable_track_context() {
         (println "fake-gate")
         (println (.getText fake-gate)))
     "#;
-    let output = Command::new("clojure")
+    let output = clojure_headless_command()
         .env("GLITCHLISP_NO_GUI", "1")
-        .arg("-J-Djava.awt.headless=true")
         .arg("-e")
         .arg(script)
         .output()
@@ -11332,9 +11378,8 @@ fn post_fx_insert_in_blank_editor_creates_runnable_source() {
         (println "nonblank")
         (println (.getText nonblank)))
     "#;
-    let output = Command::new("clojure")
+    let output = clojure_headless_command()
         .env("GLITCHLISP_NO_GUI", "1")
-        .arg("-J-Djava.awt.headless=true")
         .arg("-e")
         .arg(script)
         .output()
@@ -11403,9 +11448,8 @@ fn pattern_insert_in_blank_editor_creates_runnable_gate_track() {
         (println "inline")
         (println (.getText inline)))
     "#;
-    let output = Command::new("clojure")
+    let output = clojure_headless_command()
         .env("GLITCHLISP_NO_GUI", "1")
-        .arg("-J-Djava.awt.headless=true")
         .arg("-e")
         .arg(script)
         .output()
@@ -11475,9 +11519,8 @@ fn oscillator_insert_uses_blank_parameter_form() {
         (println "nonblank")
         (println (.getText nonblank)))
     "#;
-    let output = Command::new("clojure")
+    let output = clojure_headless_command()
         .env("GLITCHLISP_NO_GUI", "1")
-        .arg("-J-Djava.awt.headless=true")
         .arg("-e")
         .arg(script)
         .output()
@@ -11532,9 +11575,8 @@ fn track_insert_ignores_open_scene_text_inside_comments_and_strings() {
           (println label)
           (println (.getText pane))))
     "#;
-    let output = Command::new("clojure")
+    let output = clojure_headless_command()
         .env("GLITCHLISP_NO_GUI", "1")
-        .arg("-J-Djava.awt.headless=true")
         .arg("-e")
         .arg(script)
         .output()
@@ -11587,8 +11629,7 @@ fn unescape_clojure_pr_str(value: &str) -> String {
 
 #[test]
 fn swing_main_load_does_not_launch_ui_in_headless_mode() {
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg("(load-file \"src/main.clj\") (println :loaded)")
         .output()
@@ -11659,8 +11700,7 @@ fn new_file_adds_blank_tab_and_clears_active_file_state() {
         (flush)
         (System/exit 0))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -11698,8 +11738,7 @@ fn editor_tabs_mark_dirty_and_install_close_header() {
         (flush)
         (System/exit 0))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -11738,8 +11777,7 @@ fn editor_tab_rename_sets_save_suggestion() {
         (flush)
         (System/exit 0))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -11829,8 +11867,7 @@ fn custom_tab_header_selection_selects_clicked_tab() {
         (flush)
         (System/exit 0))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -11863,8 +11900,7 @@ fn line_numbers_use_four_digit_minimum_width() {
         (.setText pane "a\nb\nc")
         (println (pr-str (glitchlisp.swing.editor/line-number-text pane))))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -11909,8 +11945,7 @@ fn swing_compile_expands_includes_relative_to_current_file() {
         (.delete (java.io.File. dir "parts"))
         (.delete dir))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()
@@ -11982,9 +12017,8 @@ fn compiler_helper_insert_snippets_stay_compatible() {
                         option "\t"
                         (pr-str (glitchlisp-swing/insert-form-snippet pane category option "intro" false))))))
     "#;
-    let output = Command::new("clojure")
+    let output = clojure_headless_command()
         .env("GLITCHLISP_NO_GUI", "1")
-        .arg("-J-Djava.awt.headless=true")
         .arg("-e")
         .arg(script)
         .output()
@@ -12207,8 +12241,7 @@ fn effect_insert_parameter_comments_match_runtime_ranges() {
                               ["doppler" ":speed"]]]
         (println effect param (glitchlisp.swing.catalog/effect-param-contract effect param)))
     "#;
-    let output = Command::new("clojure")
-        .arg("-J-Djava.awt.headless=true")
+    let output = clojure_headless_command()
         .arg("-e")
         .arg(script)
         .output()

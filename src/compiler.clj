@@ -76,6 +76,12 @@
 (defn def-form? [expr]
   (and (seq? expr) (= 'def (first expr))))
 
+(defn with-form? [expr]
+  (and (seq? expr) (= 'with (first expr))))
+
+(defn section-form? [expr]
+  (and (seq? expr) (= 'section (first expr))))
+
 (defn def-binding [form]
   (let [[_ name & values] form]
     (when (empty? values)
@@ -88,6 +94,81 @@
 
 (def ^:dynamic *captured-defs* nil)
 (def ^:dynamic *scene-context* nil)
+
+(defn track-param-canonical-key [key]
+  (case key
+    (:detune :detune-cents) :detune
+    (:pulse-width :pulse_width :pw) :pulse-width
+    (:morph :morph-pos :morph_pos) :morph
+    (:unison-detune :unison_detune) :unison-detune
+    (:unison-spread :unison_spread :spread) :unison-spread
+    (:fm-ratio :fm_ratio) :fm-ratio
+    (:fm-depth :fm_depth) :fm-depth
+    (:sample :sample-path :sample_path :sample-data :sample_data) :sample
+    key))
+
+(def scene-option-arity
+  {:loop 1
+   :repeat 1
+   :repeats 1
+   :times 1
+   :steps 1
+   :length 1
+   :bars 1
+   :bar-steps 1
+   :bar-length 1
+   :bar-steps-of 1
+   :bar-length-of 1
+   :steps-of 1
+   :length-of 1
+   :loop-by 2
+   :next 1})
+
+(defn split-scene-options [form-name args]
+  (loop [remaining args
+         options []]
+    (if (and (seq remaining) (keyword? (first remaining)))
+      (let [key (first remaining)
+            arity (or (get scene-option-arity key)
+                      (throw (ex-info (str form-name " unknown option " key) {:key key
+                                                                               :args args})))
+            values (take arity (rest remaining))]
+        (when-not (= arity (count values))
+          (throw (ex-info (str form-name " " key " requires "
+                               (if (= 1 arity) "a value" (str arity " values")))
+                          {:key key
+                           :args args})))
+        (recur (drop (inc arity) remaining)
+               (into options (cons key values))))
+      [options remaining])))
+
+(defn scene-option-entries [options]
+  (loop [remaining options
+         entries []]
+    (if (seq remaining)
+      (let [key (first remaining)
+            arity (get scene-option-arity key)
+            values (take arity (rest remaining))]
+        (recur (drop (inc arity) remaining)
+               (conj entries [key values])))
+      entries)))
+
+(defn scene-option-value [options key]
+  (some (fn [[option-key values]]
+          (when (= option-key key)
+            (first values)))
+        (scene-option-entries options)))
+
+(defn option-present? [options key]
+  (boolean (some #(= key (first %)) (scene-option-entries options))))
+
+(defn loop-option? [options]
+  (option-present? options :loop))
+
+(defn section-scene-id [scene-id idx]
+  (if (zero? idx)
+    scene-id
+    (keyword (str (name scene-id) "__section_" (inc idx)))))
 
 (defn by-scene-value [args]
   (when (odd? (count args))
@@ -498,6 +579,119 @@
                    (into output emitted)))))
       output)))
 
+(defn validate-track-param-pairs! [form-name values]
+  (when (odd? (count values))
+    (throw (ex-info (str form-name " expects keyword/value override pairs") {:args values})))
+  (doseq [[key _] (partition 2 values)]
+    (when-not (keyword? key)
+      (throw (ex-info (str form-name " override keys must be keywords") {:key key
+                                                                          :args values})))))
+
+(defn track-param-map [form-name params]
+  (validate-track-param-pairs! form-name params)
+  (loop [remaining params
+         order []
+         values {}]
+    (if (seq remaining)
+      (let [[key value & more] remaining
+            canonical (track-param-canonical-key key)]
+        (when (contains? values canonical)
+          (throw (ex-info (str form-name " has duplicate track parameter " key) {:key key})))
+        (recur more (conj order canonical) (assoc values canonical [key value])))
+      [order values])))
+
+(defn with-target-track [env target-form]
+  (cond
+    (and (symbol? target-form) (contains? env target-form))
+    (with-target-track env (get env target-form))
+
+    (track-form? target-form)
+    target-form
+
+    :else
+    (let [expanded (expand-expr env target-form)]
+      (if (track-form? expanded)
+        expanded
+        (throw (ex-info "with requires a track form or track def" {:target target-form
+                                                                   :expanded expanded}))))))
+
+(defn expand-with-form [env args]
+  (let [target-form (first args)
+        override-forms (rest args)]
+    (when-not target-form
+      (throw (ex-info "with requires a track and keyword/value overrides" {:args args})))
+    (let [track (with-target-track env target-form)]
+      (let [[_ track-id & base-params] track]
+        (when-not (keyword? track-id)
+          (throw (ex-info "with target track id must be a keyword" {:track track})))
+        (let [overrides (expand-list-items env override-forms)
+              [base-order base-values] (track-param-map "with target" base-params)
+              [override-order override-values] (track-param-map "with" overrides)
+              final-order (into base-order
+                                (remove #(contains? base-values %) override-order))
+              final-order (vec (concat (remove #(contains? override-values %) final-order)
+                                       override-order))
+              final-values (merge base-values override-values)]
+          (expand-expr env
+                       (apply list
+                              'd
+                              track-id
+                              (mapcat #(get final-values %) final-order))))))))
+
+(defn expand-sectioned-scene-form [env head args]
+  (let [scene-id (first args)]
+    (when-not (keyword? scene-id)
+      (throw (ex-info "scene requires a keyword name" {:args args})))
+    (let [[outer-options body] (split-scene-options "scene" (rest args))
+          sections (filter section-form? body)]
+      (if (empty? sections)
+        (apply list head (expand-list-items env args))
+        (do
+          (when-not (= (count sections) (count body))
+            (throw (ex-info "sectioned scene cannot mix section forms with direct tracks"
+                            {:scene scene-id
+                             :body body})))
+          (let [outer-next (scene-option-value outer-options :next)
+                unsupported-outer (remove #(= :next %) (map first (scene-option-entries outer-options)))]
+            (when (seq unsupported-outer)
+              (throw (ex-info "sectioned scene only supports outer :next; put repeat/loop/steps on sections"
+                              {:scene scene-id
+                               :options unsupported-outer})))
+            (apply list
+                   'tracks
+                   (map-indexed
+                     (fn [idx section]
+                       (let [[_ & section-args] section
+                             [section-options section-body] (split-scene-options "section" section-args)
+                             section-id (section-scene-id scene-id idx)
+                             next-id (when (< idx (dec (count sections)))
+                                       (section-scene-id scene-id (inc idx)))
+                             last-section? (= idx (dec (count sections)))
+                             explicit-next? (option-present? section-options :next)]
+                         (when (and next-id explicit-next?)
+                           (throw (ex-info "non-final section cannot set :next; sections chain automatically"
+                                           {:scene scene-id
+                                            :section idx})))
+                         (when (and next-id (loop-option? section-options))
+                           (throw (ex-info "non-final section cannot loop forever"
+                                           {:scene scene-id
+                                            :section idx})))
+                         (let [section-options (cond
+                                                 next-id
+                                                 (concat section-options [:next next-id])
+
+                                                 (and last-section? outer-next (not explicit-next?))
+                                                 (concat section-options [:next outer-next])
+
+                                                 :else
+                                                 section-options)]
+                           (apply list
+                                  head
+                                  section-id
+                                  (concat (expand-list-items env section-options)
+                                          (expand-list-items env section-body))))))
+                     sections))))))))
+
 (defn expand-p-form [env args]
   (if (= :repeat (first args))
     (do
@@ -706,6 +900,10 @@
                       (throw (ex-info "transpose expects value and semitones" {:args @expanded-args})))
                     (transpose-value value semitones))
         map (expand-map-form env args)
+        with (expand-with-form env args)
+        scene (expand-sectioned-scene-form env head args)
+        block (expand-sectioned-scene-form env head args)
+        section (throw (ex-info "section is only valid inside scene" {:args args}))
         p (expand-p-form env args)
         times (expand-times-form env args)
         then (expand-then-form env args)

@@ -159,6 +159,8 @@ fn expr_needs_compiler(expr: &Expr) -> bool {
                 head,
                 "def"
                     | "tracks"
+                    | "with"
+                    | "section"
                     | "by-scene"
                     | "+"
                     | "-"
@@ -245,6 +247,12 @@ pub(crate) fn expand_source_includes(
     source: &str,
     source_path: Option<&Path>,
 ) -> Result<String, String> {
+    if !source
+        .lines()
+        .any(|line| include_path_from_line(line).is_some())
+    {
+        return Ok(source.to_string());
+    }
     let base_dir = source_path
         .and_then(Path::parent)
         .unwrap_or_else(|| Path::new("."));

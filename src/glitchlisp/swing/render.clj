@@ -29,6 +29,8 @@
   (slurp (.getPath file)))
 
 (defn write-file! [^File file text]
+  (when-let [parent (.getParentFile file)]
+    (.mkdirs parent))
   (spit (.getPath file) text))
 
 (declare current-file-or-session!)

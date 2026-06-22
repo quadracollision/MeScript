@@ -634,15 +634,28 @@
 (defn rename-tab! [^JFrame frame ^JTabbedPane tabs ^JTextComponent editor]
   (start-inline-tab-rename! tabs editor))
 
+(defn save-editor-to-file! [^JFrame frame ^JTabbedPane tabs ^JTextComponent editor ^JLabel status ^File file]
+  (try
+    (write-file! file (.getText editor))
+    (set-editor-file! editor file)
+    (set-editor-dirty! editor false)
+    (refresh-tab-title! tabs editor)
+    (set-status! status (str "saved " (.getPath file)))
+    true
+    (catch Exception ex
+      (set-status! status (str "save failed: " (.getMessage ex)))
+      (when frame
+        (JOptionPane/showMessageDialog
+          frame
+          (str "Could not save " (.getPath file) "\n\n" (.getMessage ex))
+          "Save Failed"
+          JOptionPane/ERROR_MESSAGE))
+      false)))
+
 (defn save-editor! [^JFrame frame ^JTabbedPane tabs ^JTextComponent editor ^JLabel status]
   (let [file (or (editor-file editor) (choose-file-for-editor frame "Save" editor))]
     (when file
-      (write-file! file (.getText editor))
-      (set-editor-file! editor file)
-      (set-editor-dirty! editor false)
-      (refresh-tab-title! tabs editor)
-      (set-status! status (str "saved " (.getPath file)))
-      true)))
+      (save-editor-to-file! frame tabs editor status file))))
 
 (defn prompt-save-tab! [^JFrame frame ^JTabbedPane tabs ^JTextComponent editor ^JLabel status]
   (if-not (editor-dirty? editor)
@@ -734,11 +747,7 @@
 (defn save-as! [^JFrame frame ^JTabbedPane tabs ^JLabel status]
   (when-let [editor (active-editor tabs)]
     (when-let [file (choose-file-for-editor frame "Save As" editor)]
-      (write-file! file (.getText editor))
-      (set-editor-file! editor file)
-      (set-editor-dirty! editor false)
-      (refresh-tab-title! tabs editor)
-      (set-status! status (str "saved " (.getPath file))))))
+      (save-editor-to-file! frame tabs editor status file))))
 
 (defn bind-app-action! [^JComponent component ^KeyStroke keystroke action-key f]
   (.put (.getInputMap component JComponent/WHEN_IN_FOCUSED_WINDOW)
@@ -802,7 +811,7 @@
     item))
 
 (def about-text
-  "MeScript v0.36\n21 June 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
+  "MeScript v0.37\n22 June 2026\nJacob Pereira\njacob.m.pereira@gmail.com")
 
 (defn show-about! [^JFrame frame]
   (JOptionPane/showMessageDialog frame about-text "About MeScript" JOptionPane/INFORMATION_MESSAGE))

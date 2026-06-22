@@ -589,7 +589,7 @@
     "filter" "gate-hold" "gate-seq" "gate_seq" "gs" "interleave" "map"
     "master-fx" "mute" "not" "offset" "or" "p" "pan" "phaser" "play-block"
     "play-note" "play-scene" "post-fx" "rand-range" "range" "repeat" "rev" "reverse" "reverb"
-    "rotate" "s" "sample" "scale" "scene" "shape" "solo" "start!" "stop!" "take" "then" "times" "tracks" "transpose"
+    "rotate" "s" "sample" "scale" "scene" "section" "shape" "solo" "start!" "stop!" "take" "then" "times" "tracks" "transpose" "with"
     "unmute" "unsolo"})
 
 (defn syntax-attrs [^Color color]
