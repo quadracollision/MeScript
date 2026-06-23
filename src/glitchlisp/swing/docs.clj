@@ -204,15 +204,16 @@
    ["(p :repeat N [...])" "Repeat a pattern." "(p :repeat 2 [1 0])"]
    ["(then A B ...)" "Play pattern stages in order for gates, notes, and numeric parameter patterns. A final plain gate pattern loops; a final gate times stage loops the full gate chain." "(p (then (times 2 [0 0 0 1]) [1 0 1 0]))"]
    ["(times N PATTERN)" "Repeat a pattern N times as a counted stage inside then." "(p (then (times 2 [1 0 0 0]) [1 1 1 1]))"]
-   ["(p [[...]])" "Nested note values play together as a chord step." "(p [[c3 eb3 g3]])"]
+   ["Nested notes" "Nested note values play together as a chord step." "(p [[c3 eb3 g3]])"]
    [":note [...]" "Bare note arrays advance on gate hits." ":note [c3 d3 e3 f3]"]
    ["(s [notes])" "Advance notes on hits." "(s [c3 e3 g3])"]
+   ["Triplet notes" "Use nested gates for fast hits and s notes to advance per hit." ":gate (p [0 [1 1 1] 0])\n:note (s [c3 d3 e3])"]
    ["(gate-seq [...])" "Advance notes on gate slots." "(gate-seq [c3 e3 g3])"]
    ["(euclid P S)" "Euclidean gate pattern." "(euclid 5 16)"]
    ["(euclid-rot P S R)" "Rotated Euclidean pattern." "(euclid-rot 5 16 2)"]
    ["(gate-hold N)" "Extend a hit by N slots." "(p [1 (gate-hold 2) 1])"]
    ["1_N" "Short gate hold; later hits in the held span can still play." "(p [1 1_2 1 1])"]
-   ["Nested gates" "Subdivide a step." "(p [[1 1] 0 1])"]])
+   ["Nested gates" "Subdivide a step; these are repeated hits, not chords." "(p [[1 1] 0 1])"]])
 
 (def effect-forms
   [[":fx [...]" "Track effect chain." ":fx [(delay :time 0.125)]"]

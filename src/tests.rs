@@ -72,8 +72,10 @@ fn parses_and_evaluates_track() {
 fn workstation_about_text_shows_current_version_date() {
     let source = fs::read_to_string("src/main.clj").unwrap();
     assert!(
-        source.contains("MeScript v0.37\\n22 June 2026"),
-        "about text should show current version/date"
+        source.contains(
+            "MeScript v0.371\\n22 June 2026\\nJacob Pereira (jacob.m.pereira@gmail.com)\\nquadracollision.com"
+        ),
+        "about text should show current version/date, author, email, and site"
     );
 }
 
@@ -2572,6 +2574,36 @@ fn supports_hit_indexed_note_sequences() {
 
     let mut engine = AudioEngine::new(runtime, 48_000.0);
     for _ in 0..23_990 {
+        engine.next_sample();
+    }
+    assert_eq!(engine.note_cursor_for_test("lead"), 3);
+}
+
+#[test]
+fn nested_gate_triplets_advance_hit_indexed_notes() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(bpm 120)
+         (d :lead
+            :src :sine-synth
+            :note (s [c3 d3 e3])
+            :gate (p [0 [1 1 1] 0])
+            :dur 0.02
+            :amp 0.2)
+         (start!)",
+    )
+    .unwrap();
+
+    let track = &runtime.tracks["lead"];
+    assert_eq!(track.note_mode, NoteMode::Hit);
+    assert_eq!(
+        track.gate_subdivisions,
+        vec![vec![false], vec![true, true, true], vec![false]]
+    );
+
+    let mut engine = AudioEngine::new(runtime, 48_000.0);
+    for _ in 0..12_010 {
         engine.next_sample();
     }
     assert_eq!(engine.note_cursor_for_test("lead"), 3);
