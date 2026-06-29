@@ -125,7 +125,8 @@ pub(crate) fn eval_interactive_source(runtime: &mut Runtime, source: &str) -> Re
 pub(crate) fn auto_render_seconds(runtime: &Runtime) -> Option<f32> {
     let mut current = runtime.scene_state.as_ref()?.current.clone();
     let mut visited = HashSet::new();
-    let mut steps = 0usize;
+    let mut seconds = 0.0f32;
+    let mut bpm = runtime.bpm;
 
     loop {
         if !visited.insert(current.clone()) {
@@ -135,15 +136,19 @@ pub(crate) fn auto_render_seconds(runtime: &Runtime) -> Option<f32> {
         if scene.repeats == 0 {
             return None;
         }
-        steps += scene.repeats * scene.steps.max(1);
+        if let Some(scene_bpm) = scene.bpm {
+            bpm = scene_bpm;
+        }
+        let steps = scene.repeats * scene.steps.max(1);
+        let steps_per_second = bpm.max(1.0) / 60.0 * 4.0;
+        seconds += steps as f32 / steps_per_second;
         let Some(next) = &scene.next else {
             break;
         };
         current = next.clone();
     }
 
-    let steps_per_second = runtime.bpm.max(1.0) / 60.0 * 4.0;
-    Some(steps as f32 / steps_per_second + 2.0)
+    Some(seconds + 2.0)
 }
 
 pub(crate) fn playback_hint(runtime: &Runtime) -> Option<&'static str> {
@@ -322,11 +327,35 @@ pub(crate) fn coalesced_step_event(
     latest
 }
 
+fn read_gui_live_source<I>(lines: &mut I) -> Result<String, String>
+where
+    I: Iterator<Item = io::Result<String>>,
+{
+    let mut source = String::new();
+    loop {
+        let Some(next) = lines.next() else {
+            return Ok(source);
+        };
+        let next = next.map_err(|error| error.to_string())?;
+        if next == "__GLITCHLISP_END__" {
+            break;
+        }
+        source.push_str(&next);
+        source.push('\n');
+    }
+    Ok(source)
+}
+
 fn gui_live(device_name: Option<&str>) -> Result<(), String> {
     let runtime = Arc::new(Mutex::new(Runtime::new()));
+    let queued_runtime = Arc::new(Mutex::new(None));
     let (step_tx, step_rx) = mpsc::channel();
-    let (stream, audio_info) =
-        audio::open_output_stream_named_with_info(runtime.clone(), Some(step_tx), device_name)?;
+    let (stream, audio_info) = audio::open_output_stream_named_with_info_and_queue(
+        runtime.clone(),
+        Some(step_tx),
+        device_name,
+        Some(queued_runtime.clone()),
+    )?;
     stream.play().map_err(|error| error.to_string())?;
 
     thread::spawn(move || {
@@ -359,18 +388,7 @@ fn gui_live(device_name: Option<&str>) -> Result<(), String> {
         let line = line.map_err(|error| error.to_string())?;
         match line.trim() {
             "EVAL" => {
-                let mut source = String::new();
-                loop {
-                    let Some(next) = lines.next() else {
-                        return Ok(());
-                    };
-                    let next = next.map_err(|error| error.to_string())?;
-                    if next == "__GLITCHLISP_END__" {
-                        break;
-                    }
-                    source.push_str(&next);
-                    source.push('\n');
-                }
+                let source = read_gui_live_source(&mut lines)?;
 
                 let revision = {
                     let runtime = runtime.lock().expect("runtime lock poisoned");
@@ -381,6 +399,27 @@ fn gui_live(device_name: Option<&str>) -> Result<(), String> {
                         let summary = gui_live_ok_summary(&next_runtime);
                         let mut runtime = runtime.lock().expect("runtime lock poisoned");
                         *runtime = next_runtime;
+                        println!("{}", summary);
+                    }
+                    Err(error) => println!("ERR {}", error.replace('\n', " ")),
+                }
+                io::stdout().flush().map_err(|error| error.to_string())?;
+            }
+            "QUEUE" => {
+                let source = read_gui_live_source(&mut lines)?;
+                let revision = {
+                    let runtime = runtime.lock().expect("runtime lock poisoned");
+                    runtime.transport_revision
+                };
+                match build_gui_live_runtime(&source, revision) {
+                    Ok(next_runtime) => {
+                        let summary = {
+                            let mut slot =
+                                queued_runtime.lock().expect("queued runtime lock poisoned");
+                            *slot = Some(next_runtime);
+                            let runtime = runtime.lock().expect("runtime lock poisoned");
+                            gui_live_ok_summary(&runtime)
+                        };
                         println!("{}", summary);
                     }
                     Err(error) => println!("ERR {}", error.replace('\n', " ")),

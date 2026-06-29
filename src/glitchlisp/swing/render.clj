@@ -349,6 +349,9 @@
 (defn seconds-for-steps [source steps]
   (/ steps (/ (* (bpm-from-source source) 4.0) 60.0)))
 
+(defn seconds-for-steps-at-bpm [bpm steps]
+  (/ steps (/ (* (max 1.0 (double bpm)) 4.0) 60.0)))
+
 (defn gate-hold-token? [token]
   (boolean (re-matches #"1_(?:[0-9]+)?" token)))
 
@@ -356,6 +359,18 @@
   (let [amount-text (subs token 2)
         amount (if (clojure.string/blank? amount-text) "1" amount-text)]
     (str "(gate-hold " amount ")")))
+
+(defn gate-repeat-token? [token]
+  (boolean (re-matches #"[01](?:%[01])+" token)))
+
+(defn gate-repeat-replacement [token]
+  (str "(gate-repeat [" (clojure.string/join " " (clojure.string/split token #"%")) "])"))
+
+(defn gate-sustain-token? [token]
+  (boolean (re-matches #"~[0-9]+" token)))
+
+(defn gate-sustain-replacement [token]
+  (str "(gate-sustain " (subs token 1) ")"))
 
 (defn rewrite-gate-hold-tokens [source]
   (let [token-end? #(or (Character/isWhitespace ^char %)
@@ -386,15 +401,24 @@
             (= ch \;)
             (recur (inc idx) (conj out ch) false false true)
 
-            (Character/isDigit ch)
+            (or (Character/isDigit ch) (= ch \?) (= ch \~))
             (let [end (loop [cursor idx]
                         (if (and (< cursor (count source))
                                  (not (token-end? (.charAt source cursor))))
                           (recur (inc cursor))
                           cursor))
                   token (subs source idx end)]
-              (if (gate-hold-token? token)
+              (cond
+                (gate-hold-token? token)
                 (recur end (conj out (gate-hold-replacement token)) false false false)
+
+                (gate-repeat-token? token)
+                (recur end (conj out (gate-repeat-replacement token)) false false false)
+
+                (gate-sustain-token? token)
+                (recur end (conj out (gate-sustain-replacement token)) false false false)
+
+                :else
                 (recur end (conj out token) false false false)))
 
             :else
@@ -523,18 +547,94 @@
         (when (zero? hold)
           (throw (ex-info "gate-hold must be greater than zero" {:form expr})))))))
 
+(defn gate-repeat-bools [expr]
+  (when (not= 2 (count expr))
+    (throw (ex-info "gate-repeat expects one vector" {:form expr})))
+  (let [values (second expr)]
+    (when-not (vector? values)
+      (throw (ex-info "gate-repeat expects a vector" {:form expr})))
+    (when (empty? values)
+      (throw (ex-info "gate-repeat vector cannot be empty" {:form expr})))
+    (mapv (fn [value]
+            (case value
+              0 false
+              1 true
+              (throw (ex-info "gate-repeat only accepts 0 and 1 values" {:value value}))))
+          values)))
+
+(defn chance-gate-symbol? [expr]
+  (and (symbol? expr)
+       (boolean (re-matches #"\?(?:\d+(?:\.\d+)?)?" (name expr)))))
+
+(defn chance-gate-active? [expr]
+  (let [text (name expr)
+        percent (if (= text "?")
+                  50.0
+                  (Double/parseDouble (subs text 1)))]
+    (when (or (neg? percent) (> percent 100.0))
+      (throw (ex-info "chance gate must be between ?0 and ?100" {:value expr})))
+    (pos? percent)))
+
+(declare gate-step-bools)
+
+(defn chance-prefixed-gate-step-bools [chance-expr expr]
+  (let [active? (chance-gate-active? chance-expr)]
+    (mapv #(and active? %) (gate-step-bools expr))))
+
+(defn gate-sustain-amount [expr]
+  (when (and (seq? expr) (= 'gate-sustain (form-head expr)))
+    (when (not= 2 (count expr))
+      (throw (ex-info "gate-sustain expects one amount" {:form expr})))
+    (positive-runtime-int-value (second expr) "gate-sustain")))
+
+(defn gate-step-bools-from-values [values]
+  (loop [remaining values
+         steps []
+         has-previous-hit? false]
+    (cond
+      (empty? remaining)
+      steps
+
+      (gate-sustain-amount (first remaining))
+      (let [amount (gate-sustain-amount (first remaining))]
+        (when-not has-previous-hit?
+          (throw (ex-info "gate sustain must follow a hit" {:form (first remaining)})))
+        (recur (rest remaining)
+               (into steps (repeat amount [false]))
+               has-previous-hit?))
+
+      (and (chance-gate-symbol? (first remaining))
+           (vector? (second remaining)))
+      (let [step (chance-prefixed-gate-step-bools (first remaining)
+                                                  (second remaining))]
+        (recur (nnext remaining)
+               (conj steps step)
+               (or has-previous-hit? (boolean (some true? step)))))
+
+      :else
+      (let [step (gate-step-bools (first remaining))]
+        (recur (rest remaining)
+               (conj steps step)
+               (or has-previous-hit? (boolean (some true? step))))))))
+
 (defn gate-step-bools [expr]
   (if (vector? expr)
     (if (empty? expr)
       [false]
-      (let [children (mapv gate-step-bools expr)
+      (let [children (gate-step-bools-from-values expr)
             cell-width (lcm-int (map #(max 1 (count %)) children))]
         (vec (mapcat #(expand-gate-cell % cell-width) children))))
     (if (and (seq? expr) (= 'gate-hold (form-head expr)))
       (do
         (validate-gate-hold! expr)
         [true])
-      [(truthy-gate? expr)])))
+      (if (and (seq? expr) (= 'gate-repeat (form-head expr)))
+        [(boolean (some true? (gate-repeat-bools expr)))]
+        (if (and (seq? expr) (= 'gate-sustain (form-head expr)))
+          (throw (ex-info "gate sustain must follow a hit inside a vector pattern" {:form expr}))
+          (if (chance-gate-symbol? expr)
+            [(chance-gate-active? expr)]
+            [(truthy-gate? expr)]))))))
 
 (defn euclid-bools
   ([pulses steps rotation]
@@ -549,7 +649,7 @@
           (range steps)))))
 
 (defn gate-summary-from-steps [steps]
-  (let [expanded (if (seq steps) (mapv gate-step-bools steps) [[false]])
+  (let [expanded (if (seq steps) (gate-step-bools-from-values steps) [[false]])
         slots (reduce + (map count expanded))
         hits (reduce + (map #(count (filter true? %)) expanded))]
     {:length (max 1 (count expanded))
@@ -972,7 +1072,7 @@
     :morph :morph-pos :morph_pos :gain :unison :unison-detune :unison_detune
     :unison-spread :unison_spread :spread :fm-ratio :fm_ratio :fm-depth :fm_depth
     :harmonics :sample :sample-path :sample_path :sample-data :sample_data
-    :every :offset :drunk :amp :dur :fx})
+    :every :offset :drunk :off :choke :cut :amp :dur :fx})
 
 (defn track-param-canonical-key [key]
   (case key
@@ -984,7 +1084,11 @@
     (:fm-ratio :fm_ratio) :fm-ratio
     (:fm-depth :fm_depth) :fm-depth
     (:sample :sample-path :sample_path :sample-data :sample_data) :sample
+    (:choke :cut) :choke
     key))
+
+(defn unary-track-flag? [key]
+  (contains? #{:off :choke :cut} key))
 
 (defn validate-track-params! [track-form]
   (loop [remaining (track-param-items track-form)
@@ -995,72 +1099,67 @@
           (throw (ex-info "track parameters must be keyword/value pairs" {:form track-form})))
         (when-not (contains? track-param-keys key)
           (throw (ex-info (str "unknown track parameter '" key "'") {:option key})))
-        (when-not (next remaining)
-          (throw (ex-info (str "track parameter '" key "' requires a value") {:option key})))
-        (when (= :src key)
-          (validate-source-value! (second remaining)))
-        (when (contains? #{:sample-data :sample_data} key)
-          (validate-sample-data-value! (second remaining)))
-        (when (contains? #{:sample :sample-path :sample_path} key)
-          (validate-sample-path-value! (second remaining)))
-        (when (= :harmonics key)
-          (validate-harmonics! (second remaining)))
-        (when (= :fx key)
-          (validate-fx-value! (second remaining)))
-        (when (= :amp key)
-          (validate-bounded-track-param! (second remaining) 0.0 1.0 key "amp"))
-        (when (= :dur key)
-          (validate-bounded-track-param! (second remaining) 0.005 4.0 key "dur"))
-        (when (contains? #{:detune :detune-cents} key)
-          (validate-f32-track-param! (second remaining) key))
-        (when (= :phase key)
-          (validate-f32-track-param! (second remaining) key))
-        (when (contains? #{:pulse-width :pulse_width :pw} key)
-          (validate-bounded-track-param! (second remaining) 0.01 0.99 key "pulse-width"))
-        (when (contains? #{:morph :morph-pos :morph_pos} key)
-          (validate-bounded-track-param! (second remaining) 0.0 1.0 key "morph"))
-        (when (= :gain key)
-          (validate-bounded-track-param! (second remaining) 0.0 2.0 key "gain"))
-        (when (= :unison key)
-          (validate-bounded-integer-track-param! (second remaining) 1 10 key "unison"))
-        (when (= :offset key)
-          (validate-non-negative-integer-param! (second remaining) key "offset"))
-        (when (= :drunk key)
-          (validate-bounded-track-param! (second remaining) 0.0 100.0 key "drunk"))
-        (when (contains? #{:unison-detune :unison_detune} key)
-          (validate-bounded-track-param! (second remaining) 0.0 100.0 key "unison-detune"))
-        (when (contains? #{:unison-spread :unison_spread :spread} key)
-          (validate-bounded-track-param! (second remaining) 0.0 1.0 key "unison-spread"))
-        (when (contains? #{:fm-ratio :fm_ratio} key)
-          (validate-min-track-param! (second remaining) 0.01 key "fm-ratio"))
-        (when (contains? #{:fm-depth :fm_depth} key)
-          (validate-bounded-track-param! (second remaining) 0.0 32.0 key "fm-depth"))
         (let [canonical (track-param-canonical-key key)]
           (when (contains? seen canonical)
             (throw (ex-info (str "duplicate track parameter '" key "'") {:option key})))
-          (recur (nnext remaining) (conj seen canonical)))))))
+          (if (and (unary-track-flag? key)
+                   (or (not (next remaining))
+                       (keyword? (second remaining))))
+            (recur (rest remaining) (conj seen canonical))
+            (do
+              (when-not (next remaining)
+                (throw (ex-info (str "track parameter '" key "' requires a value") {:option key})))
+              (when (= :src key)
+                (validate-source-value! (second remaining)))
+              (when (contains? #{:sample-data :sample_data} key)
+                (validate-sample-data-value! (second remaining)))
+              (when (contains? #{:sample :sample-path :sample_path} key)
+                (validate-sample-path-value! (second remaining)))
+              (when (= :harmonics key)
+                (validate-harmonics! (second remaining)))
+              (when (= :fx key)
+                (validate-fx-value! (second remaining)))
+              (when (= :amp key)
+                (validate-bounded-track-param! (second remaining) 0.0 1.0 key "amp"))
+              (when (= :dur key)
+                (validate-bounded-track-param! (second remaining) 0.005 4.0 key "dur"))
+              (when (contains? #{:detune :detune-cents} key)
+                (validate-f32-track-param! (second remaining) key))
+              (when (= :phase key)
+                (validate-f32-track-param! (second remaining) key))
+              (when (contains? #{:pulse-width :pulse_width :pw} key)
+                (validate-bounded-track-param! (second remaining) 0.01 0.99 key "pulse-width"))
+              (when (contains? #{:morph :morph-pos :morph_pos} key)
+                (validate-bounded-track-param! (second remaining) 0.0 1.0 key "morph"))
+              (when (= :gain key)
+                (validate-bounded-track-param! (second remaining) 0.0 2.0 key "gain"))
+              (when (= :unison key)
+                (validate-bounded-integer-track-param! (second remaining) 1 10 key "unison"))
+              (when (= :offset key)
+                (validate-non-negative-integer-param! (second remaining) key "offset"))
+              (when (= :drunk key)
+                (validate-bounded-track-param! (second remaining) 0.0 100.0 key "drunk"))
+              (when (contains? #{:unison-detune :unison_detune} key)
+                (validate-bounded-track-param! (second remaining) 0.0 100.0 key "unison-detune"))
+              (when (contains? #{:unison-spread :unison_spread :spread} key)
+                (validate-bounded-track-param! (second remaining) 0.0 1.0 key "unison-spread"))
+              (when (contains? #{:fm-ratio :fm_ratio} key)
+                (validate-min-track-param! (second remaining) 0.01 key "fm-ratio"))
+              (when (contains? #{:fm-depth :fm_depth} key)
+                (validate-bounded-track-param! (second remaining) 0.0 32.0 key "fm-depth"))
+              (recur (nnext remaining) (conj seen canonical)))))))))
 
 (defn track-loop-steps [track-form]
   (validate-sample-header! track-form)
   (validate-track-params! track-form)
   (let [items (track-param-items track-form)
         gate (or (pair-value items :gate) 1)
-        note (or (pair-value items :note) 'c3)
         every-value (pair-value-or items :every missing-option)
         every (if (= missing-option every-value)
                 1
                 (positive-runtime-int-value every-value "every"))
-        {:keys [length hits slots]} (gate-pattern-summary gate)
-        note-summary (note-pattern-summary note)
-        note-length (:length note-summary)
-        note-period (case (:mode note-summary)
-                      :step note-length
-                      :hit (if (zero? hits)
-                             length
-                             (* length (quot note-length (gcd-int note-length hits))))
-                      :tick (* length (quot note-length (gcd-int note-length slots)))
-                      note-length)]
-    (* every (lcm-int length note-period))))
+        {:keys [length]} (gate-pattern-summary gate)]
+    (* every length)))
 
 (defn top-level-track? [form]
   (and (seq? form) (contains? #{'d 'sample} (form-head form))))
@@ -1253,36 +1352,55 @@
 (defn scene-next-from-form [form]
   (scene-option-value form :next))
 
-(defn scene-chain-info [scenes start]
+(defn scene-body-bpm [form]
+  (last
+    (keep #(when (and (seq? %)
+                      (= 'bpm (form-head %))
+                      (number? (second %)))
+             (double (second %)))
+          (scene-body-forms form))))
+
+(defn scene-chain-info
+  ([scenes start]
+   (scene-chain-info scenes start 124.0))
+  ([scenes start initial-bpm]
   (loop [current start
          visited #{}
          chain []
-         steps 0]
+         steps 0
+         seconds 0.0
+         bpm (double initial-bpm)]
     (if (contains? visited current)
       {:steps (max 1 steps)
+       :seconds (max (seconds-for-steps-at-bpm bpm 1) seconds)
        :chain chain
        :closed? true
        :looping? false}
       (if-let [form (get scenes current)]
         (let [repeat-count (scene-repeat-from-form form)
               scene-steps (scene-steps-from-form form)
+              bpm (or (scene-body-bpm form) bpm)
               chain (conj chain current)]
           (if (zero? repeat-count)
             {:steps scene-steps
+             :seconds (seconds-for-steps-at-bpm bpm scene-steps)
              :chain chain
              :closed? true
              :looping? true}
-            (let [steps (+ steps (* repeat-count scene-steps))]
+            (let [scene-total-steps (* repeat-count scene-steps)
+                  steps (+ steps scene-total-steps)
+                  seconds (+ seconds (seconds-for-steps-at-bpm bpm scene-total-steps))]
               (if-let [next-scene (scene-next-from-form form)]
                 (if (contains? scenes next-scene)
-                  (recur next-scene (conj visited current) chain steps)
+                  (recur next-scene (conj visited current) chain steps seconds bpm)
                   (throw (ex-info (str "scene '" current "' :next references unknown scene '" next-scene "'")
                                   {:scene current :next next-scene})))
                 {:steps (max 1 steps)
+                 :seconds seconds
                  :chain chain
                  :closed? false
                  :looping? false}))))
-        nil))))
+        nil)))))
 
 (defn played-scene [forms]
   (some (fn [form]
@@ -1298,7 +1416,7 @@
                               forms))]
     (if-let [scene (played-scene forms)]
       (if (contains? scenes scene)
-        (or (:steps (scene-chain-info scenes scene))
+        (or (:steps (scene-chain-info scenes scene (bpm-from-source source)))
             16)
         (throw (ex-info (str "unknown scene '" scene "'") {:scene scene})))
       (let [track-steps (map track-loop-steps (filter top-level-track? forms))]
@@ -1365,7 +1483,7 @@
         scenes (into {} (keep #(when-let [name (scene-name %)]
                                  [name %])
                               forms))
-        chain-info (when scene (scene-chain-info scenes scene))]
+        chain-info (when scene (scene-chain-info scenes scene (bpm-from-source compiled-source)))]
     (if (and scene chain-info)
       (let [chain (:chain chain-info)
             last-scene (last chain)
@@ -1471,7 +1589,16 @@
             renderer (ensure-renderer! status)
             loop-steps (when (and loop? (nil? render-seconds))
                          (inferred-loop-steps compiled))
+            loop-scene-seconds (when (and loop? (nil? render-seconds))
+                                 (let [forms (read-source-forms compiled)
+                                       scene (played-scene forms)
+                                       scenes (into {} (keep #(when-let [name (scene-name %)]
+                                                                [name %])
+                                                             forms))]
+                                   (when (and scene (contains? scenes scene))
+                                     (:seconds (scene-chain-info scenes scene (bpm-from-source compiled))))))
             effective-render-seconds (or render-seconds
+                                         loop-scene-seconds
                                          (when loop-steps
                                            (seconds-for-steps compiled loop-steps)))
             loop-warmup? (and loop? effective-render-seconds)

@@ -23,6 +23,13 @@ for spec_jar in /usr/share/java/spec.alpha.jar /usr/share/java/core.specs.alpha.
   fi
 done
 
+LIB_JARS=()
+if [[ -d "$DIR/lib" ]]; then
+  while IFS= read -r lib_jar; do
+    LIB_JARS+=("$lib_jar")
+  done < <(find "$DIR/lib" -maxdepth 1 -type f -name '*.jar' | sort)
+fi
+
 if [[ -n "$RUNTIME_JAR" && -f "$RUNTIME_JAR" && ${#SPEC_JARS[@]} -ge 2 ]]; then
   echo "Building workstation jar"
   rm -rf "$BUILD"
@@ -34,6 +41,9 @@ if [[ -n "$RUNTIME_JAR" && -f "$RUNTIME_JAR" && ${#SPEC_JARS[@]} -ge 2 ]]; then
     jar xf "$RUNTIME_JAR"
     for spec_jar in "${SPEC_JARS[@]}"; do
       jar xf "$spec_jar"
+    done
+    for lib_jar in "${LIB_JARS[@]}"; do
+      jar xf "$lib_jar"
     done
   )
   cp -R "$CLASSES"/. "$STAGING"/

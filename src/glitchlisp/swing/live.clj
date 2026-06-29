@@ -359,6 +359,23 @@
         (.flush writer))
       true)))
 
+(defn send-compiled-live-queued-update!
+  [^JTextComponent editor-pane ^JLabel status compiled waiting-status]
+  (when-let [writer (:live-writer @shared/state)]
+    (when (live-process-running?)
+      (let [token (begin-live-update!)]
+        (schedule-live-update-timeout! status token))
+      (SwingUtilities/invokeLater #(shared/set-status! status waiting-status))
+      (locking writer
+        (.write writer "QUEUE\n")
+        (.write writer compiled)
+        (when-not (str/ends-with? compiled "\n")
+          (.write writer "\n"))
+        (.write writer live-end-marker)
+        (.write writer "\n")
+        (.flush writer))
+      true)))
+
 (defn live-update!
   ([^JFrame frame ^JTextComponent editor-pane ^JLabel status device ensure-renderer! preview-source require-playback-form! compile-source]
    (live-update! frame editor-pane status device ensure-renderer! preview-source require-playback-form! compile-source nil))

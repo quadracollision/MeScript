@@ -10,6 +10,18 @@
         amount (if (clojure.string/blank? amount-text) "1" amount-text)]
     (str "(gate-hold " amount ")")))
 
+(defn gate-repeat-token? [token]
+  (boolean (re-matches #"[01](?:%[01])+" token)))
+
+(defn gate-repeat-replacement [token]
+  (str "(gate-repeat [" (str/join " " (str/split token #"%")) "])"))
+
+(defn gate-sustain-token? [token]
+  (boolean (re-matches #"~[0-9]+" token)))
+
+(defn gate-sustain-replacement [token]
+  (str "(gate-sustain " (subs token 1) ")"))
+
 (defn rewrite-gate-hold-tokens [source]
   (let [token-end? #(or (Character/isWhitespace ^char %)
                         (contains? #{\( \) \[ \] \;} %))]
@@ -39,15 +51,24 @@
             (= ch \;)
             (recur (inc idx) (conj out ch) false false true)
 
-            (Character/isDigit ch)
+            (or (Character/isDigit ch) (= ch \?) (= ch \~))
             (let [end (loop [cursor idx]
                         (if (and (< cursor (count source))
                                  (not (token-end? (.charAt source cursor))))
                           (recur (inc cursor))
                           cursor))
                   token (subs source idx end)]
-              (if (gate-hold-token? token)
+              (cond
+                (gate-hold-token? token)
                 (recur end (conj out (gate-hold-replacement token)) false false false)
+
+                (gate-repeat-token? token)
+                (recur end (conj out (gate-repeat-replacement token)) false false false)
+
+                (gate-sustain-token? token)
+                (recur end (conj out (gate-sustain-replacement token)) false false false)
+
+                :else
                 (recur end (conj out token) false false false)))
 
             :else
@@ -94,6 +115,7 @@
 
 (def ^:dynamic *captured-defs* nil)
 (def ^:dynamic *scene-context* nil)
+(def ^:dynamic *track-param-key* nil)
 
 (defn track-param-canonical-key [key]
   (case key
@@ -105,7 +127,11 @@
     (:fm-ratio :fm_ratio) :fm-ratio
     (:fm-depth :fm_depth) :fm-depth
     (:sample :sample-path :sample_path :sample-data :sample_data) :sample
+    (:choke :cut) :choke
     key))
+
+(defn unary-track-flag? [key]
+  (contains? #{:off :choke :cut} key))
 
 (def scene-option-arity
   {:loop 1
@@ -181,9 +207,9 @@
         (some (fn [[key value]]
                 (when (= key :else) value))
               pairs)
-        (throw (ex-info (str "by-scene has no value for scene " scene-key " and no :else")
-                        {:scene scene-key
-                         :args args})))))
+        (if (= *track-param-key* :gate)
+          '(p [0])
+          'nil))))
 
 (defn repeat-pattern [n values]
   (vec (apply concat (repeat n values))))
@@ -579,17 +605,46 @@
                    (into output emitted)))))
       output)))
 
+(defn normalize-track-params [values]
+  (loop [remaining values
+         output []]
+    (if (seq remaining)
+      (let [key (first remaining)]
+        (when-not (keyword? key)
+          (throw (ex-info "track parameters must be keyword/value pairs" {:key key
+                                                                          :args values})))
+        (if (and (unary-track-flag? key)
+                 (or (empty? (rest remaining))
+                     (keyword? (second remaining))))
+          (recur (rest remaining) (conj output key true))
+          (do
+            (when (empty? (rest remaining))
+              (throw (ex-info (str "track parameter " key " requires a value") {:key key
+                                                                                :args values})))
+            (recur (nnext remaining) (conj output key (second remaining))))))
+      output)))
+
 (defn validate-track-param-pairs! [form-name values]
-  (when (odd? (count values))
-    (throw (ex-info (str form-name " expects keyword/value override pairs") {:args values})))
   (doseq [[key _] (partition 2 values)]
     (when-not (keyword? key)
       (throw (ex-info (str form-name " override keys must be keywords") {:key key
                                                                           :args values})))))
 
+(defn expand-track-form [env args]
+  (let [[id & params] args
+        params (normalize-track-params params)]
+    (apply list
+           'd
+           (expand-expr env id)
+           (mapcat (fn [[key value]]
+                     [key (binding [*track-param-key* (track-param-canonical-key key)]
+                            (expand-expr env value))])
+                   (partition 2 params)))))
+
 (defn track-param-map [form-name params]
-  (validate-track-param-pairs! form-name params)
-  (loop [remaining params
+  (let [params (normalize-track-params params)]
+    (validate-track-param-pairs! form-name params)
+    (loop [remaining params
          order []
          values {}]
     (if (seq remaining)
@@ -598,7 +653,7 @@
         (when (contains? values canonical)
           (throw (ex-info (str form-name " has duplicate track parameter " key) {:key key})))
         (recur more (conj order canonical) (assoc values canonical [key value])))
-      [order values])))
+      [order values]))))
 
 (defn with-target-track [env target-form]
   (cond
@@ -796,7 +851,7 @@
   value)
 
 (defn expand-sample-options [env options]
-  (->> (partition 2 options)
+  (->> (partition 2 (normalize-track-params options))
        (mapcat (fn [[key value]]
                  (cond
                    (#{:sample-data :sample_data} key)
@@ -827,11 +882,16 @@
           (throw (ex-info "sample options must be keyword/value pairs"
                           {:args args
                            :value (first remaining)})))
-        (when-not (seq (rest remaining))
+        (when (and (not (unary-track-flag? (first remaining)))
+                   (not (seq (rest remaining))))
           (throw (ex-info (str "sample " (first remaining) " requires a value")
                           {:args args
                            :option (first remaining)})))
-        (recur (nnext remaining))))
+        (recur (if (and (unary-track-flag? (first remaining))
+                        (or (empty? (rest remaining))
+                            (keyword? (second remaining))))
+                 (rest remaining)
+                 (nnext remaining)))))
     (when-not inline-options?
       (validate-sample-path-value! (expand-expr env sample-arg)))
     (let [options (expand-sample-options env options)
@@ -907,6 +967,7 @@
         p (expand-p-form env args)
         times (expand-times-form env args)
         then (expand-then-form env args)
+        d (expand-track-form env args)
         sample (expand-sample-form env args)
         tracks (apply list 'tracks (expand-list-items env args))
         (apply list (expand-list-items env expr))))

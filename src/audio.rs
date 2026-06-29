@@ -2,7 +2,7 @@ use crate::effects::EffectChain;
 use crate::effects::filters::{Biquad, FilterKind};
 use crate::effects::offline;
 use crate::model::{
-    EffectParamPatternMode, NoteMode, OscillatorParams, Runtime, TrackEffect, Waveform,
+    EffectParamPatternMode, GateCell, NoteMode, OscillatorParams, Runtime, TrackEffect, Waveform,
 };
 use crate::sequencer;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -25,6 +25,7 @@ pub(crate) struct StepEvent {
 
 #[derive(Clone, Debug)]
 struct Voice {
+    track_id: String,
     waveform: Waveform,
     params: OscillatorParams,
     freq: f32,
@@ -40,7 +41,7 @@ struct Voice {
     delay_line: Vec<f32>,
     delay_pos: usize,
     sample_data: Vec<f32>,
-    sample_pos: usize,
+    sample_pos: f32,
     color_state: [f32; 8],
     effects: EffectChain,
 }
@@ -119,6 +120,7 @@ impl Voice {
         let effects = active_effect_specs(&track.effects, track_step, sub_index, param_index);
         let dur = (dur_seconds + hold_seconds.max(0.0)).max(0.005);
         Self {
+            track_id: track.id.clone(),
             waveform: track.waveform,
             params,
             freq,
@@ -134,7 +136,7 @@ impl Voice {
             delay_line,
             delay_pos: 0,
             sample_data: track.sample_data.clone(),
-            sample_pos: 0,
+            sample_pos: 0.0,
             color_state: [0.0; 8],
             effects: EffectChain::new_with_duration(&effects, sample_rate, Some(dur)),
         }
@@ -830,6 +832,7 @@ pub(crate) fn playback_step_for_runtime(runtime: &Runtime, transport_step: usize
 
 pub(crate) struct AudioEngine {
     runtime: Arc<Mutex<Runtime>>,
+    queued_runtime: Option<Arc<Mutex<Option<Runtime>>>>,
     sample_rate: f32,
     step_samples: f32,
     samples_until_step: f32,
@@ -876,6 +879,7 @@ impl AudioEngine {
     ) -> Self {
         Self {
             runtime,
+            queued_runtime: None,
             sample_rate,
             step_samples,
             samples_until_step: 0.0,
@@ -893,6 +897,10 @@ impl AudioEngine {
         self.step_sender = Some(sender);
     }
 
+    pub(crate) fn set_queued_runtime(&mut self, queued_runtime: Arc<Mutex<Option<Runtime>>>) {
+        self.queued_runtime = Some(queued_runtime);
+    }
+
     fn reset_transport(&mut self, revision: u64, bpm: f32) {
         self.seen_transport_revision = revision;
         self.step_samples = samples_per_step(bpm, self.sample_rate);
@@ -908,6 +916,13 @@ impl AudioEngine {
         let runtime_header = self.runtime.lock().expect("runtime lock poisoned").clone();
         if runtime_header.transport_revision != self.seen_transport_revision {
             self.reset_transport(runtime_header.transport_revision, runtime_header.bpm);
+        }
+
+        if self.apply_queued_runtime_if_ready() {
+            self.voices.clear();
+            self.pending_triggers.clear();
+            self.note_cursors.clear();
+            self.param_cursors.clear();
         }
 
         let advanced_scene = self.advance_scene_if_needed();
@@ -934,6 +949,11 @@ impl AudioEngine {
         }
 
         let playback_step = playback_step_for_runtime(&runtime, self.step);
+        let scene_cycle = runtime
+            .scene_state
+            .as_ref()
+            .map(|state| state.cycle)
+            .unwrap_or(0);
         if let Some(sender) = &self.step_sender {
             let cycle = runtime
                 .scene_state
@@ -964,19 +984,33 @@ impl AudioEngine {
                 track.gate_loop_start,
                 track_step,
             );
+            let gate_cells = if track.gate_cells.is_empty() {
+                &[][..]
+            } else {
+                &track.gate_cells[sequencer::pattern_index(
+                    track.gate_cells.len(),
+                    track.gate_loop_start,
+                    track_step,
+                )]
+            };
             let holds = sequencer::pattern_step_holds_with_loop(
                 &track.gate_holds,
                 track.gate_loop_start,
                 track_step,
             );
-            if gates.len() <= 1 {
-                let gate = gates.first().copied().unwrap_or_else(|| {
-                    sequencer::pattern_bool_with_loop(
-                        &track.gates,
-                        track.gate_loop_start,
-                        track_step,
-                    )
-                });
+            if gates.len() <= 1 && gate_cells.len() <= 1 {
+                let gate = gate_cells
+                    .first()
+                    .map(|cell| resolve_gate_cell(cell, scene_cycle, &track.id, self.step, 0))
+                    .unwrap_or_else(|| {
+                        gates.first().copied().unwrap_or_else(|| {
+                            sequencer::pattern_bool_with_loop(
+                                &track.gates,
+                                track.gate_loop_start,
+                                track_step,
+                            )
+                        })
+                    });
                 if gate {
                     let freqs = self.note_chord_for_slot(track, track_step);
                     let hold = holds.first().copied().unwrap_or(0);
@@ -1000,8 +1034,13 @@ impl AudioEngine {
                 continue;
             }
 
-            let sub_step_samples = self.step_samples / gates.len() as f32;
-            for (idx, gate) in gates.iter().enumerate() {
+            let sub_count = gate_cells.len().max(gates.len()).max(1);
+            let sub_step_samples = self.step_samples / sub_count as f32;
+            for idx in 0..sub_count {
+                let gate = gate_cells
+                    .get(idx)
+                    .map(|cell| resolve_gate_cell(cell, scene_cycle, &track.id, self.step, idx))
+                    .unwrap_or_else(|| gates.get(idx).copied().unwrap_or(false));
                 if !gate {
                     if matches!(track.note_mode, NoteMode::Tick) {
                         self.next_note_chord_for_track(track);
@@ -1053,6 +1092,58 @@ impl AudioEngine {
         self.step = self.step.wrapping_add(1);
     }
 
+    fn apply_queued_runtime_if_ready(&mut self) -> bool {
+        let Some(queued_runtime) = &self.queued_runtime else {
+            return false;
+        };
+        let ready = {
+            let runtime = self.runtime.lock().expect("runtime lock poisoned");
+            if !runtime.running {
+                true
+            } else if let Some(state) = runtime.scene_state.as_ref() {
+                if let Some(scene) = runtime.scenes.get(&state.current) {
+                    let scene_steps = scene.steps.max(1);
+                    let scene_elapsed = self.step.saturating_sub(state.start_step);
+                    scene_elapsed > 0 && scene_elapsed % scene_steps == 0
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        };
+        if !ready {
+            return false;
+        }
+
+        let Some(mut next_runtime) = queued_runtime
+            .lock()
+            .expect("queued runtime lock poisoned")
+            .take()
+        else {
+            return false;
+        };
+
+        let mut runtime = self.runtime.lock().expect("runtime lock poisoned");
+        let running = runtime.running;
+        let scene_state = runtime.scene_state.clone();
+        let transport_revision = runtime.transport_revision;
+        next_runtime.running = running;
+        next_runtime.scene_state = scene_state.clone();
+        next_runtime.transport_revision = transport_revision;
+        if let Some(state) = &scene_state {
+            if let Some(scene) = next_runtime.scenes.get(&state.current).cloned() {
+                next_runtime.tracks = scene.tracks;
+                next_runtime.post_effects = scene.post_effects;
+            } else {
+                next_runtime.running = false;
+                next_runtime.scene_state = None;
+            }
+        }
+        *runtime = next_runtime;
+        true
+    }
+
     fn note_chord_for_slot(&mut self, track: &crate::model::Track, track_step: usize) -> Vec<f32> {
         match track.note_mode {
             NoteMode::Step => note_chord_at(&track.note_chords, track_step),
@@ -1092,6 +1183,9 @@ impl AudioEngine {
             param_index,
         )
         .clamp(0.005, 4.0);
+        if track.choke {
+            self.voices.retain(|voice| voice.track_id != track.id);
+        }
         let unison = effective_params.unison.max(1);
         if unison == 1 {
             self.voices.push(Voice::new(
@@ -1259,6 +1353,9 @@ impl AudioEngine {
 
         runtime.tracks = next_scene.tracks;
         runtime.post_effects = next_scene.post_effects;
+        if let Some(bpm) = next_scene.bpm {
+            runtime.bpm = bpm;
+        }
         runtime.scene_state = Some(crate::model::SceneState {
             current: next_scene.id,
             cycle: 0,
@@ -1869,12 +1966,24 @@ fn click(voice: &Voice) -> f32 {
     }
 }
 
+const SAMPLE_ROOT_FREQ: f32 = 110.0;
+
+fn sample_playback_rate(freq: f32) -> f32 {
+    (freq / SAMPLE_ROOT_FREQ).clamp(0.01, 64.0)
+}
+
 fn sample_playback(voice: &mut Voice) -> f32 {
-    let Some(sample) = voice.sample_data.get(voice.sample_pos).copied() else {
+    if voice.sample_pos < 0.0 {
+        return 0.0;
+    }
+    let index = voice.sample_pos.floor() as usize;
+    let Some(current) = voice.sample_data.get(index).copied() else {
         return 0.0;
     };
-    voice.sample_pos += 1;
-    sample
+    let next = voice.sample_data.get(index + 1).copied().unwrap_or(current);
+    let frac = voice.sample_pos - index as f32;
+    voice.sample_pos += sample_playback_rate(voice.freq);
+    current + (next - current) * frac
 }
 
 fn kick(voice: &mut Voice) -> f32 {
@@ -2255,6 +2364,36 @@ fn random01(state: &mut u32) -> f32 {
     (*state >> 8) as f32 / 16_777_216.0
 }
 
+pub(crate) fn resolve_gate_cell(
+    cell: &GateCell,
+    scene_cycle: usize,
+    track_id: &str,
+    step: usize,
+    sub_index: usize,
+) -> bool {
+    match cell {
+        GateCell::Static(gate) => *gate,
+        GateCell::Repeat(values) => {
+            if values.is_empty() {
+                false
+            } else {
+                values[scene_cycle % values.len()]
+            }
+        }
+        GateCell::Chance(chance) => {
+            if *chance <= 0.0 {
+                return false;
+            }
+            if *chance >= 1.0 {
+                return true;
+            }
+            let mut seed =
+                seed_from_step(track_id, step.wrapping_mul(1024).wrapping_add(sub_index));
+            random01(&mut seed) < *chance
+        }
+    }
+}
+
 fn signed_noise(state: &mut u32) -> f32 {
     *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
     ((*state >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0
@@ -2376,6 +2515,15 @@ pub(crate) fn open_output_stream_named_with_info(
     step_sender: Option<Sender<StepEvent>>,
     device_name: Option<&str>,
 ) -> Result<(cpal::Stream, String), String> {
+    open_output_stream_named_with_info_and_queue(runtime, step_sender, device_name, None)
+}
+
+pub(crate) fn open_output_stream_named_with_info_and_queue(
+    runtime: Arc<Mutex<Runtime>>,
+    step_sender: Option<Sender<StepEvent>>,
+    device_name: Option<&str>,
+    queued_runtime: Option<Arc<Mutex<Option<Runtime>>>>,
+) -> Result<(cpal::Stream, String), String> {
     let host = cpal::default_host();
     let device = if let Some(name) = device_name.filter(|name| !name.trim().is_empty()) {
         let mut devices = host.output_devices().map_err(|error| error.to_string())?;
@@ -2409,6 +2557,9 @@ pub(crate) fn open_output_stream_named_with_info(
     let mut audio_engine = AudioEngine::new_shared(runtime, sample_rate);
     if let Some(sender) = step_sender {
         audio_engine.set_step_sender(sender);
+    }
+    if let Some(queued_runtime) = queued_runtime {
+        audio_engine.set_queued_runtime(queued_runtime);
     }
     let engine = Arc::new(Mutex::new(audio_engine));
     let err_fn = |error| eprintln!("audio stream error: {}", error);

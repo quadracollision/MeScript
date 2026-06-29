@@ -1,15 +1,17 @@
 (ns glitchlisp-swing
-  (:require [clojure.java.io :as io]
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.set :as set]
             [clojure.string :as str])
   (:import
-    [java.awt BorderLayout Color Cursor Dimension Font GraphicsEnvironment]
-    [java.awt.event ActionListener FocusAdapter InputEvent KeyEvent MouseAdapter MouseEvent WindowAdapter]
+    [java.awt BorderLayout Color Component Container Cursor Dimension Font GraphicsEnvironment Window]
+    [java.awt.event ActionListener ComponentAdapter FocusAdapter InputEvent KeyEvent MouseAdapter MouseEvent WindowAdapter]
     [java.io BufferedReader ByteArrayInputStream ByteArrayOutputStream File InputStreamReader OutputStreamWriter PushbackReader StringReader]
     [javax.sound.sampled AudioFileFormat$Type AudioFormat AudioInputStream AudioSystem Clip]
     [javax.swing.event CaretListener ChangeListener DocumentListener]
     [javax.swing.text DefaultHighlighter$DefaultHighlightPainter JTextComponent SimpleAttributeSet StyleConstants StyledDocument]
-    [javax.swing AbstractAction BorderFactory Box BoxLayout JButton JCheckBoxMenuItem JComboBox JFileChooser JComponent JFrame JLabel JMenu JMenuBar JMenuItem JOptionPane JPanel JScrollPane JTabbedPane JTextField JTextPane KeyStroke SwingUtilities Timer]))
+    [javax.swing AbstractAction BorderFactory Box BoxLayout ButtonGroup JButton JCheckBoxMenuItem JComboBox JFileChooser JComponent JFrame JLabel JMenu JMenuBar JMenuItem JOptionPane JPanel JPopupMenu JRadioButtonMenuItem JScrollPane JSplitPane JTabbedPane JTextField JTextPane KeyStroke ScrollPaneConstants SwingUtilities Timer UIManager]
+    [javax.swing.border BevelBorder LineBorder]))
 
 (defn load-swing-module! [resource-path file-path]
   (when-not (.exists (java.io.File. file-path))
@@ -113,13 +115,7 @@
 (def syntax-max-highlight-chars glitchlisp.swing.editor/syntax-max-highlight-chars)
 (def syntax-form-names glitchlisp.swing.editor/syntax-form-names)
 (def syntax-attrs glitchlisp.swing.editor/syntax-attrs)
-(def syntax-default-attrs glitchlisp.swing.editor/syntax-default-attrs)
-(def syntax-comment-attrs glitchlisp.swing.editor/syntax-comment-attrs)
-(def syntax-string-attrs glitchlisp.swing.editor/syntax-string-attrs)
-(def syntax-form-attrs glitchlisp.swing.editor/syntax-form-attrs)
-(def syntax-keyword-attrs glitchlisp.swing.editor/syntax-keyword-attrs)
-(def syntax-number-attrs glitchlisp.swing.editor/syntax-number-attrs)
-(def syntax-note-attrs glitchlisp.swing.editor/syntax-note-attrs)
+(def set-syntax-theme! glitchlisp.swing.editor/set-syntax-theme!)
 (def syntax-span-limit glitchlisp.swing.editor/syntax-span-limit)
 (def token-delimiter? glitchlisp.swing.editor/token-delimiter?)
 (def syntax-kind glitchlisp.swing.editor/syntax-kind)
@@ -236,6 +232,7 @@
 (def scene-option-value glitchlisp.swing.render/scene-option-value)
 (def scene-body-forms glitchlisp.swing.render/scene-body-forms)
 (def track-id glitchlisp.swing.render/track-id)
+(def track-param-items glitchlisp.swing.render/track-param-items)
 (def scene-inferred-steps glitchlisp.swing.render/scene-inferred-steps)
 (def scene-steps-from-form glitchlisp.swing.render/scene-steps-from-form)
 (def played-scene glitchlisp.swing.render/played-scene)
@@ -272,6 +269,7 @@
 
 (def send-live-command! glitchlisp.swing.live/send-live-command!)
 (def send-compiled-live-update! glitchlisp.swing.live/send-compiled-live-update!)
+(def send-compiled-live-queued-update! glitchlisp.swing.live/send-compiled-live-queued-update!)
 
 (declare tab-editor editor-file)
 
@@ -355,16 +353,38 @@
 
 (def live-auto-update-delay-ms 450)
 (def live-auto-update-timer-key "glitchlisp.liveAutoUpdateTimer")
+(def live-auto-update-suppressed-key "glitchlisp.liveAutoUpdateSuppressed")
 
 (defn valid-live-compiled-source [source]
   (let [preview (preview-source source)]
     (require-playback-form! preview)
     (compile-glitchlisp-source preview)))
 
+(defn live-queue-update! [^JFrame frame ^JTextComponent editor ^JLabel status device source]
+  (future
+    (try
+      (let [compiled (valid-live-compiled-source source)]
+        (if (live-process-running?)
+          (send-compiled-live-queued-update! editor status compiled "queued for next loop...")
+          (live-update! frame editor status device)))
+      (catch Exception ex
+        (SwingUtilities/invokeLater
+          #(do
+             (report-source-error! editor status ex)
+             (when-not (GraphicsEnvironment/isHeadless)
+               (JOptionPane/showMessageDialog frame (clean-error-message ex) "Live update failed" JOptionPane/ERROR_MESSAGE))))))))
+
 (defn next-live-auto-edit-token! []
   (:live-auto-edit-token
     (swap! state update :live-auto-edit-token
            #(inc (long (or % 0))))))
+
+(defn cancel-live-auto-update! [^JTextComponent editor]
+  (let [token (next-live-auto-edit-token!)]
+    (.putClientProperty editor "glitchlisp.liveAutoUpdateToken" token)
+    (when-let [^Timer timer (.getClientProperty editor live-auto-update-timer-key)]
+      (.stop timer))
+    token))
 
 (defn live-auto-apply-source! [^JTextComponent editor ^JLabel status source token]
   (future
@@ -373,7 +393,7 @@
         (when (and (= token (:live-auto-edit-token @state))
                    (live-process-running?))
           (swap! state assoc :live-auto-last-error nil)
-          (send-compiled-live-update! editor status compiled "live edit applied")))
+          (send-compiled-live-queued-update! editor status compiled "live edit queued for next loop")))
       (catch Exception ex
         (when (= token (:live-auto-edit-token @state))
           (swap! state assoc :live-auto-last-error (clean-error-message ex))
@@ -406,10 +426,12 @@
         (.getDocument editor)
         (reify DocumentListener
           (insertUpdate [_ _]
-            (when-not (.getClientProperty editor syntax-refreshing-key)
+            (when-not (or (.getClientProperty editor syntax-refreshing-key)
+                          (.getClientProperty editor live-auto-update-suppressed-key))
               (schedule-live-auto-update! editor status)))
           (removeUpdate [_ _]
-            (when-not (.getClientProperty editor syntax-refreshing-key)
+            (when-not (or (.getClientProperty editor syntax-refreshing-key)
+                          (.getClientProperty editor live-auto-update-suppressed-key))
               (schedule-live-auto-update! editor status)))
           (changedUpdate [_ _] nil))))))
 
@@ -433,6 +455,12 @@
 
 (defn set-editor-dirty! [^JTextComponent editor dirty?]
   (.putClientProperty editor "mescript.dirty" (boolean dirty?)))
+
+(defn empty-untitled-editor? [^JTextComponent editor]
+  (and editor
+       (nil? (editor-file editor))
+       (not (editor-dirty? editor))
+       (str/blank? (.getText editor))))
 
 (defn set-editor-file! [^JTextComponent editor ^File file]
   (.putClientProperty editor "mescript.file" file)
@@ -460,22 +488,28 @@
 (defn sync-active-file! [^JTabbedPane tabs]
   (swap! state assoc :file (active-file tabs)))
 
-(def tab-text-color (Color. 24 24 24))
-(def tab-close-color (Color. 70 70 70))
-(def tab-close-hover-color (Color. 180 40 40))
+(declare theme-option saved-theme-id)
+
+(defn current-theme []
+  (or (:theme-data @state)
+      (theme-option (or (:theme @state) (saved-theme-id)))))
 
 (defn refresh-tab-header-style! [^JTabbedPane tabs ^JTextComponent editor]
   (when-let [scroll (.getClientProperty editor "mescript.scroll")]
     (let [idx (.indexOfComponent tabs scroll)]
       (when (>= idx 0)
-        (let [header (.getTabComponentAt tabs idx)]
-          (when header
-            (.setOpaque ^JComponent header false)
-            (.setBorder ^JComponent header (BorderFactory/createEmptyBorder 2 5 2 4))
-            (.revalidate ^JComponent header)
-            (.repaint ^JComponent header)))
-        (when-let [label (.getClientProperty editor "mescript.tab-label")]
-          (.setForeground ^JLabel label tab-text-color))))))
+        (let [header (.getTabComponentAt tabs idx)
+              theme (current-theme)
+              selected? (= idx (.getSelectedIndex tabs))]
+	          (when header
+	            (.setOpaque ^JComponent header false)
+	            (.setBorder ^JComponent header (BorderFactory/createEmptyBorder 2 5 2 4))
+	            (.revalidate ^JComponent header)
+	            (.repaint ^JComponent header))
+	          (when-let [label (.getClientProperty editor "mescript.tab-label")]
+	            (.setForeground ^JLabel label (if selected? (:text theme) (:muted theme))))
+	          (when-let [close-label (.getClientProperty editor "mescript.tab-close-label")]
+            (.setForeground ^JLabel close-label (if selected? (:text theme) (:muted theme)))))))))
 
 (defn refresh-all-tab-headers! [^JTabbedPane tabs]
   (doseq [idx (range (.getTabCount tabs))]
@@ -495,7 +529,7 @@
             (.setText ^JLabel label title))
           (refresh-tab-header-style! tabs editor))))))
 
-(declare close-tab!)
+(declare close-tab! close-main-window! dispose-child-windows!)
 (declare rename-tab!)
 
 (defn select-editor-tab! [^JTabbedPane tabs ^JTextComponent editor]
@@ -572,7 +606,7 @@
                             (.setBorder (BorderFactory/createEmptyBorder 0 4 0 5)))
               close-label (doto (JLabel. "x")
                             (.setFont (Font. Font/SANS_SERIF Font/BOLD 11))
-                            (.setForeground tab-close-color)
+                            (.setForeground (:muted (current-theme)))
                             (.setFocusable false)
                             (.setRequestFocusEnabled false)
                             (.setBorder (BorderFactory/createEmptyBorder 0 3 0 3))
@@ -583,7 +617,8 @@
           (.setFocusable header false)
           (.setRequestFocusEnabled header false)
           (.setLayout header (BoxLayout. header BoxLayout/X_AXIS))
-          (.putClientProperty editor "mescript.tab-label" title-label)
+	          (.putClientProperty editor "mescript.tab-label" title-label)
+	          (.putClientProperty editor "mescript.tab-close-label" close-label)
           (.addMouseListener header
                              (proxy [MouseAdapter] []
                                (mousePressed [^MouseEvent _]
@@ -603,10 +638,10 @@
                                    tabs
                                    editor
                                    (.getClientProperty tabs "mescript.status")))
-                               (mouseEntered [^MouseEvent _]
-                                 (.setForeground close-label tab-close-hover-color))
-                               (mouseExited [^MouseEvent _]
-                                 (.setForeground close-label tab-close-color))))
+	                               (mouseEntered [^MouseEvent _]
+	                                 (.setForeground close-label (:accent (current-theme))))
+	                               (mouseExited [^MouseEvent _]
+	                                 (refresh-tab-header-style! tabs editor))))
           (.add header title-label)
           (.add header close-label)
           (.setTabComponentAt tabs idx header)
@@ -657,6 +692,8 @@
     (when file
       (save-editor-to-file! frame tabs editor status file))))
 
+(declare retro-editor-font style-component!)
+
 (defn prompt-save-tab! [^JFrame frame ^JTabbedPane tabs ^JTextComponent editor ^JLabel status]
   (if-not (editor-dirty? editor)
     true
@@ -679,8 +716,11 @@
 (defn configure-editor! [^JTextComponent editor ^JLabel status source file]
   (.setText editor source)
   (clear-editor-undo-history! editor)
-  (.setFont editor (Font. Font/MONOSPACED Font/PLAIN 13))
-  (.setBackground editor Color/WHITE)
+  (.setFont editor retro-editor-font)
+  (when-let [theme (:theme-data @state)]
+    (.setBackground editor (:field theme))
+    (.setForeground editor (:text theme))
+    (.setCaretColor editor (:accent theme)))
   (.putClientProperty editor "mescript.file" file)
   (set-editor-dirty! editor false)
   (install-auto-indent! editor)
@@ -693,8 +733,9 @@
 (defn add-editor-tab! [^JTabbedPane tabs ^JLabel status source file]
   (let [editor (configure-editor! (editor-pane) status source file)
         scroll (JScrollPane. editor)]
-    (.setBackground (.getViewport scroll) Color/WHITE)
     (.setRowHeaderView scroll (line-number-gutter editor))
+    (when-let [theme (:theme-data @state)]
+      (style-component! scroll theme))
     (.setPreferredSize scroll (Dimension. 712 520))
     (.putClientProperty editor "mescript.scroll" scroll)
     (.setName editor "mescript-editor")
@@ -714,19 +755,31 @@
     (sync-active-file! tabs)
     editor))
 
-(defn close-tab! [^JFrame frame ^JTabbedPane tabs ^JTextComponent editor ^JLabel status]
-  (when (or (nil? frame)
-            (prompt-save-tab! frame tabs editor status))
-    (when-let [scroll (.getClientProperty editor "mescript.scroll")]
-      (let [idx (.indexOfComponent tabs scroll)]
-        (when (>= idx 0)
-          (.removeTabAt tabs idx)
-          (when (zero? (.getTabCount tabs))
-            (add-editor-tab! tabs (or status (JLabel.)) "" nil))
-          (sync-active-file! tabs)
-          (when status
-            (set-status! status "closed tab"))
-          true)))))
+(defn close-tab!
+  ([^JFrame frame ^JTabbedPane tabs ^JTextComponent editor ^JLabel status]
+   (close-tab! frame tabs editor status true))
+  ([^JFrame frame ^JTabbedPane tabs ^JTextComponent editor ^JLabel status add-empty-tab?]
+   (when (or (nil? frame)
+             (prompt-save-tab! frame tabs editor status))
+     (when-let [scroll (.getClientProperty editor "mescript.scroll")]
+       (let [idx (.indexOfComponent tabs scroll)]
+         (when (>= idx 0)
+           (.removeTabAt tabs idx)
+           (when (and add-empty-tab? (zero? (.getTabCount tabs)))
+             (add-editor-tab! tabs (or status (JLabel.)) "" nil))
+           (sync-active-file! tabs)
+           (when status
+             (set-status! status "closed tab"))
+           true))))))
+
+(defn close-current-tab! [^JFrame frame ^JTabbedPane tabs ^JLabel status]
+  (when-let [editor (active-editor tabs)]
+    (let [last-tab? (= 1 (.getTabCount tabs))]
+      (when (close-tab! frame tabs editor status (not last-tab?))
+        (when last-tab?
+          (dispose-child-windows! frame)
+          (close-live-process!)
+          (.dispose frame))))))
 
 (defn close-all-tabs! [^JFrame frame ^JTabbedPane tabs ^JLabel status]
   (loop []
@@ -759,17 +812,36 @@
           (actionPerformed [_] (f)))))
 
 (def save-current-keystroke
-  (KeyStroke/getKeyStroke KeyEvent/VK_S InputEvent/ALT_DOWN_MASK))
+  (KeyStroke/getKeyStroke KeyEvent/VK_S InputEvent/CTRL_DOWN_MASK))
 
-(defn install-save-shortcut! [^JFrame frame ^JTabbedPane tabs ^JLabel status]
+(def close-current-tab-keystroke
+  (KeyStroke/getKeyStroke KeyEvent/VK_W InputEvent/CTRL_DOWN_MASK))
+
+(defn install-app-shortcuts! [^JFrame frame ^JTabbedPane tabs ^JLabel status]
   (bind-app-action! (.getRootPane frame)
                     save-current-keystroke
                     "mescript-save-current"
-                    #(save-current! frame tabs status)))
+                    #(save-current! frame tabs status))
+  (bind-app-action! (.getRootPane frame)
+                    close-current-tab-keystroke
+                    "mescript-close-current-tab"
+                    #(close-current-tab! frame tabs status)))
 
 (defn new-file! [^JTabbedPane tabs ^JLabel status]
   (add-editor-tab! tabs status "" nil)
   (set-status! status "new file"))
+
+(defn replace-editor-with-file! [^JTabbedPane tabs ^JTextComponent editor ^File file source]
+  (.putClientProperty editor "mescript.file" file)
+  (.putClientProperty editor "mescript.tab-name" nil)
+  (.setText editor source)
+  (clear-editor-undo-history! editor)
+  (set-editor-dirty! editor false)
+  (refresh-syntax-colors! editor)
+  (refresh-tab-title! tabs editor)
+  (select-editor-tab! tabs editor)
+  (sync-active-file! tabs)
+  editor)
 
 (defn open-file-in-tab! [^JTabbedPane tabs ^JLabel status ^File file]
   (if-let [existing (some (fn [idx]
@@ -784,8 +856,12 @@
       (.setSelectedComponent tabs existing)
       (sync-active-file! tabs)
       (set-status! status (str "opened " (.getPath file))))
-    (do
-      (add-editor-tab! tabs status (read-file file) file)
+    (let [source (read-file file)]
+      (if-let [editor (let [active (active-editor tabs)]
+                        (when (empty-untitled-editor? active)
+                          active))]
+        (replace-editor-with-file! tabs editor file source)
+        (add-editor-tab! tabs status source file))
       (set-status! status (str "opened " (.getPath file))))))
 
 (defn save-audio-to-file! [^JFrame frame ^JTextComponent editor ^JLabel status ^File file]
@@ -797,6 +873,596 @@
   (when-let [editor (active-editor tabs)]
     (when-let [file (choose-wav-file frame)]
       (save-audio-to-file! frame editor status file))))
+
+(declare active-editor)
+
+(def inspector-repl-frame-key "mescript.inspectorReplFrame")
+(def inspector-repl-result-key "mescript.inspectorReplResult")
+(def theme-selector-frame-key "mescript.themeSelectorFrame")
+
+(def preferences-file-name "mescript-preferences.edn")
+(def theme-preference-key "theme")
+(def tools-width-preference-key "tools-width")
+(def window-x-preference-key "window-x")
+(def window-y-preference-key "window-y")
+(def window-width-preference-key "window-width")
+(def window-height-preference-key "window-height")
+(def default-theme-id "retro-cherry")
+(def default-tools-width 148)
+(def default-window-width 741)
+(def default-window-height 580)
+
+(defn rgb [r g b]
+  (Color. (int r) (int g) (int b)))
+
+(defn bevel-border [theme]
+  (BorderFactory/createBevelBorder
+    BevelBorder/RAISED
+    (:highlight theme)
+    (:panel theme)
+    (:shadow theme)
+    (:background theme)))
+
+(defn editor-border [theme]
+  (LineBorder. (:shadow theme) 1))
+
+(def theme-options
+  [{:id "retro-green"
+    :label "Green"
+    :class "com.formdev.flatlaf.FlatDarkLaf"
+    :background (rgb 27 31 31)
+    :panel (rgb 47 54 54)
+    :panel-alt (rgb 58 66 66)
+    :field (rgb 12 17 14)
+    :field-alt (rgb 31 38 34)
+    :text (rgb 218 238 216)
+    :muted (rgb 141 165 150)
+    :accent (rgb 108 207 132)
+    :highlight (rgb 120 142 135)
+    :shadow (rgb 6 8 8)
+    :comment (rgb 104 142 104)
+    :string (rgb 126 210 147)
+    :form (rgb 128 205 255)
+    :keyword (rgb 255 202 96)
+    :number (rgb 255 144 112)
+    :note (rgb 210 166 255)}
+   {:id "retro-amber"
+    :label "Amber"
+    :class "com.formdev.flatlaf.FlatDarkLaf"
+    :background (rgb 30 27 22)
+    :panel (rgb 57 49 38)
+    :panel-alt (rgb 72 62 47)
+    :field (rgb 18 13 8)
+    :field-alt (rgb 40 32 22)
+    :text (rgb 255 222 150)
+    :muted (rgb 188 151 86)
+    :accent (rgb 255 180 72)
+    :highlight (rgb 143 117 73)
+    :shadow (rgb 8 6 4)
+    :comment (rgb 164 128 70)
+    :string (rgb 240 196 116)
+    :form (rgb 255 214 128)
+    :keyword (rgb 255 156 72)
+    :number (rgb 255 118 84)
+    :note (rgb 224 172 255)}
+   {:id "retro-phosphor"
+    :label "Phosphor"
+    :class "com.formdev.flatlaf.FlatDarkLaf"
+    :background (rgb 5 18 10)
+    :panel (rgb 12 38 22)
+    :panel-alt (rgb 20 54 32)
+    :field (rgb 0 10 4)
+    :field-alt (rgb 8 30 16)
+    :text (rgb 170 255 176)
+    :muted (rgb 90 170 98)
+    :accent (rgb 86 255 116)
+    :highlight (rgb 74 132 82)
+    :shadow (rgb 0 4 0)
+    :comment (rgb 86 150 92)
+    :string (rgb 130 245 150)
+    :form (rgb 150 255 202)
+    :keyword (rgb 210 255 132)
+    :number (rgb 255 205 112)
+    :note (rgb 185 190 255)}
+   {:id "retro-midnight"
+    :label "Midnight"
+    :class "com.formdev.flatlaf.FlatDarkLaf"
+    :background (rgb 12 14 24)
+    :panel (rgb 27 31 48)
+    :panel-alt (rgb 38 43 63)
+    :field (rgb 5 7 14)
+    :field-alt (rgb 20 24 38)
+    :text (rgb 214 224 255)
+    :muted (rgb 132 146 184)
+    :accent (rgb 128 168 255)
+    :highlight (rgb 78 92 132)
+    :shadow (rgb 2 3 8)
+    :comment (rgb 108 128 160)
+    :string (rgb 126 220 190)
+    :form (rgb 138 178 255)
+    :keyword (rgb 255 198 110)
+    :number (rgb 255 132 140)
+    :note (rgb 210 154 255)}
+   {:id "retro-cherry"
+    :label "Cherry"
+    :class "com.formdev.flatlaf.FlatDarkLaf"
+    :background (rgb 28 12 18)
+    :panel (rgb 55 24 34)
+    :panel-alt (rgb 74 34 48)
+    :field (rgb 14 5 9)
+    :field-alt (rgb 42 18 28)
+    :text (rgb 255 220 226)
+    :muted (rgb 198 126 142)
+    :accent (rgb 255 92 126)
+    :highlight (rgb 142 70 86)
+    :shadow (rgb 6 2 4)
+    :comment (rgb 176 100 118)
+    :string (rgb 255 168 146)
+    :form (rgb 255 118 158)
+    :keyword (rgb 255 210 118)
+    :number (rgb 132 220 255)
+    :note (rgb 218 162 255)}
+   {:id "retro-blue"
+    :label "Blue"
+    :class "com.formdev.flatlaf.FlatDarkLaf"
+    :background (rgb 10 22 32)
+    :panel (rgb 24 46 64)
+    :panel-alt (rgb 34 62 84)
+    :field (rgb 2 12 20)
+    :field-alt (rgb 18 36 52)
+    :text (rgb 198 238 255)
+    :muted (rgb 110 170 196)
+    :accent (rgb 86 204 255)
+    :highlight (rgb 72 116 138)
+    :shadow (rgb 0 5 10)
+   :comment (rgb 88 144 170)
+   :string (rgb 122 242 226)
+   :form (rgb 116 190 255)
+   :keyword (rgb 255 214 108)
+   :number (rgb 255 144 104)
+   :note (rgb 194 160 255)}
+   {:id "retro-oxide"
+    :label "Oxide"
+    :class "com.formdev.flatlaf.FlatDarkLaf"
+    :background (rgb 18 20 20)
+    :panel (rgb 38 42 42)
+    :panel-alt (rgb 52 58 56)
+    :field (rgb 8 10 10)
+    :field-alt (rgb 26 30 29)
+    :text (rgb 224 230 218)
+    :muted (rgb 128 142 132)
+    :accent (rgb 214 120 58)
+    :highlight (rgb 94 104 96)
+    :shadow (rgb 2 3 3)
+    :comment (rgb 108 130 116)
+    :string (rgb 130 214 154)
+    :form (rgb 118 188 238)
+    :keyword (rgb 238 174 82)
+    :number (rgb 236 100 84)
+    :note (rgb 194 144 242)}
+   {:id "retro-crt"
+    :label "CRT"
+    :class "com.formdev.flatlaf.FlatDarkLaf"
+    :background (rgb 7 18 20)
+    :panel (rgb 13 42 44)
+    :panel-alt (rgb 22 58 60)
+    :field (rgb 0 8 9)
+    :field-alt (rgb 8 29 31)
+    :text (rgb 190 255 224)
+    :muted (rgb 88 172 148)
+    :accent (rgb 64 240 188)
+    :highlight (rgb 50 118 112)
+    :shadow (rgb 0 3 4)
+    :comment (rgb 80 154 132)
+    :string (rgb 114 255 168)
+    :form (rgb 102 216 255)
+    :keyword (rgb 254 230 112)
+    :number (rgb 255 132 84)
+    :note (rgb 190 154 255)}
+   {:id "retro-plum"
+    :label "Plum"
+    :class "com.formdev.flatlaf.FlatDarkLaf"
+    :background (rgb 22 17 28)
+    :panel (rgb 42 32 54)
+    :panel-alt (rgb 58 44 72)
+    :field (rgb 10 6 16)
+    :field-alt (rgb 31 22 42)
+    :text (rgb 238 224 248)
+    :muted (rgb 164 138 178)
+    :accent (rgb 224 110 190)
+    :highlight (rgb 102 78 118)
+    :shadow (rgb 4 2 8)
+    :comment (rgb 144 118 158)
+    :string (rgb 134 224 182)
+    :form (rgb 128 188 255)
+    :keyword (rgb 255 204 104)
+    :number (rgb 255 128 112)
+    :note (rgb 224 152 255)}
+   {:id "retro-steel"
+    :label "Steel"
+    :class "com.formdev.flatlaf.FlatDarkLaf"
+    :background (rgb 20 24 28)
+    :panel (rgb 40 48 54)
+    :panel-alt (rgb 54 64 72)
+    :field (rgb 9 12 16)
+    :field-alt (rgb 28 34 40)
+    :text (rgb 226 234 238)
+    :muted (rgb 136 154 164)
+    :accent (rgb 116 178 204)
+    :highlight (rgb 92 108 118)
+    :shadow (rgb 3 5 7)
+    :comment (rgb 112 136 146)
+    :string (rgb 126 218 170)
+    :form (rgb 130 188 255)
+    :keyword (rgb 246 198 92)
+    :number (rgb 238 116 96)
+    :note (rgb 200 154 246)}
+   {:id "retro-bone"
+    :label "Bone"
+    :class "com.formdev.flatlaf.FlatLightLaf"
+    :background (rgb 190 190 178)
+    :panel (rgb 172 172 160)
+    :panel-alt (rgb 222 222 210)
+    :field (rgb 235 235 224)
+    :field-alt (rgb 198 198 186)
+    :text (rgb 10 12 12)
+    :muted (rgb 64 66 62)
+    :accent (rgb 94 82 66)
+    :highlight (rgb 252 252 238)
+    :shadow (rgb 56 58 54)
+    :comment (rgb 70 88 68)
+    :string (rgb 0 86 66)
+    :form (rgb 66 58 126)
+    :keyword (rgb 0 72 108)
+    :number (rgb 116 54 0)
+    :note (rgb 110 40 98)}
+   {:id "retro-paper"
+    :label "Paper"
+    :class "com.formdev.flatlaf.FlatLightLaf"
+    :background (rgb 215 213 200)
+    :panel (rgb 196 194 180)
+    :panel-alt (rgb 232 230 216)
+    :field (rgb 250 248 232)
+    :field-alt (rgb 204 202 188)
+    :text (rgb 14 17 18)
+    :muted (rgb 80 78 70)
+    :accent (rgb 126 55 18)
+    :highlight (rgb 255 254 238)
+    :shadow (rgb 70 68 58)
+    :comment (rgb 76 100 66)
+    :string (rgb 0 96 72)
+    :form (rgb 82 48 138)
+    :keyword (rgb 0 76 116)
+    :number (rgb 132 56 0)
+    :note (rgb 126 34 104)}
+   {:id "retro-light"
+    :label "Light"
+    :class "com.formdev.flatlaf.FlatLightLaf"
+    :background (rgb 214 216 210)
+    :panel (rgb 194 197 190)
+    :panel-alt (rgb 238 240 234)
+    :field (rgb 252 253 246)
+    :field-alt (rgb 218 221 214)
+    :text (rgb 8 12 14)
+    :muted (rgb 72 76 76)
+    :accent (rgb 0 84 112)
+    :highlight (rgb 255 255 250)
+    :shadow (rgb 62 66 66)
+    :comment (rgb 70 96 70)
+    :string (rgb 0 92 68)
+    :form (rgb 74 54 142)
+    :keyword (rgb 0 76 124)
+    :number (rgb 126 54 0)
+    :note (rgb 120 42 118)}])
+
+(defn preferences-file []
+  (child-file (app-dir) preferences-file-name))
+
+(defn read-app-preferences []
+  (let [file (preferences-file)]
+    (if (.exists file)
+      (try
+        (let [value (edn/read-string (slurp file))]
+          (if (map? value) value {}))
+        (catch Exception _ {}))
+      {})))
+
+(defn write-app-preferences! [prefs]
+  (try
+    (spit (preferences-file) (pr-str prefs))
+    true
+    (catch Exception _ false)))
+
+(defn theme-option [theme-id]
+  (or (some #(when (= (:id %) theme-id) %) theme-options)
+      (first theme-options)))
+
+(defn saved-theme-id []
+  (or (get (read-app-preferences) (keyword theme-preference-key))
+      default-theme-id))
+
+(defn save-theme-id! [theme-id]
+  (write-app-preferences! (assoc (read-app-preferences)
+                                 (keyword theme-preference-key)
+                                 theme-id)))
+
+(defn saved-tools-width []
+  (let [value (get (read-app-preferences) (keyword tools-width-preference-key))]
+    (if (number? value)
+      (max 96 (min 420 (int value)))
+      default-tools-width)))
+
+(defn save-tools-width! [width]
+  (when (number? width)
+    (write-app-preferences! (assoc (read-app-preferences)
+                                   (keyword tools-width-preference-key)
+                                   (max 96 (min 420 (int width)))))))
+
+(defn set-tools-panel-width! [^JSplitPane split width]
+  (when (and split (number? width))
+    (let [split-width (.getWidth split)
+          target (max 96 (min 420 (int width)))
+          divider (.getDividerSize split)]
+      (when (pos? split-width)
+        (.setDividerLocation split (max 0 (- split-width target divider)))))))
+
+(defn saved-window-bounds []
+  (let [prefs (read-app-preferences)
+        x (get prefs (keyword window-x-preference-key))
+        y (get prefs (keyword window-y-preference-key))
+        width (get prefs (keyword window-width-preference-key))
+        height (get prefs (keyword window-height-preference-key))]
+    (when (and (number? x)
+               (number? y)
+               (number? width)
+               (number? height)
+               (>= width 520)
+               (>= height 360))
+      {:x (int x)
+       :y (int y)
+       :width (int width)
+       :height (int height)})))
+
+(defn save-window-bounds! [^JFrame frame]
+  (when (and frame (.isDisplayable frame))
+    (let [prefs (read-app-preferences)]
+      (write-app-preferences!
+        (assoc prefs
+               (keyword window-x-preference-key) (.getX frame)
+               (keyword window-y-preference-key) (.getY frame)
+               (keyword window-width-preference-key) (.getWidth frame)
+               (keyword window-height-preference-key) (.getHeight frame))))))
+
+(defn clear-layout-preferences! []
+  (write-app-preferences!
+    (apply dissoc
+           (read-app-preferences)
+           (map keyword [tools-width-preference-key
+                         window-x-preference-key
+                         window-y-preference-key
+                         window-width-preference-key
+                         window-height-preference-key]))))
+
+(def retro-ui-font (Font. Font/MONOSPACED Font/BOLD 12))
+(def retro-editor-font (Font. Font/MONOSPACED Font/BOLD 14))
+
+(defn put-ui-color! [key value]
+  (UIManager/put key value))
+
+(defn put-ui-int! [key value]
+  (UIManager/put key (Integer/valueOf (int value))))
+
+(defn apply-ui-manager-theme! [theme]
+  (put-ui-color! "Panel.background" (:background theme))
+  (put-ui-color! "MenuBar.background" (:background theme))
+  (put-ui-color! "MenuBar.foreground" (:text theme))
+  (put-ui-color! "Menu.background" (:background theme))
+  (put-ui-color! "Menu.foreground" (:text theme))
+  (put-ui-color! "Menu.selectionBackground" (:panel-alt theme))
+  (put-ui-color! "Menu.selectionForeground" (:text theme))
+  (put-ui-color! "MenuItem.background" (:background theme))
+  (put-ui-color! "MenuItem.foreground" (:text theme))
+  (put-ui-color! "MenuItem.selectionBackground" (:panel-alt theme))
+  (put-ui-color! "MenuItem.selectionForeground" (:text theme))
+  (put-ui-color! "PopupMenu.background" (:background theme))
+  (put-ui-color! "PopupMenu.foreground" (:text theme))
+  (put-ui-color! "RadioButtonMenuItem.background" (:background theme))
+  (put-ui-color! "RadioButtonMenuItem.foreground" (:text theme))
+  (put-ui-color! "RadioButtonMenuItem.selectionBackground" (:panel-alt theme))
+  (put-ui-color! "RadioButtonMenuItem.selectionForeground" (:text theme))
+  (put-ui-color! "CheckBoxMenuItem.background" (:background theme))
+  (put-ui-color! "CheckBoxMenuItem.foreground" (:text theme))
+  (put-ui-color! "CheckBoxMenuItem.selectionBackground" (:panel-alt theme))
+  (put-ui-color! "CheckBoxMenuItem.selectionForeground" (:text theme))
+  (put-ui-color! "Button.background" (:panel-alt theme))
+  (put-ui-color! "Button.foreground" (:text theme))
+  (put-ui-color! "Button.borderColor" (:shadow theme))
+  (put-ui-color! "Button.focusedBorderColor" (:highlight theme))
+  (put-ui-color! "Button.hoverBorderColor" (:highlight theme))
+  (put-ui-color! "Button.focusedBackground" (:panel-alt theme))
+  (put-ui-color! "Button.default.background" (:panel-alt theme))
+  (put-ui-color! "Button.default.foreground" (:text theme))
+  (put-ui-color! "Button.default.borderColor" (:shadow theme))
+  (put-ui-color! "Button.default.focusedBorderColor" (:highlight theme))
+  (put-ui-color! "Button.default.hoverBorderColor" (:highlight theme))
+  (put-ui-color! "ComboBox.background" (:field-alt theme))
+  (put-ui-color! "ComboBox.foreground" (:text theme))
+  (put-ui-color! "Label.foreground" (:text theme))
+  (put-ui-color! "OptionPane.background" (:background theme))
+  (put-ui-color! "OptionPane.foreground" (:text theme))
+  (put-ui-color! "OptionPane.messageForeground" (:text theme))
+  (put-ui-color! "OptionPane.buttonAreaBackground" (:background theme))
+  (put-ui-color! "OptionPane.messageAreaBackground" (:background theme))
+  (put-ui-color! "OptionPane.borderColor" (:shadow theme))
+  (put-ui-color! "TabbedPane.background" (:background theme))
+  (put-ui-color! "TabbedPane.foreground" (:text theme))
+  (put-ui-color! "TabbedPane.selectedBackground" (:panel theme))
+  (put-ui-color! "TabbedPane.selectedForeground" (:text theme))
+  (put-ui-color! "TabbedPane.inactiveForeground" (:muted theme))
+  (put-ui-color! "TabbedPane.disabledForeground" (:muted theme))
+  (put-ui-color! "TabbedPane.tabAreaBackground" (:background theme))
+  (put-ui-color! "TabbedPane.hoverColor" (:panel-alt theme))
+  (put-ui-color! "TextComponent.background" (:field theme))
+  (put-ui-color! "TextComponent.foreground" (:text theme))
+  (put-ui-color! "TextField.background" (:field theme))
+  (put-ui-color! "TextField.foreground" (:text theme))
+  (put-ui-color! "TextPane.background" (:field theme))
+  (put-ui-color! "TextPane.foreground" (:text theme))
+  (put-ui-color! "ScrollPane.background" (:background theme))
+  (put-ui-color! "Viewport.background" (:field theme))
+  (put-ui-color! "Component.focusColor" (:accent theme))
+  (put-ui-color! "Component.focusedBorderColor" (:shadow theme))
+  (put-ui-color! "Component.borderColor" (:shadow theme))
+  (put-ui-color! "Component.custom.borderColor" (:shadow theme))
+  (put-ui-color! "TextComponent.focusedBorderColor" (:shadow theme))
+  (put-ui-color! "TextComponent.borderColor" (:shadow theme))
+  (put-ui-color! "ScrollPane.borderColor" (:shadow theme))
+  (put-ui-color! "TabbedPane.focusColor" (:accent theme))
+  (put-ui-color! "TabbedPane.underlineColor" (:accent theme))
+  (doseq [key ["Button.arc" "Component.arc" "CheckBox.arc" "ComboBox.arc" "TextComponent.arc" "TabbedPane.tabArc"]]
+    (put-ui-int! key 0))
+  (doseq [key ["defaultFont" "Button.font" "ComboBox.font" "Label.font" "Menu.font" "MenuItem.font" "TabbedPane.font"]]
+    (UIManager/put key retro-ui-font)))
+
+(defn style-button! [^JButton button theme]
+  (.setFont button retro-ui-font)
+  (.setBackground button (:panel-alt theme))
+  (.setForeground button (:text theme))
+  (.setFocusPainted button false)
+  (.setBorderPainted button true)
+  (.setContentAreaFilled button true)
+  (.setOpaque button true)
+  (.setBorder button (bevel-border theme)))
+
+(declare style-component!)
+
+(defn style-menu-item! [^JMenuItem item theme]
+  (.setFont item retro-ui-font)
+  (.setBackground item (:background theme))
+  (.setForeground item (:text theme))
+  (.setOpaque item true)
+  (.setBorder item (BorderFactory/createEmptyBorder 3 8 3 8)))
+
+(defn style-popup-menu! [^JPopupMenu popup theme]
+  (.setBackground popup (:background theme))
+  (.setForeground popup (:text theme))
+  (.setBorder popup (LineBorder. (:shadow theme) 1))
+  (doseq [child (.getComponents popup)]
+    (style-component! child theme)))
+
+(defn style-menu! [^JMenu menu theme]
+  (style-menu-item! menu theme)
+  (style-popup-menu! (.getPopupMenu menu) theme))
+
+(defn style-component! [^Component component theme]
+  (cond
+    (instance? JButton component)
+    (style-button! component theme)
+
+    (instance? JMenu component)
+    (style-menu! component theme)
+
+    (instance? JMenuItem component)
+    (style-menu-item! component theme)
+
+    (instance? JPopupMenu component)
+    (style-popup-menu! component theme)
+
+    (instance? JMenuBar component)
+    (doto ^JMenuBar component
+      (.setBackground (:background theme))
+      (.setForeground (:text theme))
+      (.setBorder (LineBorder. (:shadow theme) 1)))
+
+    (instance? JComboBox component)
+    (doto ^JComboBox component
+      (.setFont retro-ui-font)
+      (.setBackground (:field-alt theme))
+      (.setForeground (:text theme)))
+
+    (instance? JLabel component)
+    (doto ^JLabel component
+      (.setFont retro-ui-font)
+      (.setForeground (:text theme)))
+
+    (instance? JTextPane component)
+    (let [name (.getName component)
+          editor? (= name "mescript-editor")
+          gutter? (= name "mescript-line-numbers")]
+      (doto ^JTextPane component
+        (.setFont (if editor? retro-editor-font retro-ui-font))
+        (.setBackground (if gutter? (:field-alt theme) (:field theme)))
+        (.setForeground (if gutter? (:muted theme) (:text theme)))
+        (.setCaretColor (:accent theme))
+        (.setSelectedTextColor (:background theme))
+        (.setSelectionColor (:accent theme))
+        (.setBorder (BorderFactory/createEmptyBorder 0 6 0 6)))
+      (when editor?
+        (refresh-syntax-colors! component)))
+
+    (instance? JTextField component)
+    (doto ^JTextField component
+      (.setFont retro-ui-font)
+      (.setBackground (:field theme))
+      (.setForeground (:text theme))
+      (.setCaretColor (:accent theme))
+      (.setBorder (bevel-border theme)))
+
+    (instance? JTabbedPane component)
+    (doto ^JTabbedPane component
+      (.setFont retro-ui-font)
+      (.setBackground (:background theme))
+      (.setForeground (:text theme)))
+
+    (instance? JSplitPane component)
+    (doto ^JSplitPane component
+      (.setBackground (:background theme))
+      (.setForeground (:accent theme)))
+
+    (instance? JComponent component)
+    (doto ^JComponent component
+      (.setBackground (:background theme))
+      (.setForeground (:text theme))))
+  (when (instance? JScrollPane component)
+    (let [scroll ^JScrollPane component]
+      (.setBackground scroll (:background theme))
+      (.setBorder scroll (editor-border theme))
+      (.setBackground (.getViewport scroll) (:field theme))
+      (when-let [row-header (.getRowHeader scroll)]
+        (.setBackground row-header (:field-alt theme)))))
+  (when (instance? Container component)
+    (doseq [child (.getComponents ^Container component)]
+      (style-component! child theme))))
+
+(defn apply-component-theme! [theme]
+  (set-syntax-theme! theme)
+  (doseq [^Window window (Window/getWindows)]
+    (style-component! window theme)))
+
+(defn refresh-window-themes! []
+  (doseq [^Window window (Window/getWindows)]
+    (SwingUtilities/updateComponentTreeUI window)
+    (when-let [theme (:theme-data @state)]
+      (style-component! window theme))
+    (.revalidate window)
+    (.repaint window)))
+
+(defn apply-theme-id! [theme-id]
+  (let [{:keys [id class]} (theme-option theme-id)]
+    (try
+      (Class/forName class)
+      (UIManager/setLookAndFeel class)
+      (apply-ui-manager-theme! (theme-option id))
+      (save-theme-id! id)
+      (swap! state assoc :theme id :theme-data (theme-option id))
+      (apply-component-theme! (theme-option id))
+      (refresh-window-themes!)
+      {:ok true :theme id}
+      (catch Exception ex
+        {:ok false :theme id :message (.getMessage ex)}))))
+
+(defn apply-saved-theme! []
+  (apply-theme-id! (saved-theme-id)))
 
 (defn menu-item [text f]
   (doto (JMenuItem. text)
@@ -810,8 +1476,818 @@
                           (actionPerformed [_ _] (f (.isSelected item)))))
     item))
 
+(defn inspector-tokenize-command [command]
+  (->> (str/split (str/trim command) #"\s+")
+       (remove str/blank?)
+       vec))
+
+(defn inspector-param-key [token]
+  (let [token (str token)]
+    (if (str/starts-with? token ":")
+      token
+      (str ":" token))))
+
+(defn inspector-def-range-map [source]
+  (reduce
+    (fn [defs [start end]]
+      (let [text (subs source start (inc end))]
+        (try
+          (let [form (first (read-source-forms text))
+                def-symbol (second form)]
+            (if (symbol? def-symbol)
+              (assoc defs (str def-symbol)
+                     {:kind :def
+                      :symbol def-symbol
+                      :source-start start
+                      :source-end end
+                      :text text
+                      :form form})
+              defs))
+          (catch Exception _
+            defs))))
+    {}
+    (form-ranges source "def")))
+
+(defn inspector-top-level-form-ranges [source form-name]
+  (let [scene-ranges (concat (form-ranges source "scene")
+                             (form-ranges source "block")
+                             (form-ranges source "def"))]
+    (->> (form-ranges source form-name)
+         (remove (fn [[start _]] (inside-any-range? start scene-ranges)))
+         vec)))
+
+(defn inspector-track-form? [form]
+  (and (seq? form)
+       (#{'d 'sample} (first form))
+       (keyword? (second form))))
+
+(defn inspector-track-key [track-id]
+  (if (str/starts-with? track-id ":")
+    (subs track-id 1)
+    track-id))
+
+(defn inspector-track-entry [source start end form extra]
+  (let [track-id (name (second form))
+        text (subs source start (inc end))]
+    (merge {:kind :track
+            :symbol nil
+            :track-id track-id
+            :source-start start
+            :source-end end
+            :track-source-start start
+            :track-source-end end
+            :text text
+            :form form
+            :track-form form}
+           extra)))
+
+(defn inspector-nested-track-ranges [source start end]
+  (let [visible (code-visible-text source)]
+    (loop [idx start
+           ranges []]
+      (if (>= idx end)
+        ranges
+        (let [d-found (.indexOf visible "(d" idx)
+              sample-found (.indexOf visible "(sample" idx)
+              candidates (->> [d-found sample-found]
+                              (filter #(and (>= % 0) (<= % end)))
+                              sort)
+              open (first candidates)]
+          (if-not open
+            ranges
+            (if (or (form-symbol-at? visible open "d")
+                    (form-symbol-at? visible open "sample"))
+              (if-let [close (matching-close source open \( \))]
+                (recur (inc close) (if (<= close end)
+                                     (conj ranges [open close])
+                                     ranges))
+                (recur (inc open) ranges))
+              (recur (inc open) ranges))))))))
+
+(defn inspector-assoc-track [tracks key entry]
+  (if (contains? tracks key)
+    tracks
+    (assoc tracks key entry)))
+
+(defn inspector-assoc-track-aliases [tracks track-id entry]
+  (let [bare (name track-id)
+        keyed (str ":" bare)]
+    (-> tracks
+        (inspector-assoc-track bare entry)
+        (inspector-assoc-track keyed entry))))
+
+(defn inspector-track-range-map [source]
+  (let [defs (inspector-def-range-map source)
+        def-tracks (reduce-kv
+                     (fn [tracks def-name info]
+                       (let [value (nth (:form info) 2 nil)]
+                         (if (inspector-track-form? value)
+                           (assoc tracks def-name
+                                  (assoc info
+                                         :track-id (name (second value))
+                                         :track-form value
+                                         :track-source-start (:source-start info)
+                                         :track-source-end (:source-end info)))
+                           tracks)))
+                     {}
+                     defs)
+        top-level-tracks (reduce
+                           (fn [tracks [start end]]
+                             (let [text (subs source start (inc end))]
+                               (try
+	                                 (let [form (first (read-source-forms text))]
+	                                   (if (inspector-track-form? form)
+	                                     (inspector-assoc-track-aliases
+	                                       tracks
+	                                       (second form)
+	                                       (inspector-track-entry source start end form {}))
+	                                     tracks))
+                                 (catch Exception _
+                                   tracks))))
+                           {}
+                           (inspector-top-level-form-ranges source "d"))
+        top-level-samples (reduce
+                            (fn [tracks [start end]]
+                              (let [text (subs source start (inc end))]
+                                (try
+                                  (let [form (first (read-source-forms text))]
+                                    (if (inspector-track-form? form)
+                                      (inspector-assoc-track-aliases
+                                        tracks
+                                        (second form)
+                                        (inspector-track-entry source start end form {}))
+                                      tracks))
+                                  (catch Exception _
+                                    tracks))))
+                            {}
+                            (inspector-top-level-form-ranges source "sample"))
+        nested-tracks (reduce
+                        (fn [tracks [_ info]]
+                          (reduce
+                            (fn [tracks [start end]]
+                              (let [text (subs source start (inc end))]
+                                (try
+                                  (let [form (first (read-source-forms text))]
+                                    (if (inspector-track-form? form)
+                                      (inspector-assoc-track-aliases
+                                        tracks
+                                        (second form)
+                                        (inspector-track-entry
+                                          source start end form
+                                          {:container-symbol (:symbol info)
+                                           :container-source-start (:source-start info)
+                                           :container-source-end (:source-end info)}))
+                                      tracks))
+                                  (catch Exception _
+                                    tracks))))
+                            tracks
+                            (inspector-nested-track-ranges source
+                                                           (:source-start info)
+                                                           (:source-end info))))
+                        {}
+                        defs)]
+    (merge top-level-tracks top-level-samples def-tracks nested-tracks)))
+
+(declare inspector-editable-result)
+
+(defn inspector-scene-range-map [source]
+  (reduce
+    (fn [scenes [start end]]
+      (let [text (subs source start (inc end))]
+        (try
+          (let [form (first (read-source-forms text))
+                scene-id (second form)]
+            (if (keyword? scene-id)
+              (assoc scenes (name scene-id)
+                     {:kind :scene
+                      :scene-id scene-id
+                      :source-start start
+                      :source-end end
+                      :text text
+                      :form form})
+              scenes))
+          (catch Exception _
+            scenes))))
+    {}
+    (form-ranges source "scene")))
+
+(defn inspector-scene-source-result [source target]
+  (let [key (if (str/starts-with? target ":") (subs target 1) target)
+        scenes (inspector-scene-range-map source)]
+    (if-let [{:keys [source-start source-end text scene-id]} (get scenes key)]
+      (inspector-editable-result :scene source source-start source-end text {:scene-id scene-id})
+      {:text (str "unknown scene " target)
+       :editable false})))
+
+(defn inspector-bpm-result [source]
+  (let [ranges (inspector-top-level-form-ranges source "bpm")]
+    (if-let [[start end] (last ranges)]
+      (let [text (subs source start (inc end))
+            form (first (read-source-forms text))
+            value (second form)
+            value-text (emit-form value)
+            value-start (.indexOf source value-text start)]
+        (if (and (>= value-start 0) (<= value-start end))
+          (inspector-editable-result :bpm source value-start (dec (+ value-start (count value-text))) value-text {})
+          {:text (str "bpm " (bpm-from-source source))
+           :editable false}))
+      {:text (str "bpm " (bpm-from-source source) "\nno top-level (bpm N) form found")
+       :editable false})))
+
+(defn inspector-token-range [text offset limit]
+  (let [visible (code-visible-text text)
+        offset (loop [idx offset]
+                 (if (and (< idx limit)
+                          (Character/isWhitespace (.charAt visible idx)))
+                   (recur (inc idx))
+                   idx))]
+    (when (< offset limit)
+      (let [ch (.charAt visible offset)]
+        (cond
+          (= ch \()
+          (when-let [close (matching-close text offset \( \))]
+            [offset close])
+
+          (= ch \[)
+          (when-let [close (matching-close text offset \[ \])]
+            [offset close])
+
+          :else
+          [offset
+           (dec (loop [idx offset]
+                  (if (and (< idx limit)
+                           (let [ch (.charAt visible idx)]
+                             (not (or (Character/isWhitespace ch)
+                                      (contains? #{\( \) \[ \] \;} ch)))))
+                    (recur (inc idx))
+                    idx)))])))))
+
+(defn inspector-find-track-form-range [source start end]
+  (let [visible (code-visible-text source)]
+    (loop [idx start]
+      (when-let [open (let [found (.indexOf visible "(d" idx)]
+                        (when (and (>= found 0) (<= found end)) found))]
+        (if (form-symbol-at? visible open "d")
+          (when-let [close (matching-close source open \( \))]
+            (when (<= close end)
+              [open close]))
+          (recur (inc open)))))))
+
+(defn inspector-param-value-range [source track-start track-end param-key]
+  (let [visible (code-visible-text source)
+        needle (str param-key)
+        limit (inc track-end)]
+    (loop [idx (inc track-start)
+           depth 0
+           in-string? false
+           escape? false
+           in-comment? false]
+      (when (< idx limit)
+        (let [ch (.charAt visible idx)]
+          (cond
+            in-comment?
+            (recur (inc idx) depth false false (not= ch \newline))
+
+            escape?
+            (recur (inc idx) depth in-string? false false)
+
+            (and in-string? (= ch \\))
+            (recur (inc idx) depth true true false)
+
+            (= ch \")
+            (recur (inc idx) depth (not in-string?) false false)
+
+            in-string?
+            (recur (inc idx) depth true false false)
+
+            (= ch \;)
+            (recur (inc idx) depth false false true)
+
+            (= ch \()
+            (recur (inc idx) (inc depth) false false false)
+
+            (= ch \))
+            (recur (inc idx) (dec depth) false false false)
+
+            (= ch \[)
+            (recur (inc idx) (inc depth) false false false)
+
+            (= ch \])
+            (recur (inc idx) (dec depth) false false false)
+
+	            (and (= depth 0)
+	                 (= needle (subs visible idx (min limit (+ idx (count needle)))))
+                 (or (= (+ idx (count needle)) limit)
+                     (Character/isWhitespace (.charAt visible (+ idx (count needle))))))
+            (inspector-token-range source (+ idx (count needle)) limit)
+
+            :else
+            (recur (inc idx) depth false false false)))))))
+
+(defn inspector-track-param-value [track-form param-key]
+  (let [target (keyword (subs param-key 1))]
+    (loop [items (nnext track-form)]
+      (when (seq items)
+        (if (= target (first items))
+          (second items)
+          (recur (next items)))))))
+
+(defn inspector-editable-result [kind source start end text extra]
+  (merge {:kind kind
+          :source-start start
+          :source-end end
+          :text text
+          :editable true}
+         extra))
+
+(defn inspector-symbol-result [source sym]
+  (let [defs (inspector-def-range-map source)
+        tracks (inspector-track-range-map source)]
+    (cond
+      (contains? defs sym)
+      (let [{:keys [source-start source-end text symbol]} (get defs sym)]
+        (inspector-editable-result :def source source-start source-end text {:symbol symbol}))
+
+      (contains? tracks sym)
+      (let [{:keys [source-start source-end text symbol track-id]} (get tracks sym)]
+        (inspector-editable-result (if symbol :def :track)
+                                   source source-start source-end text
+                                   {:symbol symbol :track-id track-id}))
+
+      :else
+      {:text (str "unknown symbol '" sym "'")
+       :editable false})))
+
+(defn inspector-symbol-param-result [source sym param-key]
+  (let [defs (inspector-def-range-map source)
+        tracks (inspector-track-range-map source)
+        track (get tracks sym)]
+    (if-not track
+      {:text (str "unknown track or def '" sym "'")
+       :editable false}
+      (let [value (inspector-track-param-value (:track-form track) param-key)]
+        (cond
+          (nil? value)
+          {:text (str sym " has no " param-key)
+           :editable false}
+
+          (and (symbol? value)
+               (contains? defs (name value)))
+          (let [{:keys [source-start source-end text symbol]} (get defs (name value))]
+            (inspector-editable-result :def source source-start source-end text {:symbol symbol}))
+
+          :else
+          (let [[track-start track-end] (or (and (:symbol track)
+                                                 (inspector-find-track-form-range source
+                                                                                  (:source-start track)
+                                                                                  (:source-end track)))
+                                            [(:track-source-start track)
+                                             (:track-source-end track)])
+                [value-start value-end] (inspector-param-value-range source
+                                                                     track-start
+                                                                     track-end
+                                                                     param-key)
+                text (if (and value-start value-end)
+                       (subs source value-start (inc value-end))
+                       (emit-form value))]
+            (if (and value-start value-end)
+              (inspector-editable-result :value source value-start value-end text
+                                         {:symbol (:symbol track)
+                                          :track-id (:track-id track)
+                                          :param param-key})
+              {:text text
+               :editable false})))))))
+
+(defn inspector-compile-expanded-forms [source tail-form]
+  (->> (str source "\n" tail-form "\n")
+       compile-glitchlisp-source
+       read-source-forms))
+
+(defn inspector-expand-symbol-result [source sym]
+  (try
+    (let [forms (inspector-compile-expanded-forms source sym)]
+      {:text (if-let [form (last forms)]
+               (emit-form form)
+               (str "no expanded form for " sym))
+       :editable false})
+    (catch Exception ex
+      {:text (clean-error-message ex)
+       :editable false})))
+
+(defn inspector-expand-param-result [source sym param-key]
+  (try
+    (let [forms (inspector-compile-expanded-forms source sym)
+          form (last forms)
+          value (when (and (seq? form) (= 'd (first form)))
+                  (inspector-track-param-value form param-key))]
+      {:text (if value
+               (emit-form value)
+               (str sym " has no " param-key " after expansion"))
+       :editable false})
+    (catch Exception ex
+      {:text (clean-error-message ex)
+       :editable false})))
+
+(defn inspector-compiled-forms [source]
+  (-> source compile-glitchlisp-source read-source-forms))
+
+(defn inspector-compiled-scenes [source]
+  (->> (inspector-compiled-forms source)
+       (filter scene-form?)
+       (map (fn [form] [(scene-name form) form]))
+       (into {})))
+
+(defn inspector-compiled-tracks [source]
+  (->> (inspector-compiled-forms source)
+       (mapcat (fn [form]
+                 (cond
+                   (top-level-track? form) [form]
+                   (scene-form? form) (filter top-level-track? (scene-body-forms form))
+                   :else [])))
+       (map (fn [form] [(track-id form) form]))
+       (into {})))
+
+(defn inspector-list-result [source kind]
+  (try
+    {:text (case kind
+             "defs" (str/join "\n" (sort (keys (inspector-def-range-map source))))
+             "tracks" (str/join "\n" (sort (map #(str %) (keys (inspector-compiled-tracks source)))))
+             "scenes" (str/join "\n" (sort (map #(str %) (keys (inspector-compiled-scenes source))))))
+     :editable false}
+    (catch Exception ex
+      {:text (clean-error-message ex)
+       :editable false})))
+
+(defn inspector-track-info-text [track-form]
+  (let [items (track-param-items track-form)
+        gate (or (pair-value items :gate) 1)
+        note (or (pair-value items :note) 'c3)
+        gate-summary (gate-pattern-summary gate)
+        note-summary (note-pattern-summary note)
+        loop-steps (track-loop-steps track-form)]
+    (str "track " (track-id track-form) "\n"
+         "loop steps: " loop-steps "\n"
+         "gate length: " (:length gate-summary) "\n"
+         "gate hits: " (:hits gate-summary) "\n"
+         "gate slots: " (:slots gate-summary) "\n"
+         "note length: " (:length note-summary) "\n"
+         "note mode: " (name (:mode note-summary)))))
+
+(defn inspector-scene-track-lines [scene-form]
+  (->> (scene-body-forms scene-form)
+       (filter top-level-track?)
+       (map (fn [track-form]
+              (let [items (track-param-items track-form)
+                    gate-summary (gate-pattern-summary (or (pair-value items :gate) 1))
+                    note-summary (note-pattern-summary (or (pair-value items :note) 'c3))]
+                (str "  " (track-id track-form)
+                     " gate=" (:length gate-summary)
+                     " hits=" (:hits gate-summary)
+                     " notes=" (:length note-summary)
+                     " note-mode=" (name (:mode note-summary))))))))
+
+(defn inspector-scene-info-text [scene-form]
+  (let [declared (or (scene-option-value scene-form :steps)
+                     (scene-option-value scene-form :length))
+        effective (scene-steps-from-form scene-form)
+        inferred (try
+                   (scene-inferred-steps scene-form)
+                   (catch Exception _ nil))
+        repeat-count (scene-repeat-from-form scene-form)
+        lines (inspector-scene-track-lines scene-form)]
+    (str "scene " (scene-name scene-form) "\n"
+         "declared steps: " (or declared "-") "\n"
+         "effective steps: " effective "\n"
+         "inferred full loop: " (or inferred "-") "\n"
+         "repeat: " (if (zero? repeat-count) "loop" repeat-count) "\n"
+         "\ntracks:\n"
+         (if (seq lines) (str/join "\n" lines) "  -"))))
+
+(defn inspector-info-result [source target]
+  (try
+    (cond
+      (str/starts-with? target ":")
+      (let [scene-key (keyword (subs target 1))
+            scenes (inspector-compiled-scenes source)]
+        (if-let [scene-form (get scenes scene-key)]
+          {:text (inspector-scene-info-text scene-form) :editable false}
+          {:text (str "unknown scene " target) :editable false}))
+
+      :else
+      (let [tracks (inspector-compiled-tracks (str source "\n" target "\n"))
+            form (last (inspector-compile-expanded-forms source target))]
+        (cond
+          (top-level-track? form)
+          {:text (inspector-track-info-text form) :editable false}
+
+          :else
+          (let [summary (gate-pattern-summary form)]
+            {:text (str target "\n"
+                        "steps: " (:length summary) "\n"
+                        "hits: " (:hits summary) "\n"
+                        "slots: " (:slots summary))
+             :editable false}))))
+    (catch Exception ex
+      {:text (clean-error-message ex)
+       :editable false})))
+
+(defn inspector-length-result [source target]
+  (try
+    (if (str/starts-with? target ":")
+      (let [scene-key (keyword (subs target 1))
+            scene-form (get (inspector-compiled-scenes source) scene-key)]
+        {:text (if scene-form
+                 (str (scene-name scene-form) "\n"
+                      "effective steps: " (scene-steps-from-form scene-form) "\n"
+                      "total repeated steps: " (scene-total-steps-from-form scene-form))
+                 (str "unknown scene " target))
+         :editable false})
+      (let [form (last (inspector-compile-expanded-forms source target))]
+        {:text (if (top-level-track? form)
+                 (str target "\nloop steps: " (track-loop-steps form))
+                 (let [summary (gate-pattern-summary form)]
+                   (str target "\nsteps: " (:length summary))))
+         :editable false}))
+    (catch Exception ex
+      {:text (clean-error-message ex)
+       :editable false})))
+
+(defn inspector-hits-result [source target]
+  (try
+    (let [form (last (inspector-compile-expanded-forms source target))
+          gate (if (top-level-track? form)
+                 (or (pair-value (track-param-items form) :gate) 1)
+                 form)
+          summary (gate-pattern-summary gate)]
+      {:text (str target "\n"
+                  "steps: " (:length summary) "\n"
+                  "hits: " (:hits summary) "\n"
+                  "slots: " (:slots summary))
+       :editable false})
+    (catch Exception ex
+      {:text (clean-error-message ex)
+       :editable false})))
+
+(defn inspector-command-result [source command]
+  (let [tokens (inspector-tokenize-command command)]
+    (case (count tokens)
+      0 {:text "" :editable false}
+      1 (if (#{"defs" "tracks" "scenes"} (tokens 0))
+          (inspector-list-result source (tokens 0))
+          (if (= "bpm" (tokens 0))
+            (inspector-bpm-result source)
+            (inspector-symbol-result source (tokens 0))))
+	      2 (case (tokens 0)
+	          "expand" (inspector-expand-symbol-result source (tokens 1))
+	          "info" (inspector-info-result source (tokens 1))
+	          "scene" (inspector-scene-source-result source (tokens 1))
+	          "length" (inspector-length-result source (tokens 1))
+          "hits" (inspector-hits-result source (tokens 1))
+          "replace" (inspector-symbol-result source (tokens 1))
+          (inspector-symbol-param-result source (tokens 0) (inspector-param-key (tokens 1))))
+      3 (case (tokens 0)
+          "expand" (inspector-expand-param-result source (tokens 1) (inspector-param-key (tokens 2)))
+          "replace" (inspector-symbol-param-result source (tokens 1) (inspector-param-key (tokens 2)))
+          {:text "unsupported command" :editable false})
+      {:text "unsupported command" :editable false})))
+
+(defn inspector-validate-replacement! [source start end replacement]
+  (let [candidate (str (subs source 0 start)
+                       replacement
+                       (subs source (inc end)))]
+    (valid-live-compiled-source candidate)
+    candidate))
+
+(defn inspector-apply-result! [^JFrame frame ^JTabbedPane tabs ^JTextComponent result-editor ^JLabel inspector-status]
+  (let [result (.getClientProperty result-editor inspector-repl-result-key)]
+    (if-not (and result (:editable result) (:source-start result) (:source-end result))
+      (.setText inspector-status "result is inspect-only; no source range is available")
+      (if-let [editor (active-editor tabs)]
+        (let [replacement (.getText result-editor)
+              start (:source-start result)
+              end (:source-end result)
+              source (.getText editor)]
+          (try
+            (let [candidate (inspector-validate-replacement! source start end replacement)]
+              (cancel-live-auto-update! editor)
+              (.putClientProperty editor live-auto-update-suppressed-key true)
+              (try
+                (.setText editor candidate)
+                (.setCaretPosition editor (min start (count candidate)))
+                (refresh-syntax-colors! editor)
+                (finally
+                  (.putClientProperty editor live-auto-update-suppressed-key false)
+                  (cancel-live-auto-update! editor)))
+              (live-queue-update! frame editor (or (.getClientProperty tabs "mescript.status")
+                                                   inspector-status)
+                                  (:audio-device @state)
+                                  candidate)
+              (.setText inspector-status "applied; queued for next loop")
+              (.putClientProperty result-editor inspector-repl-result-key
+                                  (assoc result
+                                         :source-end (+ start (dec (count replacement)))
+                                         :text replacement)))
+            (catch Exception ex
+              (.setText inspector-status (clean-error-message ex)))))
+	        (.setText inspector-status "no active editor")))))
+
+(defn inspector-play-result! [^JFrame frame ^JTextComponent result-editor ^JLabel inspector-status]
+  (let [source (.getText result-editor)]
+    (if (has-track-form? source)
+      (live-update! frame result-editor inspector-status (:audio-device @state))
+      (.setText inspector-status "play needs a track result: inspect :kick, kick, or a sample/d form"))))
+
+(defn inspector-stop-result! [^JTextComponent result-editor ^JLabel inspector-status]
+  (live-stop! result-editor inspector-status))
+
+(def child-window-set-key "mescript.child-windows")
+
+(defn child-window-set [^JFrame frame]
+  (let [root (.getRootPane frame)]
+    (or (.getClientProperty root child-window-set-key)
+        (let [windows (atom #{})]
+          (.putClientProperty root child-window-set-key windows)
+          windows))))
+
+(defn unregister-child-window! [^JFrame frame ^Window child]
+  (when (and frame child)
+    (when (instance? JFrame child)
+      (.setAlwaysOnTop ^JFrame child false))
+    (swap! (child-window-set frame) disj child)))
+
+(defn register-child-window! [^JFrame frame ^Window child]
+  (when (and frame child)
+    (when (instance? JFrame child)
+      (.setAlwaysOnTop ^JFrame child true))
+    (swap! (child-window-set frame) conj child)
+    (.addWindowListener child
+                        (proxy [WindowAdapter] []
+                          (windowClosed [_]
+                            (unregister-child-window! frame child))))
+    (.toFront child))
+  child)
+
+(defn dispose-child-windows! [^JFrame frame]
+  (when frame
+    (let [windows @(child-window-set frame)]
+      (doseq [^Window child windows]
+        (when (.isDisplayable child)
+          (.dispose child)))
+      (reset! (child-window-set frame) #{}))))
+
+(defn close-main-window! [^JFrame frame ^JTabbedPane tabs ^JLabel status]
+  (when (close-all-tabs! frame tabs status)
+    (dispose-child-windows! frame)
+    (close-live-process!)
+    (.dispose frame)))
+
+(defn refresh-theme-selector-buttons! [buttons]
+  (let [selected (or (:theme @state) (saved-theme-id))]
+    (doseq [[id ^JButton button] buttons]
+      (.setEnabled button (not= id selected))
+      (.setText button (str (if (= id selected) "* " "  ")
+                            (:label (theme-option id)))))))
+
+(defn show-theme-selector! [^JFrame frame ^JLabel status]
+  (let [root (.getRootPane frame)
+        ^JFrame existing (.getClientProperty root theme-selector-frame-key)]
+    (when (and existing (not (.isDisplayable existing)))
+      (.putClientProperty root theme-selector-frame-key nil))
+    (if (and existing (.isDisplayable existing))
+      (do
+        (.setVisible existing true)
+        (.toFront existing)
+        (.requestFocus existing))
+      (let [selector-frame (JFrame. "Theme Selector")
+            panel (JPanel.)
+            buttons (atom {})]
+        (.setName selector-frame "mescript-theme-selector-frame")
+        (.setLayout panel (BoxLayout. panel BoxLayout/Y_AXIS))
+        (.setBorder panel (BorderFactory/createEmptyBorder 8 8 8 8))
+        (doseq [{:keys [id label]} theme-options]
+          (let [button (JButton. label)]
+            (.setName button (str "mescript-theme-" id))
+            (.setAlignmentX button Component/LEFT_ALIGNMENT)
+            (.setMaximumSize button (Dimension. Integer/MAX_VALUE 26))
+            (swap! buttons assoc id button)
+            (.addActionListener button
+                                (reify ActionListener
+                                  (actionPerformed [_ _]
+                                    (let [result (apply-theme-id! id)]
+                                      (if (:ok result)
+                                        (refresh-theme-selector-buttons! @buttons)
+                                        (set-status! status
+                                                     (str "theme failed: " (:message result))))))))
+            (.add panel button)
+            (.add panel (Box/createVerticalStrut 4))))
+        (refresh-theme-selector-buttons! @buttons)
+        (.add (.getContentPane selector-frame) panel BorderLayout/CENTER)
+        (.setSize selector-frame 220 420)
+        (.setLocationRelativeTo selector-frame frame)
+        (register-child-window! frame selector-frame)
+        (.putClientProperty root theme-selector-frame-key selector-frame)
+        (.addWindowListener selector-frame
+                            (proxy [WindowAdapter] []
+                              (windowClosed [_]
+                                (.putClientProperty root theme-selector-frame-key nil))))
+        (when-let [theme (:theme-data @state)]
+          (style-component! selector-frame theme))
+        (.setVisible selector-frame true)))))
+
+(defn inspector-run-command! [^JTabbedPane tabs ^JTextComponent result-editor ^JTextField command-field ^JLabel inspector-status]
+  (if-let [editor (active-editor tabs)]
+    (let [command (.getText command-field)
+          result (inspector-command-result (.getText editor) command)]
+	      (.setText result-editor (:text result))
+	      (.setCaretPosition result-editor 0)
+	      (refresh-syntax-colors! result-editor)
+	      (.putClientProperty result-editor inspector-repl-result-key result)
+      (.setText inspector-status
+                (if (:editable result)
+                  "editable result"
+                  "inspect-only result")))
+    (.setText inspector-status "no active editor")))
+
+(defn show-inspector-repl! [^JFrame frame ^JTabbedPane tabs ^JLabel status]
+  (let [^JFrame existing (.getClientProperty (.getRootPane frame) inspector-repl-frame-key)]
+    (when (and existing (not (.isDisplayable existing)))
+      (.putClientProperty (.getRootPane frame) inspector-repl-frame-key nil))
+    (if (and existing (.isDisplayable existing))
+      (do
+        (.setVisible existing true)
+        (.toFront existing)
+        (.requestFocus existing))
+	      (let [repl-frame (JFrame. "Inspector")
+	            result-editor (JTextPane.)
+	            result-scroll (JScrollPane. result-editor)
+	            command-field (JTextField.)
+	            run-button (JButton. "Run")
+	            play-button (JButton. "Play")
+	            stop-button (JButton. "Stop")
+	            apply-button (JButton. "Apply")
+	            command-row (JPanel. (BorderLayout. 4 0))
+	            button-row (JPanel.)
+	            bottom-panel (JPanel. (BorderLayout.))
+	            inspector-status (JLabel. "ready")]
+      (.setName repl-frame "mescript-inspector-repl-frame")
+      (.setName result-editor "mescript-inspector-result")
+	      (.setName command-field "mescript-inspector-command")
+	      (.setName run-button "mescript-inspector-run")
+	      (.setName play-button "mescript-inspector-play")
+	      (.setName stop-button "mescript-inspector-stop")
+	      (.setName apply-button "mescript-inspector-apply")
+	      (.setFont result-editor (Font. Font/MONOSPACED Font/PLAIN 13))
+	      (.setEditable result-editor true)
+	      (install-syntax-highlighter! result-editor)
+	      (.setVerticalScrollBarPolicy result-scroll ScrollPaneConstants/VERTICAL_SCROLLBAR_ALWAYS)
+	      (.setHorizontalScrollBarPolicy result-scroll ScrollPaneConstants/HORIZONTAL_SCROLLBAR_ALWAYS)
+      (.add command-row (JLabel. "command:") BorderLayout/WEST)
+      (.add command-row command-field BorderLayout/CENTER)
+	      (.add button-row run-button)
+	      (.add button-row play-button)
+	      (.add button-row stop-button)
+	      (.add button-row apply-button)
+      (.add command-row button-row BorderLayout/EAST)
+      (.setBorder command-row (BorderFactory/createEmptyBorder 4 4 4 4))
+      (.setBorder inspector-status (BorderFactory/createEmptyBorder 2 6 4 6))
+      (.addActionListener run-button
+                          (reify ActionListener
+                            (actionPerformed [_ _]
+                              (inspector-run-command! tabs result-editor command-field inspector-status))))
+      (.addActionListener command-field
+                          (reify ActionListener
+                            (actionPerformed [_ _]
+                              (inspector-run-command! tabs result-editor command-field inspector-status))))
+	      (.addActionListener apply-button
+	                          (reify ActionListener
+	                            (actionPerformed [_ _]
+	                              (inspector-apply-result! frame tabs result-editor inspector-status))))
+	      (.addActionListener play-button
+	                          (reify ActionListener
+	                            (actionPerformed [_ _]
+	                              (inspector-play-result! frame result-editor inspector-status))))
+	      (.addActionListener stop-button
+	                          (reify ActionListener
+	                            (actionPerformed [_ _]
+	                              (inspector-stop-result! result-editor inspector-status))))
+      (.setLayout (.getContentPane repl-frame) (BorderLayout.))
+      (.add bottom-panel command-row BorderLayout/CENTER)
+      (.add bottom-panel inspector-status BorderLayout/SOUTH)
+	      (.add (.getContentPane repl-frame) result-scroll BorderLayout/CENTER)
+      (.add (.getContentPane repl-frame) bottom-panel BorderLayout/SOUTH)
+	      (.setSize repl-frame 520 320)
+	      (.setLocationRelativeTo repl-frame frame)
+	      (register-child-window! frame repl-frame)
+	      (.putClientProperty (.getRootPane frame) inspector-repl-frame-key repl-frame)
+	      (.addWindowListener repl-frame
+	                          (proxy [WindowAdapter] []
+                            (windowClosed [_]
+                              (.putClientProperty (.getRootPane frame) inspector-repl-frame-key nil))))
+      (.setVisible repl-frame true)
+      (.requestFocusInWindow command-field)))))
+
 (def about-text
-  "MeScript v0.371\n22 June 2026\nJacob Pereira (jacob.m.pereira@gmail.com)\nquadracollision.com")
+  "MeScript v0.38\n28 June 2026\nJacob Pereira (jacob.m.pereira@gmail.com)\nquadracollision.com")
 
 (defn show-about! [^JFrame frame]
   (JOptionPane/showMessageDialog frame about-text "About MeScript" JOptionPane/INFORMATION_MESSAGE))
@@ -1562,7 +3038,7 @@
         (set-status! status "null parameters: cleared")))))
 
 (defn build-ui [initial-file]
-  (let [frame (JFrame. "temporaworkstation")
+  (let [frame (JFrame. "MeScript")
         tabs (JTabbedPane.)
         status (JLabel. "ready")
         insert-category-combo (JComboBox. (into-array String insert-form-categories))
@@ -1591,9 +3067,9 @@
                               (.putClientProperty (.getRootPane frame) "mescript.editor" editor)))))
     (.setLayout tools (BoxLayout. tools BoxLayout/Y_AXIS))
     (.setBorder tools (BorderFactory/createEmptyBorder 6 8 6 8))
-    (.setPreferredSize tools (Dimension. 148 480))
-    (.setMinimumSize tools (Dimension. 148 0))
-    (.setMaximumSize tools (Dimension. 148 32767))
+    (.setPreferredSize tools (Dimension. (saved-tools-width) 480))
+    (.setMinimumSize tools (Dimension. 96 0))
+    (.setMaximumSize tools (Dimension. 420 32767))
     (set-insert-options! insert-form-combo "Oscillator")
 
     (letfn [(button [text f]
@@ -1602,9 +3078,9 @@
                 (.addActionListener (reify ActionListener
                                       (actionPerformed [_ _] (f))))))
             (compact! [component height]
-              (.setMaximumSize component (Dimension. 132 height))
-              (.setPreferredSize component (Dimension. 132 height))
-              (.setMinimumSize component (Dimension. 132 height))
+              (.setMaximumSize component (Dimension. Integer/MAX_VALUE height))
+              (.setPreferredSize component (Dimension. (max 132 (.getWidth tools)) height))
+              (.setMinimumSize component (Dimension. 80 height))
               (.setAlignmentX component java.awt.Component/LEFT_ALIGNMENT)
               component)
             (add-control! [component height]
@@ -1685,10 +3161,11 @@
           (.add file-menu (menu-item "Save As..." #(save-as! frame tabs status)))
           (.add file-menu (menu-item "Save Audio..." #(save-audio! frame tabs status)))
           (.add file-menu
-                (menu-item "Exit"
-                           #(when (close-all-tabs! frame tabs status)
-                              (close-live-process!)
-                              (.dispose frame))))
+                (doto (menu-item "Close Tab" #(close-current-tab! frame tabs status))
+                  (.setAccelerator close-current-tab-keystroke)))
+	          (.add file-menu
+	                (menu-item "Exit"
+	                           #(close-main-window! frame tabs status)))
           (.add preferences-menu
                 (checkbox-menu-item "Remove Insert Comments"
                                     (:remove-insert-comments @state)
@@ -1714,9 +3191,27 @@
                 (menu-item "Clear Null Parameters"
                            #(when-let [editor (active-editor tabs)]
                               (clear-null-parameters! editor status))))
+	          (.add preferences-menu
+	                (menu-item "Theme Selector" #(show-theme-selector! frame status)))
+          (.add preferences-menu
+                (menu-item "Reset Window Layout"
+	                           #(when-let [split (.getClientProperty (.getRootPane frame) "mescript.main-split")]
+	                              (let [location (.getLocation frame)]
+	                                (clear-layout-preferences!)
+	                                (.setPreferredSize tools (Dimension. default-tools-width 480))
+	                                (.setSize frame default-window-width default-window-height)
+	                                (.setLocation frame location)
+	                                (set-tools-panel-width! ^JSplitPane split default-tools-width))
+	                              (save-tools-width! default-tools-width)
+	                              (save-window-bounds! frame)
+	                              (set-status! status "window layout: reset"))))
+          (.add preferences-menu
+	                (menu-item "Open Inspector" #(show-inspector-repl! frame tabs status)))
           (.add audio-menu devices-menu)
           (.add audio-menu (menu-item "Refresh Devices" #(refresh-devices!)))
-          (.add about-menu (menu-item "Language Reference" #(show-language-reference! frame)))
+	          (.add about-menu
+	                (menu-item "Language Reference"
+	                           #(register-child-window! frame (show-language-reference! frame))))
           (.add about-menu (menu-item "About MeScript" #(show-about! frame)))
           (.add menu-bar file-menu)
           (.add menu-bar preferences-menu)
@@ -1726,9 +3221,25 @@
           (refresh-devices!)))
 
       (let [editor (active-editor tabs)]
-        (.putClientProperty (.getRootPane frame) "mescript.editor" editor)
-        (.add (.getContentPane frame) tabs BorderLayout/CENTER)
-        (.add (.getContentPane frame) tools BorderLayout/EAST)
+        (let [split (JSplitPane. JSplitPane/HORIZONTAL_SPLIT tabs tools)]
+          (.setName split "mescript-main-split")
+          (.setOneTouchExpandable split false)
+          (.setContinuousLayout split true)
+          (.setResizeWeight split 1.0)
+          (.setDividerSize split 4)
+          (.setBorder split nil)
+          (.setMinimumSize tabs (Dimension. 280 0))
+          (.addPropertyChangeListener
+            split
+            JSplitPane/DIVIDER_LOCATION_PROPERTY
+            (proxy [java.beans.PropertyChangeListener] []
+              (propertyChange [_]
+                (let [width (.getWidth tools)]
+                  (when (pos? width)
+                    (save-tools-width! width))))))
+          (.putClientProperty (.getRootPane frame) "mescript.main-split" split)
+          (.putClientProperty (.getRootPane frame) "mescript.editor" editor)
+          (.add (.getContentPane frame) split BorderLayout/CENTER))
         (.add (.getContentPane frame) status BorderLayout/SOUTH)))
 
     (.setDefaultCloseOperation frame JFrame/DO_NOTHING_ON_CLOSE)
@@ -1736,21 +3247,37 @@
     (.setName status "mescript-status")
     (.putClientProperty (.getRootPane frame) "mescript.editor-tabs" tabs)
     (.putClientProperty (.getRootPane frame) "mescript.status" status)
-    (install-save-shortcut! frame tabs status)
-    (.addWindowListener frame
-                        (proxy [WindowAdapter] []
-                          (windowClosing [_]
-                            (when (close-all-tabs! frame tabs status)
-                              (close-live-process!)
-                              (.dispose frame)))))
+    (when-let [theme (:theme-data @state)]
+      (style-component! frame theme))
+    (install-app-shortcuts! frame tabs status)
+	    (.addWindowListener frame
+	                        (proxy [WindowAdapter] []
+	                          (windowClosing [_]
+	                            (close-main-window! frame tabs status))))
     (.pack frame)
-    (.setLocationRelativeTo frame nil)
-    (.setVisible frame true)
+	    (if-let [{:keys [x y width height]} (saved-window-bounds)]
+	      (do
+	        (.setSize frame width height)
+	        (.setLocation frame x y))
+	      (do
+	        (.setSize frame default-window-width default-window-height)
+	        (.setLocationRelativeTo frame nil)))
+	    (.setVisible frame true)
+	    (when-let [split (.getClientProperty (.getRootPane frame) "mescript.main-split")]
+	      (set-tools-panel-width! ^JSplitPane split (saved-tools-width)))
+	    (save-window-bounds! frame)
+    (.addComponentListener frame
+                           (proxy [ComponentAdapter] []
+                             (componentMoved [_] (save-window-bounds! frame))
+                             (componentResized [_] (save-window-bounds! frame))))
     frame))
 
 (defn -main [& args]
   (let [file (some-> (first args) File.)]
-    (SwingUtilities/invokeLater #(build-ui file))))
+    (SwingUtilities/invokeLater
+      #(do
+         (apply-saved-theme!)
+         (build-ui file)))))
 
 (defn no-gui-mode? []
   (or (System/getenv "GLITCHLISP_NO_GUI")

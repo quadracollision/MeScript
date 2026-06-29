@@ -165,6 +165,7 @@
 (def scene-options
   [[":loop true" "Loop this scene forever; true-only alias for repeat 0." "(scene :a :loop true (d :lead :src :sine-synth :gate 1))\n(play-scene :a)"]
    [":repeat N" "Repeat count; 0 loops forever." "(scene :a :repeat 2 (d :lead :src :sine-synth :gate 1))\n(play-scene :a)"]
+   ["(bpm N)" "Set tempo when this scene starts." "(scene :a :repeat 1 (bpm 120) (d :lead :src :sine-synth :gate 1))\n(scene :b :loop true (bpm 90) (d :lead :src :sine-synth :note e3 :gate 1))\n(play-scene :a)"]
    [":steps N" "Set positive scene length in steps." "(scene :a :steps 16 (d :lead :src :sine-synth :gate 1))\n(play-scene :a)"]
    [":bars N" "Set positive length in bars; defaults to 16 steps per bar." "(scene :a :bars 2 (d :lead :src :sine-synth :gate 1))\n(play-scene :a)"]
    [":bar-steps N" "Set steps per bar for :bars." "(scene :a :bars 2 :bar-steps 8 (d :lead :src :sine-synth :gate 1))\n(play-scene :a)"]
@@ -177,6 +178,8 @@
   [[":src" "Oscillator or sample source." ":src :additive"]
    [":note" "Note, chord, or note pattern." ":note (p [c3 e3 g3])"]
    [":gate" "Hit/rest pattern." ":gate (p [1 0 1 0])"]
+   [":off" "Mute/disable this track; can be written as a flag or boolean." ":off true"]
+   [":choke / :cut" "Cut previous voices from this same track on each new hit; can be written as a flag or boolean." ":choke true"]
    [":dur" "Voice duration in seconds from 0.005 to 4." ":dur 0.2"]
    [":amp" "Track amplitude from 0 to 1." ":amp 0.4"]
    [":fx" "Track effect chain." ":fx [(delay :time 0.125)]"]
@@ -212,7 +215,11 @@
    ["(euclid P S)" "Euclidean gate pattern." "(euclid 5 16)"]
    ["(euclid-rot P S R)" "Rotated Euclidean pattern." "(euclid-rot 5 16 2)"]
    ["(gate-hold N)" "Extend a hit by N slots." "(p [1 (gate-hold 2) 1])"]
-   ["1_N" "Short gate hold; later hits in the held span can still play." "(p [1 1_2 1 1])"]
+   ["1_N" "Gate hold shorthand; 1_3 holds the hit across three slots while later hits in the held span can still play." "(p [1 1_3 1 0])"]
+   ["~N" "Gate sustain shorthand; ~N adds N silent occupied slots after the previous cell, so (p [1 ~15]) is a 16-slot cycle with one hit." "(p [1 ~15])"]
+   ["?" "Random gate; ? is a 50% chance hit." "(p [1 0 ? 0])"]
+   ["?N" "Percent chance gate; ?25 is a 25% chance hit and ?99[1 0 1] applies chance to a subdivided cell." "(p [1 ?25 0 ?99[1 0 1]])"]
+   ["A%B%C" "Cycle gate; values rotate by scene/playthrough cycle, so 1%0%1%0 plays on cycle 1, rests on cycle 2, then repeats." "(p [1 0 1%0%1%0 0])"]
    ["Nested gates" "Subdivide a step; these are repeated hits, not chords." "(p [[1 1] 0 1])"]])
 
 (def effect-forms

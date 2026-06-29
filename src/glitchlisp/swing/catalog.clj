@@ -54,9 +54,7 @@
    "Sample" "Sample"})
 
 (defn oscillator-option-label [source]
-  (str (get oscillator-source-group-labels (oscillator-source-group source) "Other")
-       " / "
-       source))
+  source)
 
 (defn oscillator-option-header? [option]
   (str/starts-with? (str option) "/"))
@@ -71,11 +69,14 @@
 (defn oscillator-option-labels []
   (let [grouped (->> oscillator-sources
                      (group-by oscillator-source-group))]
-    (->> oscillator-source-group-order
-         (sort-by val)
-         (mapcat (fn [[group _]]
-                   (when-let [sources (seq (sort (get grouped group)))]
-                     (map oscillator-option-label sources)))))))
+    (concat
+      (map oscillator-option-label (sort (get grouped "Sample")))
+      (->> oscillator-source-group-order
+           (sort-by val)
+           (remove #(= "Sample" (first %)))
+           (mapcat (fn [[group _]]
+                     (when-let [sources (seq (sort (get grouped group)))]
+                       (map oscillator-option-label sources))))))))
 
 (defn track-id-for-source [source]
   (-> source
@@ -153,6 +154,7 @@
    ":sample-data" "type: vector<number|note>"
    ":note" "type: note or note-pattern"
    ":gate" "type: gate-pattern; range: 0 rest, 1 hit, nested subdivision, hold suffix"
+   ":off" "type: flag or boolean; chokes previous voices from this track on each new hit"
    ":dur" "type: number seconds or number-pattern; range: 0.005..4"
    ":amp" "type: number or number-pattern; range: 0..1"
    ":detune-cents" "type: number cents or number-pattern; range: any"

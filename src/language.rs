@@ -1,8 +1,8 @@
 use crate::effects::offline::{OfflineEffectSpec, StereoSide};
 use crate::effects::{self, DistortionKind, EffectSpec, FilterKind};
 use crate::model::{
-    EffectParamPattern, EffectParamPatternMode, NoteMode, OscillatorParams, ParamPatterns, Runtime,
-    Scene, SceneState, Track, TrackEffect, Waveform,
+    EffectParamPattern, EffectParamPatternMode, GateCell, NoteMode, OscillatorParams,
+    ParamPatterns, Runtime, Scene, SceneState, Track, TrackEffect, Waveform,
 };
 use crate::sequencer;
 use std::collections::HashSet;
@@ -385,6 +385,12 @@ fn eval_form(runtime: &mut Runtime, expr: &Expr) -> Result<(), String> {
                     note_mode: NoteMode::Step,
                     gates: vec![true, false, false, false],
                     gate_subdivisions: vec![vec![true], vec![false], vec![false], vec![false]],
+                    gate_cells: vec![
+                        vec![GateCell::Static(true)],
+                        vec![GateCell::Static(false)],
+                        vec![GateCell::Static(false)],
+                        vec![GateCell::Static(false)],
+                    ],
                     gate_holds: vec![vec![0], vec![0], vec![0], vec![0]],
                     gate_loop_start: 0,
                     step_every: 1,
@@ -395,6 +401,7 @@ fn eval_form(runtime: &mut Runtime, expr: &Expr) -> Result<(), String> {
                     param_patterns: ParamPatterns::default(),
                     effects: Vec::new(),
                     sample_data: Vec::new(),
+                    choke: false,
                     muted: false,
                     solo: false,
                 },
@@ -458,6 +465,9 @@ pub(crate) fn apply_scene(runtime: &mut Runtime, id: &str) -> Result<(), String>
     validate_scene_next_targets(runtime, id)?;
     runtime.tracks = scene.tracks;
     runtime.post_effects = scene.post_effects;
+    if let Some(bpm) = scene.bpm {
+        runtime.bpm = bpm;
+    }
     runtime.scene_state = Some(SceneState {
         current: scene.id,
         cycle: 0,
@@ -579,7 +589,16 @@ fn define_scene(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
 
     let mut block_runtime = Runtime::new();
     block_runtime.bpm = runtime.bpm;
+    let mut scene_bpm = None;
     while index < items.len() {
+        if let Expr::List(form_items) = &items[index] {
+            if matches!(form_items.first(), Some(Expr::Symbol(name)) if name == "bpm") {
+                expect_arity(form_items, "bpm", 2)?;
+                scene_bpm = Some(bpm_value(number_arg(form_items, 1, "bpm")?)?);
+                index += 1;
+                continue;
+            }
+        }
         eval_form(&mut block_runtime, &items[index])?;
         index += 1;
     }
@@ -624,6 +643,7 @@ fn define_scene(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
         id.clone(),
         Scene {
             id: id.clone(),
+            bpm: scene_bpm,
             steps,
             repeats,
             next,
@@ -646,6 +666,7 @@ fn define_sample_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), Stri
     let inline_options = matches!(sample_arg, Expr::Keyword(_));
     let options_start = if inline_options { 2 } else { 3 };
     validate_sample_options(items, options_start)?;
+    let options = normalized_track_options(items, options_start)?;
     let mut track_items = vec![
         Expr::Symbol("d".to_string()),
         id,
@@ -662,16 +683,15 @@ fn define_sample_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), Stri
         ("dur", Expr::Number(1.0)),
         ("amp", Expr::Number(1.0)),
     ] {
-        if !track_options_contain_from(items, options_start, key) {
+        if !track_options_contain(&options, key) {
             track_items.push(Expr::Keyword(key.to_string()));
             track_items.push(value);
         }
     }
-    track_items.extend(items.iter().skip(options_start).cloned());
+    track_items.extend(options.iter().cloned());
     if inline_options
-        && !track_options_contain_any_from(
-            items,
-            options_start,
+        && !track_options_contain_any(
+            &options,
             &[
                 "sample-data",
                 "sample_data",
@@ -692,6 +712,12 @@ fn validate_sample_options(items: &[Expr], start: usize) -> Result<(), String> {
         let Expr::Keyword(key) = &items[index] else {
             return Err("sample options must be keyword/value pairs".to_string());
         };
+        if unary_track_flag(key) {
+            if index + 1 >= items.len() || matches!(items.get(index + 1), Some(Expr::Keyword(_))) {
+                index += 1;
+                continue;
+            }
+        }
         if index + 1 >= items.len() {
             return Err(format!("sample :{} requires a value", key));
         }
@@ -700,18 +726,41 @@ fn validate_sample_options(items: &[Expr], start: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn track_options_contain_from(items: &[Expr], start: usize, key: &str) -> bool {
-    items
+fn normalized_track_options(items: &[Expr], start: usize) -> Result<Vec<Expr>, String> {
+    let mut options = Vec::new();
+    let mut index = start;
+    while index < items.len() {
+        let Expr::Keyword(key) = &items[index] else {
+            return Err("track parameters must be keyword/value pairs".to_string());
+        };
+        if unary_track_flag(key) {
+            if index + 1 >= items.len() || matches!(items.get(index + 1), Some(Expr::Keyword(_))) {
+                options.push(Expr::Keyword(key.clone()));
+                options.push(Expr::Symbol("true".to_string()));
+                index += 1;
+                continue;
+            }
+        }
+        let value = items
+            .get(index + 1)
+            .ok_or_else(|| format!("track parameter ':{}' requires a value", key))?;
+        options.push(Expr::Keyword(key.clone()));
+        options.push(value.clone());
+        index += 2;
+    }
+    Ok(options)
+}
+
+fn track_options_contain(options: &[Expr], key: &str) -> bool {
+    options
         .iter()
-        .skip(start)
         .step_by(2)
         .any(|expr| matches!(expr, Expr::Keyword(name) if name == key))
 }
 
-fn track_options_contain_any_from(items: &[Expr], start: usize, keys: &[&str]) -> bool {
-    items
+fn track_options_contain_any(options: &[Expr], keys: &[&str]) -> bool {
+    options
         .iter()
-        .skip(start)
         .step_by(2)
         .any(|expr| matches!(expr, Expr::Keyword(name) if keys.contains(&name.as_str())))
 }
@@ -726,30 +775,7 @@ fn inferred_scene_steps(runtime: &Runtime) -> Result<usize, String> {
 
 fn inferred_track_steps(track: &Track) -> usize {
     let gate_length = track.gate_subdivisions.len().max(1);
-    let gate_hits = track
-        .gate_subdivisions
-        .iter()
-        .filter(|step| step.iter().any(|gate| *gate))
-        .count();
-    let gate_slots = track
-        .gate_subdivisions
-        .iter()
-        .map(|step| step.len().max(1))
-        .sum::<usize>()
-        .max(1);
-    let note_length = track.note_chords.len().max(1);
-    let note_period = match track.note_mode {
-        NoteMode::Step => note_length,
-        NoteMode::Hit => {
-            if gate_hits == 0 {
-                gate_length
-            } else {
-                gate_length * (note_length / gcd(note_length, gate_hits))
-            }
-        }
-        NoteMode::Tick => gate_length * (note_length / gcd(note_length, gate_slots)),
-    };
-    track.step_every.max(1) * lcm(gate_length, note_period)
+    track.step_every.max(1) * gate_length
 }
 
 fn play_scene(runtime: &mut Runtime, items: &[Expr], form: &str) -> Result<(), String> {
@@ -786,8 +812,13 @@ fn track_param_canonical_key(key: &str) -> &str {
         "fm-ratio" | "fm_ratio" => "fm-ratio",
         "fm-depth" | "fm_depth" => "fm-depth",
         "sample" | "sample-path" | "sample_path" | "sample-data" | "sample_data" => "sample",
+        "choke" | "cut" => "choke",
         other => other,
     }
+}
+
+fn unary_track_flag(key: &str) -> bool {
+    matches!(key, "off" | "choke" | "cut")
 }
 
 fn set_track_flag(
@@ -825,6 +856,7 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
         note_mode: NoteMode::Step,
         gates: vec![true],
         gate_subdivisions: vec![vec![true]],
+        gate_cells: vec![vec![GateCell::Static(true)]],
         gate_holds: vec![vec![0]],
         gate_loop_start: 0,
         step_every: 1,
@@ -835,6 +867,7 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
         param_patterns: ParamPatterns::default(),
         effects: Vec::new(),
         sample_data: Vec::new(),
+        choke: false,
         muted: false,
         solo: false,
     };
@@ -852,6 +885,17 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
         let canonical_key = track_param_canonical_key(key);
         if !seen_parameters.insert(canonical_key) {
             return Err(format!("duplicate track parameter ':{}'", key));
+        }
+        if unary_track_flag(key) {
+            if index + 1 >= items.len() || matches!(items.get(index + 1), Some(Expr::Keyword(_))) {
+                match key.as_str() {
+                    "off" => track.muted = true,
+                    "choke" | "cut" => track.choke = true,
+                    _ => {}
+                }
+                index += 1;
+                continue;
+            }
         }
         let value = items
             .get(index + 1)
@@ -871,6 +915,7 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
             "gate" => {
                 let gate_pattern = gate_pattern(value)?;
                 track.gate_subdivisions = gate_pattern.gates;
+                track.gate_cells = gate_pattern.cells;
                 track.gate_holds = gate_pattern.holds;
                 track.gate_loop_start = gate_pattern.loop_start;
                 track.gates = track
@@ -988,6 +1033,8 @@ fn define_track(runtime: &mut Runtime, items: &[Expr]) -> Result<(), String> {
             "every" => track.step_every = positive_usize_value(value, "every")?,
             "offset" => track.step_offset = usize_value(value, "offset")?,
             "drunk" => track.drunk = drunk_value(value)?,
+            "off" => track.muted = bool_value(value, key)?,
+            "choke" | "cut" => track.choke = bool_value(value, key)?,
             "amp" => {
                 set_bounded_f32_param_pattern_or_scalar(
                     value,
@@ -3676,21 +3723,31 @@ fn expanded_pattern_values(expr: &Expr, notes: bool, name: &str) -> Result<Vec<f
 #[derive(Clone, Debug)]
 struct ParsedGatePattern {
     gates: Vec<Vec<bool>>,
+    cells: Vec<Vec<GateCell>>,
     holds: Vec<Vec<usize>>,
     loop_start: usize,
 }
 
 fn parsed_gate_pattern(
     gates: Vec<Vec<bool>>,
+    cells: Vec<Vec<GateCell>>,
     holds: Vec<Vec<usize>>,
     loop_start: usize,
 ) -> Result<ParsedGatePattern, String> {
     validate_gate_holds(&gates, &holds)?;
     Ok(ParsedGatePattern {
         gates,
+        cells,
         holds,
         loop_start,
     })
+}
+
+fn static_gate_cells_like(gates: &[Vec<bool>]) -> Vec<Vec<GateCell>> {
+    gates
+        .iter()
+        .map(|step| step.iter().copied().map(GateCell::Static).collect())
+        .collect()
 }
 
 fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
@@ -3707,8 +3764,9 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
                         .into_iter()
                         .map(|gate| vec![gate])
                         .collect();
+                    let cells = static_gate_cells_like(&gates);
                     let holds = empty_holds_like(&gates);
-                    return parsed_gate_pattern(gates, holds, 0);
+                    return parsed_gate_pattern(gates, cells, holds, 0);
                 }
                 "euclid-rot" => {
                     if items.len() != 4 {
@@ -3721,8 +3779,9 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
                         .into_iter()
                         .map(|gate| vec![gate])
                         .collect();
+                    let cells = static_gate_cells_like(&gates);
                     let holds = empty_holds_like(&gates);
-                    return parsed_gate_pattern(gates, holds, 0);
+                    return parsed_gate_pattern(gates, cells, holds, 0);
                 }
                 "rev" | "reverse" => {
                     if items.len() > 2 {
@@ -3731,6 +3790,7 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
                     let source = items.get(1).ok_or("reverse requires a pattern")?;
                     let mut pattern = gate_pattern(source)?;
                     pattern.gates.reverse();
+                    pattern.cells.reverse();
                     pattern.holds.reverse();
                     pattern.loop_start = 0;
                     validate_gate_holds(&pattern.gates, &pattern.holds)?;
@@ -3745,18 +3805,21 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
                     let count = positive_usize_value(count_expr, "times")?;
                     let pattern = gate_pattern(source)?;
                     let mut gates = Vec::with_capacity(pattern.gates.len() * count);
+                    let mut cells = Vec::with_capacity(pattern.cells.len() * count);
                     let mut holds = Vec::with_capacity(pattern.holds.len() * count);
                     for _ in 0..count {
                         gates.extend(pattern.gates.iter().cloned());
+                        cells.extend(pattern.cells.iter().cloned());
                         holds.extend(pattern.holds.iter().cloned());
                     }
-                    return parsed_gate_pattern(gates, holds, 0);
+                    return parsed_gate_pattern(gates, cells, holds, 0);
                 }
                 "then" => {
                     if items.len() < 3 {
                         return Err("then expects at least two patterns".to_string());
                     }
                     let mut gates = Vec::new();
+                    let mut cells = Vec::new();
                     let mut holds = Vec::new();
                     let mut loop_start = 0;
                     let last_stage_is_times = items.last().is_some_and(|stage| {
@@ -3772,9 +3835,10 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
                         }
                         let stage = gate_pattern(stage_expr)?;
                         gates.extend(stage.gates);
+                        cells.extend(stage.cells);
                         holds.extend(stage.holds);
                     }
-                    return parsed_gate_pattern(gates, holds, loop_start);
+                    return parsed_gate_pattern(gates, cells, holds, loop_start);
                 }
                 name if numeric_pattern_form(name) => {
                     let Some(source) = items.get(1) else {
@@ -3798,10 +3862,7 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
                     }
                     return match source {
                         Expr::Vector(values) => {
-                            let pattern = values
-                                .iter()
-                                .map(gate_step_pattern)
-                                .collect::<Result<Vec<_>, _>>()?;
+                            let pattern = gate_steps_from_values(values)?;
                             gate_pattern_from_steps(pattern)
                         }
                         _ => gate_pattern(source),
@@ -3813,10 +3874,7 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
     }
     match expr {
         Expr::Vector(values) => {
-            let pattern = values
-                .iter()
-                .map(gate_step_pattern)
-                .collect::<Result<Vec<_>, _>>()?;
+            let pattern = gate_steps_from_values(values)?;
             gate_pattern_from_steps(pattern)
         }
         _ => {
@@ -3826,6 +3884,42 @@ fn gate_pattern(expr: &Expr) -> Result<ParsedGatePattern, String> {
     }
 }
 
+fn gate_steps_from_values(values: &[Expr]) -> Result<Vec<Vec<GateSlot>>, String> {
+    let mut steps = Vec::new();
+    let mut index = 0;
+    let mut has_previous_hit = false;
+    while index < values.len() {
+        if let Some(amount) = gate_sustain_value(&values[index])? {
+            if !has_previous_hit {
+                return Err("gate sustain must follow a hit".to_string());
+            }
+            for _ in 0..amount {
+                steps.push(vec![GateSlot {
+                    gate: false,
+                    cell: GateCell::Static(false),
+                    hold: 0,
+                }]);
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(chance) = chance_gate_value(&values[index])? {
+            if let Some(Expr::Vector(_)) = values.get(index + 1) {
+                let step = chance_prefixed_gate_step(chance, &values[index + 1])?;
+                has_previous_hit |= step.iter().any(|slot| slot.gate);
+                steps.push(step);
+                index += 2;
+                continue;
+            }
+        }
+        let step = gate_step_pattern(&values[index])?;
+        has_previous_hit |= step.iter().any(|slot| slot.gate);
+        steps.push(step);
+        index += 1;
+    }
+    Ok(steps)
+}
+
 fn gate_subdivision_pattern(expr: &Expr) -> Result<Vec<Vec<bool>>, String> {
     Ok(gate_pattern(expr)?.gates)
 }
@@ -3833,6 +3927,7 @@ fn gate_subdivision_pattern(expr: &Expr) -> Result<Vec<Vec<bool>>, String> {
 #[derive(Clone, Debug)]
 struct GateSlot {
     gate: bool,
+    cell: GateCell,
     hold: usize,
 }
 
@@ -3841,11 +3936,15 @@ fn gate_pattern_from_steps(steps: Vec<Vec<GateSlot>>) -> Result<ParsedGatePatter
         .iter()
         .map(|step| step.iter().map(|slot| slot.gate).collect())
         .collect();
+    let cells: Vec<Vec<GateCell>> = steps
+        .iter()
+        .map(|step| step.iter().map(|slot| slot.cell.clone()).collect())
+        .collect();
     let holds: Vec<Vec<usize>> = steps
         .iter()
         .map(|step| step.iter().map(|slot| slot.hold).collect())
         .collect();
-    parsed_gate_pattern(gates, holds, 0)
+    parsed_gate_pattern(gates, cells, holds, 0)
 }
 
 fn empty_holds_like(gates: &[Vec<bool>]) -> Vec<Vec<usize>> {
@@ -3891,12 +3990,29 @@ fn gate_step_pattern(expr: &Expr) -> Result<Vec<GateSlot>, String> {
             if items.len() > 2 {
                 return Err("gate-hold expects zero or one amount".to_string());
             }
-            Ok(vec![GateSlot { gate: true, hold }])
+            Ok(vec![GateSlot {
+                gate: true,
+                cell: GateCell::Static(true),
+                hold,
+            }])
+        }
+        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "gate-repeat") =>
+        {
+            if items.len() != 2 {
+                return Err("gate-repeat expects one vector".to_string());
+            }
+            let values = gate_repeat_values(&items[1])?;
+            Ok(vec![GateSlot {
+                gate: values.first().copied().unwrap_or(false),
+                cell: GateCell::Repeat(values),
+                hold: 0,
+            }])
         }
         Expr::Vector(values) => {
             if values.is_empty() {
                 return Ok(vec![GateSlot {
                     gate: false,
+                    cell: GateCell::Static(false),
                     hold: 0,
                 }]);
             }
@@ -3915,10 +4031,14 @@ fn gate_step_pattern(expr: &Expr) -> Result<Vec<GateSlot>, String> {
             }
             Ok(flattened)
         }
-        _ => Ok(vec![GateSlot {
-            gate: numeric_only(expr)? > 0.0,
-            hold: 0,
-        }]),
+        _ => {
+            let cell = gate_cell(expr)?;
+            Ok(vec![GateSlot {
+                gate: gate_cell_preview(&cell),
+                cell,
+                hold: 0,
+            }])
+        }
     }
 }
 
@@ -3926,6 +4046,7 @@ fn expand_gate_cell(pattern: &[GateSlot], width: usize) -> Vec<GateSlot> {
     let mut expanded = vec![
         GateSlot {
             gate: false,
+            cell: GateCell::Static(false),
             hold: 0,
         };
         width.max(1)
@@ -3941,6 +4062,125 @@ fn expand_gate_cell(pattern: &[GateSlot], width: usize) -> Vec<GateSlot> {
         }
     }
     expanded
+}
+
+fn gate_cell(expr: &Expr) -> Result<GateCell, String> {
+    match expr {
+        Expr::Symbol(name) if name.starts_with('~') => {
+            Err("gate sustain must follow a hit inside a vector pattern".to_string())
+        }
+        Expr::Symbol(name) if name.starts_with('?') => {
+            Ok(GateCell::Chance(chance_gate_percent(name)?))
+        }
+        Expr::Symbol(name) if name.contains('%') => {
+            Ok(GateCell::Repeat(parse_gate_repeat_token(name)?))
+        }
+        Expr::Number(_) => Ok(GateCell::Static(numeric_only(expr)? > 0.0)),
+        _ => Err("expected numeric pattern value".to_string()),
+    }
+}
+
+fn gate_sustain_value(expr: &Expr) -> Result<Option<usize>, String> {
+    match expr {
+        Expr::Symbol(name) if name.starts_with('~') => Ok(Some(gate_sustain_amount(
+            name.strip_prefix('~').unwrap_or(""),
+        )?)),
+        Expr::List(items) if matches!(items.first(), Some(Expr::Symbol(name)) if name == "gate-sustain") =>
+        {
+            if items.len() != 2 {
+                return Err("gate-sustain expects one amount".to_string());
+            }
+            Ok(Some(positive_usize_value(&items[1], "gate-sustain")?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn gate_sustain_amount(text: &str) -> Result<usize, String> {
+    let amount = text
+        .parse::<usize>()
+        .map_err(|_| "gate sustain must be written like ~12".to_string())?;
+    if amount == 0 {
+        return Err("gate sustain must be greater than zero".to_string());
+    }
+    Ok(amount)
+}
+
+fn chance_gate_value(expr: &Expr) -> Result<Option<f32>, String> {
+    match expr {
+        Expr::Symbol(name) if name.starts_with('?') => Ok(Some(chance_gate_percent(name)?)),
+        _ => Ok(None),
+    }
+}
+
+fn chance_gate_percent(name: &str) -> Result<f32, String> {
+    if name == "?" {
+        return Ok(0.5);
+    }
+    let percent = name
+        .strip_prefix('?')
+        .and_then(|value| value.parse::<f32>().ok())
+        .ok_or_else(|| "chance gate must be ? or ?0 through ?100".to_string())?;
+    if !(0.0..=100.0).contains(&percent) {
+        return Err("chance gate must be between ?0 and ?100".to_string());
+    }
+    Ok(percent / 100.0)
+}
+
+fn chance_prefixed_gate_step(chance: f32, expr: &Expr) -> Result<Vec<GateSlot>, String> {
+    let mut slots = gate_step_pattern(expr)?;
+    for slot in &mut slots {
+        if slot.gate {
+            slot.gate = chance >= 0.5;
+            slot.cell = GateCell::Chance(chance);
+        }
+    }
+    Ok(slots)
+}
+
+fn gate_cell_preview(cell: &GateCell) -> bool {
+    match cell {
+        GateCell::Static(gate) => *gate,
+        GateCell::Repeat(values) => values.first().copied().unwrap_or(false),
+        GateCell::Chance(chance) => *chance >= 0.5,
+    }
+}
+
+fn parse_gate_repeat_token(token: &str) -> Result<Vec<bool>, String> {
+    if token.starts_with('%') || token.ends_with('%') {
+        return Err("repeat gate cells use values separated by %, like 1%0%1%0".to_string());
+    }
+    let mut values = Vec::new();
+    for part in token.split('%') {
+        match part {
+            "0" => values.push(false),
+            "1" => values.push(true),
+            _ => {
+                return Err("repeat gate cells only accept 0 and 1 values, like 1%0%1%0".to_string());
+            }
+        }
+    }
+    if values.is_empty() {
+        return Err("repeat gate cells need at least one value".to_string());
+    }
+    Ok(values)
+}
+
+fn gate_repeat_values(expr: &Expr) -> Result<Vec<bool>, String> {
+    let Expr::Vector(items) = expr else {
+        return Err("gate-repeat expects a vector".to_string());
+    };
+    if items.is_empty() {
+        return Err("gate-repeat vector cannot be empty".to_string());
+    }
+    items
+        .iter()
+        .map(|item| match item {
+            Expr::Number(value) if *value == 0.0 => Ok(false),
+            Expr::Number(value) if *value == 1.0 => Ok(true),
+            _ => Err("gate-repeat only accepts 0 and 1 values".to_string()),
+        })
+        .collect()
 }
 
 fn gcd(mut a: usize, mut b: usize) -> usize {

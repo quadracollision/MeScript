@@ -94,6 +94,13 @@ pub(crate) enum NoteMode {
     Tick,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GateCell {
+    Static(bool),
+    Repeat(Vec<bool>),
+    Chance(f32),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Track {
     pub(crate) id: String,
@@ -104,6 +111,7 @@ pub(crate) struct Track {
     pub(crate) note_mode: NoteMode,
     pub(crate) gates: Vec<bool>,
     pub(crate) gate_subdivisions: Vec<Vec<bool>>,
+    pub(crate) gate_cells: Vec<Vec<GateCell>>,
     pub(crate) gate_holds: Vec<Vec<usize>>,
     pub(crate) gate_loop_start: usize,
     pub(crate) step_every: usize,
@@ -114,6 +122,7 @@ pub(crate) struct Track {
     pub(crate) param_patterns: ParamPatterns,
     pub(crate) effects: Vec<TrackEffect>,
     pub(crate) sample_data: Vec<f32>,
+    pub(crate) choke: bool,
     pub(crate) muted: bool,
     pub(crate) solo: bool,
 }
@@ -170,6 +179,7 @@ impl Default for OscillatorParams {
 #[derive(Clone, Debug)]
 pub(crate) struct Scene {
     pub(crate) id: String,
+    pub(crate) bpm: Option<f32>,
     pub(crate) steps: usize,
     pub(crate) repeats: usize,
     pub(crate) next: Option<String>,

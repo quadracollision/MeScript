@@ -26,6 +26,7 @@
          :live-cycle nil
          :live-highlight-scheduled false
          :audio-device nil
+         :theme nil
          :remove-insert-comments true
          :remove-playback-highlighting false}))
 

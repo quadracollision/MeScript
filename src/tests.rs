@@ -1,6 +1,6 @@
 use crate::audio::{
     AudioEngine, active_effect_specs, playback_step_for_runtime, pluck_delay_samples_for_test,
-    render,
+    render, resolve_gate_cell,
 };
 use crate::cli::{self, auto_render_seconds};
 use crate::editor;
@@ -33,7 +33,7 @@ use crate::language::{
     compile_source_for_runtime, compile_source_for_runtime_with_base, eval_program, load_runtime,
     source_needs_compiler,
 };
-use crate::model::{NoteMode, Runtime, SceneState};
+use crate::model::{GateCell, NoteMode, Runtime, SceneState};
 use crate::sequencer;
 use std::fs;
 use std::path::PathBuf;
@@ -73,7 +73,7 @@ fn workstation_about_text_shows_current_version_date() {
     let source = fs::read_to_string("src/main.clj").unwrap();
     assert!(
         source.contains(
-            "MeScript v0.371\\n22 June 2026\\nJacob Pereira (jacob.m.pereira@gmail.com)\\nquadracollision.com"
+            "MeScript v0.38\\n28 June 2026\\nJacob Pereira (jacob.m.pereira@gmail.com)\\nquadracollision.com"
         ),
         "about text should show current version/date, author, email, and site"
     );
@@ -689,6 +689,184 @@ fn sample_waveform_plays_sample_data_without_synth_substitution() {
     assert_eq!(engine.next_frame(), [0.0, 0.0]);
 }
 
+fn expected_center_sample_frame(sample: f32, amp: f32) -> [f32; 2] {
+    let center_pan_gain = 0.5_f32.sqrt();
+    let raw = sample * amp * center_pan_gain * 0.8;
+    let clipped = raw / (1.0_f32 + raw.abs());
+    [clipped, clipped]
+}
+
+#[test]
+fn sample_note_controls_playback_rate_relative_to_c3() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(d :up
+            :src :sample
+            :sample-data [1 0.75 0.5 0.25 0]
+            :note c4
+            :gate 1
+            :dur 0.02
+            :amp 0.5)
+         (start!)",
+    )
+    .unwrap();
+
+    let mut engine = AudioEngine::new(runtime, 48_000.0);
+    for expected in [1.0, 0.5, 0.0] {
+        let frame = engine.next_frame();
+        let expected = expected_center_sample_frame(expected, 0.5);
+        assert!((frame[0] - expected[0]).abs() < 0.000_1);
+        assert!((frame[1] - expected[1]).abs() < 0.000_1);
+    }
+    assert_eq!(engine.next_frame(), [0.0, 0.0]);
+}
+
+#[test]
+fn lower_sample_notes_play_back_slower_with_interpolation() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(d :down
+            :src :sample
+            :sample-data [1 0 -1]
+            :note c2
+            :gate 1
+            :dur 0.02
+            :amp 0.5)
+         (start!)",
+    )
+    .unwrap();
+
+    let mut engine = AudioEngine::new(runtime, 48_000.0);
+    for expected in [1.0, 0.5, 0.0, -0.5, -1.0] {
+        let frame = engine.next_frame();
+        let expected = expected_center_sample_frame(expected, 0.5);
+        assert!((frame[0] - expected[0]).abs() < 0.000_1);
+        assert!((frame[1] - expected[1]).abs() < 0.000_1);
+    }
+}
+
+#[test]
+fn choke_flag_chokes_previous_sample_voice_on_new_hit() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(bpm 120)
+         (sample :hat
+            :sample-data [1 1 1 1 1 1 1 1]
+            :choke
+            :gate (p [1 1])
+            :dur 4
+            :amp 0.5)
+         (start!)",
+    )
+    .unwrap();
+    assert!(runtime.tracks["hat"].choke);
+    assert!(!runtime.tracks["hat"].muted);
+
+    let mut engine = AudioEngine::new(runtime, 8.0);
+    engine.next_frame();
+    assert_eq!(engine.active_voice_count_for_test(), 1);
+    engine.next_frame();
+    assert_eq!(engine.active_voice_count_for_test(), 1);
+}
+
+#[test]
+fn voices_overlap_without_off_flag() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(bpm 120)
+         (sample :hat
+            :sample-data [1 1 1 1 1 1 1 1]
+            :gate (p [1 1])
+            :dur 4
+            :amp 0.5)
+         (start!)",
+    )
+    .unwrap();
+
+    let mut engine = AudioEngine::new(runtime, 8.0);
+    engine.next_frame();
+    assert_eq!(engine.active_voice_count_for_test(), 1);
+    engine.next_frame();
+    assert_eq!(engine.active_voice_count_for_test(), 2);
+}
+
+#[test]
+fn choke_flag_chokes_previous_synth_voice_on_new_hit() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(bpm 120)
+         (d :lead
+            :src :sine-synth
+            :note c3
+            :choke
+            :gate (p [1 1])
+            :dur 4
+            :amp 0.2)
+         (start!)",
+    )
+    .unwrap();
+    assert!(runtime.tracks["lead"].choke);
+    assert!(!runtime.tracks["lead"].muted);
+
+    let mut engine = AudioEngine::new(runtime, 8.0);
+    engine.next_frame();
+    assert_eq!(engine.active_voice_count_for_test(), 1);
+    engine.next_frame();
+    assert_eq!(engine.active_voice_count_for_test(), 1);
+}
+
+#[test]
+fn off_flag_mutes_sample_track() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(bpm 120)
+         (sample :hat
+            :sample-data [1 1 1 1]
+            :off
+            :gate (p [1 1])
+            :dur 1
+            :amp 0.5)
+         (start!)",
+    )
+    .unwrap();
+    assert!(runtime.tracks["hat"].muted);
+    assert!(!runtime.tracks["hat"].choke);
+
+    let mut engine = AudioEngine::new(runtime, 8.0);
+    engine.next_frame();
+    assert_eq!(engine.active_voice_count_for_test(), 0);
+}
+
+#[test]
+fn off_true_mutes_synth_track_without_choking() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(bpm 120)
+         (d :lead
+            :src :sine-synth
+            :note c3
+            :off true
+            :gate (p [1 1])
+            :dur 1
+            :amp 0.2)
+         (start!)",
+    )
+    .unwrap();
+    assert!(runtime.tracks["lead"].muted);
+    assert!(!runtime.tracks["lead"].choke);
+
+    let mut engine = AudioEngine::new(runtime, 8.0);
+    engine.next_frame();
+    assert_eq!(engine.active_voice_count_for_test(), 0);
+}
+
 #[test]
 fn sample_form_defines_sample_track_from_wav_path() {
     let path = std::env::temp_dir().join("mescript-sample-form-test.wav");
@@ -1042,6 +1220,25 @@ fn compiler_with_replaces_scene_sensitive_base_param_before_resolving_it() {
         runtime.scenes["drop"].tracks["kick"].gates,
         vec![false, true]
     );
+}
+
+#[test]
+fn by_scene_without_matching_gate_is_silent_instead_of_defaulting_to_hit() {
+    let source = "(def kick-1
+                    (d :kick
+                       :src :kick-synth
+                       :note c2
+                       :gate (by-scene
+                               :part-a (p [1 0 0 0]))))
+                  (scene :intro :repeat 1
+                    kick-1)
+                  (play-scene :intro)";
+    let compiled = compile_source_for_runtime(source).unwrap();
+    assert!(compiled.contains(":gate (p [0])"), "{}", compiled);
+
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &compiled).unwrap();
+    assert_eq!(runtime.scenes["intro"].tracks["kick"].gates, vec![false]);
 }
 
 #[test]
@@ -1800,6 +1997,30 @@ fn scene_infers_steps_from_track_patterns_when_omitted() {
 }
 
 #[test]
+fn scene_infers_steps_from_longest_gate_even_when_notes_need_more_passes() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(scene :intro :repeat 2
+           (sample :hat
+             :sample-data [1 0 -1]
+             :note [d3 c3]
+             :gate (p [1 0 1 0
+                       1 0 1 0
+                       1 0 1 0
+                       1 1 [1 0 1] 0]))
+           (sample :kick
+             :sample-data [1 0 -1]
+             :gate (p [1 0 0 0
+                       1 0 0 1
+                       0 0 0 0
+                       0 1 0 1])))",
+    )
+    .unwrap();
+    assert_eq!(runtime.scenes["intro"].steps, 16);
+}
+
+#[test]
 fn scene_steps_of_uses_named_track_cycle() {
     let mut runtime = Runtime::new();
     eval_program(
@@ -1833,6 +2054,51 @@ fn scene_loop_by_uses_named_track_cycle_times_count() {
     assert_eq!(runtime.scenes["intro"].steps, 16);
     assert_eq!(runtime.scenes["intro"].repeats, 0);
     assert_eq!(runtime.scene_state.as_ref().unwrap().current, "intro");
+}
+
+#[test]
+fn scene_body_bpm_overrides_global_bpm_when_scene_starts() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(bpm 90)
+         (scene :intro :repeat 1
+           (bpm 140)
+           (d :click :src :click :gate 1))
+         (play-scene :intro)",
+    )
+    .unwrap();
+
+    assert_eq!(runtime.scenes["intro"].bpm, Some(140.0));
+    assert_eq!(runtime.bpm, 140.0);
+}
+
+#[test]
+fn scene_body_bpm_changes_when_scene_chain_advances() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(bpm 120)
+         (scene :intro :steps 1 :repeat 1 :next :drop
+           (bpm 120)
+           (d :a :src :click :gate 1))
+         (scene :drop :steps 1 :loop true
+           (bpm 60)
+           (d :b :src :click :gate 1))
+         (play-scene :intro)",
+    )
+    .unwrap();
+
+    assert_eq!(runtime.bpm, 120.0);
+    let mut engine = AudioEngine::new(runtime.clone(), 8.0);
+    engine.next_frame();
+    engine.next_frame();
+    let advanced = engine.runtime_for_test();
+    assert_eq!(advanced.bpm, 60.0);
+    assert_eq!(
+        advanced.scene_state.as_ref().unwrap().current,
+        "drop"
+    );
 }
 
 #[test]
@@ -2173,6 +2439,25 @@ fn auto_render_seconds_follows_finite_scene_chain() {
 }
 
 #[test]
+fn auto_render_seconds_uses_scene_local_bpm_in_finite_chain() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(bpm 100)
+         (scene :intro :steps 8 :repeat 1 :next :drop
+           (bpm 120)
+           (d :a :src :sine-synth :note c3 :gate 1 :amp 0.1))
+         (scene :drop :steps 8 :repeat 1
+           (bpm 60)
+           (d :b :src :sine-synth :note c4 :gate 1 :amp 0.1))
+         (play-scene :intro)",
+    )
+    .unwrap();
+
+    assert_eq!(auto_render_seconds(&runtime), Some(5.0));
+}
+
+#[test]
 fn auto_render_seconds_rejects_looping_scene_chain() {
     let mut runtime = Runtime::new();
     eval_program(
@@ -2340,6 +2625,161 @@ fn gate_then_long_times_chain_preserves_stage_counts() {
     assert_eq!(
         looped,
         vec![true, false, false, false, true, false, false, false]
+    );
+}
+
+#[test]
+fn repeat_gate_cells_follow_scene_cycle_index() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(d :kick :src :click :gate (p [1 0 1%0%1%0 0]) :amp 0.2)",
+    )
+    .unwrap();
+
+    let track = &runtime.tracks["kick"];
+    assert_eq!(
+        track.gate_cells[2],
+        vec![GateCell::Repeat(vec![true, false, true, false])]
+    );
+    let cell = &track.gate_cells[2][0];
+    let played: Vec<bool> = (0..6)
+        .map(|cycle| resolve_gate_cell(cell, cycle, "kick", 2, 0))
+        .collect();
+    assert_eq!(played, vec![true, false, true, false, true, false]);
+}
+
+#[test]
+fn chance_gate_cells_accept_question_mark_percent_syntax() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(d :hat :src :click :gate (p [? ?0 ?100 ?50]) :amp 0.2)",
+    )
+    .unwrap();
+
+    let track = &runtime.tracks["hat"];
+    assert_eq!(track.gate_cells[0], vec![GateCell::Chance(0.5)]);
+    assert_eq!(track.gate_cells[1], vec![GateCell::Chance(0.0)]);
+    assert_eq!(track.gate_cells[2], vec![GateCell::Chance(1.0)]);
+    assert!(!resolve_gate_cell(&track.gate_cells[1][0], 0, "hat", 1, 0));
+    assert!(resolve_gate_cell(&track.gate_cells[2][0], 0, "hat", 2, 0));
+}
+
+#[test]
+fn chance_prefix_on_subdivision_keeps_one_top_level_gate_step() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(sample :hat
+            :sample-data [1 0 -1]
+            :amp 0.8
+            :note [d3 c3]
+            :gate (p [1 0 1 0
+                      1 0 1 0
+                      1 0 1 0
+                      1 1 ?99[1 0 1] 0]))",
+    )
+    .unwrap();
+
+    let track = &runtime.tracks["hat"];
+    assert_eq!(track.gate_subdivisions.len(), 16);
+    assert_eq!(track.gate_cells[14].len(), 3);
+    assert_eq!(track.gate_cells[14][0], GateCell::Chance(0.99));
+    assert_eq!(track.gate_cells[14][1], GateCell::Static(false));
+    assert_eq!(track.gate_cells[14][2], GateCell::Chance(0.99));
+}
+
+#[test]
+fn gate_sustain_extends_gate_cycle_without_retriggering() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(sample :syntho
+            :sample-data [1 0 -1]
+            :amp 0.3
+            :note [[c4 e4 g4] [d4 f4 a4]]
+            :gate (p [1 ~12]))",
+    )
+    .unwrap();
+
+    let track = &runtime.tracks["syntho"];
+    assert_eq!(track.gate_subdivisions.len(), 13);
+    assert_eq!(track.gates[0], true);
+    assert!(track.gates.iter().skip(1).all(|gate| !gate));
+}
+
+#[test]
+fn gate_seq_note_then_times_keeps_multiple_chord_stages_with_sustain_gate() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(sample :syntho
+            :sample-data [1 0 -1]
+            :amp 0.3
+            :note (g (then
+              (times 1 [[c4 e3 g3]])
+              (times 1 [[d3 f4 a3]])))
+            :gate (p [1 ~15]))",
+    )
+    .unwrap();
+
+    let track = &runtime.tracks["syntho"];
+    assert_eq!(track.note_mode, NoteMode::Tick);
+    assert_eq!(track.note_chords.len(), 2);
+    assert_eq!(track.note_chords[0].len(), 3);
+    assert_eq!(track.note_chords[1].len(), 3);
+    assert_eq!(track.gate_subdivisions.len(), 16);
+}
+
+#[test]
+fn gate_sustain_must_follow_a_hit() {
+    let mut runtime = Runtime::new();
+    let err = eval_program(&mut runtime, "(d :bad :src :click :gate (p [~12 1]))").unwrap_err();
+    assert!(err.contains("gate sustain must follow a hit"), "{}", err);
+}
+
+#[test]
+fn compiled_sample_gate_preserves_gate_sustain_tokens() {
+    let source = "(def parta
+                    (sample :syntho
+                      \"samps/syntho.wav\"
+                      :amp 0.3
+                      :note [[c4 e4 g4] [d4 f4 a4]]
+                      :gate (p [1 ~12])))
+                  (scene :intro :repeat 1
+                    parta)
+                  (play-scene :intro)";
+    let compiled = compile_source_for_runtime(source).unwrap();
+    assert!(compiled.contains("(gate-sustain 12)"), "{}", compiled);
+
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &compiled).unwrap();
+    let track = &runtime.scenes["intro"].tracks["syntho"];
+    assert_eq!(track.gate_subdivisions.len(), 13);
+}
+
+#[test]
+fn compiled_sample_gate_preserves_repeat_and_chance_cells() {
+    let source = "(def parta
+                    (sample :kick
+                      \"samps/kick1.wav\"
+                      :amp 1
+                      :gate (p [1 ?50 1%0%1%0 0])))
+                  (scene :intro :repeat 4
+                    parta)
+                  (play-scene :intro)";
+    let compiled = compile_source_for_runtime(source).unwrap();
+    assert!(compiled.contains("(gate-repeat [1 0 1 0])"), "{}", compiled);
+    assert!(compiled.contains("?50"), "{}", compiled);
+
+    let mut runtime = Runtime::new();
+    eval_program(&mut runtime, &compiled).unwrap();
+    let track = &runtime.scenes["intro"].tracks["kick"];
+    assert_eq!(track.gate_cells[1], vec![GateCell::Chance(0.5)]);
+    assert_eq!(
+        track.gate_cells[2],
+        vec![GateCell::Repeat(vec![true, false, true, false])]
     );
 }
 
@@ -5549,9 +5989,18 @@ fn swing_loop_inference_counts_sample_tracks_like_tracks() {
       (load-file "src/glitchlisp/swing/render.clj")
       (let [top-level "(sample :hit \"kick.wav\" :gate (p [1 0 0 0]))\n(start!)"
             scene "(scene :intro :loop true\n  (sample :hit \"kick.wav\" :gate (p [1 0 0 0])))\n(play-scene :intro)"
+            note-cycle-form (first (glitchlisp.swing.render/read-source-forms
+                              "(scene :intro :repeat 2\n  (sample :hat \"hat.wav\" :note [d3 c3] :gate (p [1 0 1 0 1 0 1 0 1 0 1 0 1 1 [1 0 1] 0])))"))
+            dynamic "(sample :kick \"kick.wav\" :gate (p [1 ?50 1%0%1%0 0]))\n(start!)"
+            attached-chance "(sample :hat \"hat.wav\" :gate (p [1 0 1 0 1 0 1 0 1 0 1 0 1 1 ?99[1 0 1] 0]))\n(start!)"
+            sustain "(sample :syntho \"syntho.wav\" :gate (p [1 ~12]))\n(start!)"
             every "(sample :hat \"hat.wav\" :gate (p [1 0]) :every 3)\n(start!)"]
         (println (= 4 (glitchlisp.swing.render/inferred-loop-steps top-level)))
         (println (= 4 (glitchlisp.swing.render/inferred-loop-steps scene)))
+        (println (= 16 (glitchlisp.swing.render/scene-steps-from-form note-cycle-form)))
+        (println (= 4 (glitchlisp.swing.render/inferred-loop-steps dynamic)))
+        (println (= 16 (glitchlisp.swing.render/inferred-loop-steps attached-chance)))
+        (println (= 13 (glitchlisp.swing.render/inferred-loop-steps sustain)))
         (println (= 6 (glitchlisp.swing.render/inferred-loop-steps every))))
     "#;
     let output = clojure_headless_command()
@@ -5571,8 +6020,43 @@ fn swing_loop_inference_counts_sample_tracks_like_tracks() {
         .collect::<Vec<_>>();
     assert_eq!(
         results,
-        vec!["true", "true", "true"],
+        vec!["true", "true", "true", "true", "true", "true", "true"],
         "unexpected sample loop inference results: {}",
+        stdout
+    );
+}
+
+#[test]
+fn swing_syntax_highlights_dynamic_gate_tokens() {
+    let script = r#"
+      (load-file "src/glitchlisp/swing/shared.clj")
+      (load-file "src/glitchlisp/swing/editor.clj")
+      (println (= :number (glitchlisp.swing.editor/syntax-kind "1%0%1%0")))
+      (println (= :number (glitchlisp.swing.editor/syntax-kind "?")))
+      (println (= :number (glitchlisp.swing.editor/syntax-kind "?50")))
+      (println (= :number (glitchlisp.swing.editor/syntax-kind "~12")))
+      (println (= :form (glitchlisp.swing.editor/syntax-kind "gate-repeat")))
+      (println (= :form (glitchlisp.swing.editor/syntax-kind "gate-sustain")))
+    "#;
+    let output = clojure_headless_command()
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run swing dynamic gate syntax highlight smoke");
+    assert!(
+        output.status.success(),
+        "swing dynamic gate syntax highlight smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter(|line| *line == "true" || *line == "false")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec!["true", "true", "true", "true", "true", "true"],
+        "unexpected dynamic gate syntax highlight results: {}",
         stdout
     );
 }
@@ -7501,6 +7985,61 @@ fn native_scene_cycle_status_counts_completed_scene_loops() {
 }
 
 #[test]
+fn queued_live_runtime_applies_at_scene_loop_boundary_without_transport_reset() {
+    let mut runtime = Runtime::new();
+    eval_program(
+        &mut runtime,
+        "(bpm 120)
+         (scene :intro :steps 2 :loop true
+           (d :lead :src :sine-synth :note c3 :gate 1 :dur 0.01 :amp 0.2))
+         (play-scene :intro)",
+    )
+    .unwrap();
+
+    let mut next_runtime = Runtime::new();
+    eval_program(
+        &mut next_runtime,
+        "(bpm 120)
+         (scene :intro :steps 2 :loop true
+           (d :lead :src :sine-synth :note c3 :gate 1 :dur 0.01 :amp 0.8))
+         (play-scene :intro)",
+    )
+    .unwrap();
+
+    let queued_runtime = Arc::new(Mutex::new(Some(next_runtime)));
+    let mut engine = AudioEngine::new(runtime, 48_000.0);
+    engine.set_queued_runtime(queued_runtime);
+
+    engine.next_frame();
+    let before_boundary = engine.runtime_for_test();
+    assert_eq!(
+        before_boundary.tracks.get("lead").unwrap().amp,
+        0.2,
+        "queued update should not apply before the scene loop boundary"
+    );
+
+    for _ in 0..12_000 {
+        engine.next_frame();
+    }
+
+    let after_boundary = engine.runtime_for_test();
+    assert_eq!(
+        after_boundary.transport_revision, 0,
+        "queued update should not reset transport"
+    );
+    assert_eq!(
+        after_boundary.tracks.get("lead").unwrap().amp,
+        0.8,
+        "queued update should replace track definitions at the next scene loop"
+    );
+    assert!(
+        cli::live_status_summary(&after_boundary).contains("cycle=1/loop"),
+        "queued update should preserve scene progress: {}",
+        cli::live_status_summary(&after_boundary)
+    );
+}
+
+#[test]
 fn render_rejects_invalid_seconds_before_loading_input_file() {
     let args = vec![
         "glitchlisp-native".to_string(),
@@ -8141,6 +8680,55 @@ fn swing_editor_treats_sample_as_track_for_indent_helpers() {
         results,
         vec!["true", "true", "true"],
         "unexpected sample editor helper results: {}",
+        stdout
+    );
+}
+
+#[test]
+fn swing_tab_indents_and_shift_tab_outdents_lines() {
+    let script = r#"
+      (load-file "src/glitchlisp/swing/shared.clj")
+      (load-file "src/glitchlisp/swing/editor.clj")
+      (let [pane (javax.swing.JTextPane.)]
+        (.setText pane "(times 1 [[c4 e3 g3]])\n(times 1 [[ab3 c4 eb4]])")
+        (glitchlisp.swing.editor/install-auto-indent! pane)
+        (.setSelectionStart pane 0)
+        (.setSelectionEnd pane (.getLength (.getDocument pane)))
+        (.actionPerformed (.get (.getActionMap pane) "glitchlisp-indent-lines") nil)
+        (println (pr-str (.getText pane)))
+        (.setSelectionStart pane 0)
+        (.setSelectionEnd pane (.getLength (.getDocument pane)))
+        (.actionPerformed (.get (.getActionMap pane) "glitchlisp-outdent-lines") nil)
+        (println (pr-str (.getText pane)))
+        (.setCaretPosition pane 0)
+        (.actionPerformed (.get (.getActionMap pane) "glitchlisp-indent-lines") nil)
+        (println (pr-str (.getText pane))))
+    "#;
+    let output = clojure_headless_command()
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run swing tab indent smoke");
+    assert!(
+        output.status.success(),
+        "swing tab indent smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"  (times 1 [[c4 e3 g3]])\\n  (times 1 [[ab3 c4 eb4]])\""),
+        "Tab should indent selected lines: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"(times 1 [[c4 e3 g3]])\\n(times 1 [[ab3 c4 eb4]])\""),
+        "Shift+Tab should outdent selected lines: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"  (times 1 [[c4 e3 g3]])\\n(times 1 [[ab3 c4 eb4]])\""),
+        "Tab without selection should indent the current line: {}",
         stdout
     );
 }
@@ -9349,6 +9937,48 @@ fn live_step_highlight_marks_active_note_times_stage() {
 }
 
 #[test]
+fn live_step_highlight_marks_s_note_chord_cells() {
+    let script = r#"
+      (load-file "src/glitchlisp/swing/shared.clj")
+      (load-file "src/glitchlisp/swing/editor.clj")
+      (let [pane (javax.swing.JTextPane.)
+            source "(sample :syntho\n  \"samps/syntho.wav\"\n  :amp 0.3\n  :note (s [[c4 e4 g4] [d4 f4 a4]])\n  :gate (p [1 ~15]))\n(start!)"
+            highlighted (fn []
+                          (->> (.getClientProperty pane glitchlisp.swing.editor/live-step-highlight-key)
+                               (map (fn [[start end]] (subs source start end)))
+                               vec))]
+        (.setText pane source)
+        (glitchlisp.swing.editor/install-live-gate-range-cache! pane)
+        (glitchlisp.swing.editor/highlight-live-step! pane 0 nil)
+        (let [ranges (highlighted)]
+          (println (some #(= "[c4 e4 g4]" %) ranges))
+          (println (some #(= "1" %) ranges))))
+    "#;
+    let output = clojure_headless_command()
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run live s-note chord highlight smoke");
+    assert!(
+        output.status.success(),
+        "live s-note chord highlight smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter(|line| *line == "true" || *line == "false")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec!["true", "true"],
+        "live highlight should mark s note chord cells: {}",
+        stdout
+    );
+}
+
+#[test]
 fn live_step_highlight_skips_repaint_when_visible_range_is_unchanged() {
     let script = r#"
       (load-file "src/glitchlisp/swing/shared.clj")
@@ -10080,7 +10710,7 @@ fn language_reference_scene_option_examples_start_scenes() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 9, "expected every scene option row to be checked");
+    assert_eq!(checked, 10, "expected every scene option row to be checked");
 }
 
 #[test]
@@ -11540,8 +12170,8 @@ fn oscillator_insert_uses_blank_parameter_form() {
             form (javax.swing.JComboBox.)]
         (.addItem category "Oscillator")
         (.setSelectedItem category "Oscillator")
-        (.addItem form "Synth / sine-synth")
-        (.setSelectedItem form "Synth / sine-synth")
+        (.addItem form "sine-synth")
+        (.setSelectedItem form "sine-synth")
         (glitchlisp-swing/insert-selected-form! blank category form "intro")
         (println "blank")
         (println (.getText blank))
@@ -11590,6 +12220,38 @@ fn oscillator_insert_uses_blank_parameter_form() {
             && nonblank.contains(":gate null")
             && !nonblank.contains("(start!)"),
         "nonblank Oscillator insertion should keep blank track-only behavior: {}",
+        stdout
+    );
+}
+
+#[test]
+fn oscillator_insert_options_use_short_labels() {
+    let script = r#"
+      (load-file "src/main.clj")
+      (doseq [option (take 12 (glitchlisp-swing/insert-form-options "Oscillator"))]
+        (println option))
+    "#;
+    let output = clojure_headless_command()
+        .env("GLITCHLISP_NO_GUI", "1")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run oscillator option label smoke");
+    assert!(
+        output.status.success(),
+        "oscillator option label smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Synth /") && !stdout.contains("Drum /") && !stdout.contains("Noise /"),
+        "oscillator combo labels should not repeat category prefixes: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("sine-synth") || stdout.contains("additive"),
+        "oscillator options should still expose source names: {}",
         stdout
     );
 }
@@ -11703,6 +12365,447 @@ fn file_menu_source_lists_new_save_as_and_exit() {
 }
 
 #[test]
+fn preferences_menu_source_lists_inspector() {
+    let source = std::fs::read_to_string("src/main.clj").expect("read Swing main source");
+    let preferences_start = source
+        .find("(defn build-ui")
+        .and_then(|start| {
+            source[start..]
+                .find("(let [menu-bar")
+                .map(|offset| start + offset)
+        })
+        .expect("find menu setup");
+    let preferences_menu = &source[preferences_start..];
+    assert!(
+        preferences_menu.contains("(menu-item \"Open Inspector\""),
+        "Open Inspector should be under Preferences"
+    );
+    assert!(
+        !preferences_menu.contains("(.add file-menu (menu-item \"Open Inspector\""),
+        "Open Inspector should not be under File"
+    );
+    assert!(
+        source.contains("(JFrame. \"Inspector\")")
+            && !source.contains("(JFrame. \"Inspector REPL\")"),
+        "Inspector window title should be shortened"
+    );
+    assert!(
+        source.contains("(install-syntax-highlighter! result-editor)")
+            && source.contains("ScrollPaneConstants/VERTICAL_SCROLLBAR_ALWAYS")
+            && source.contains("ScrollPaneConstants/HORIZONTAL_SCROLLBAR_ALWAYS"),
+        "Inspector result pane should use syntax highlighting and always-visible scrollbars"
+    );
+    assert!(
+        source.contains("(defn inspector-play-result!")
+            && source.contains("(defn inspector-stop-result!")
+            && source.contains("(JButton. \"Play\")")
+            && source.contains("(JButton. \"Stop\")")
+            && source.contains("mescript-inspector-play")
+            && source.contains("mescript-inspector-stop"),
+        "Inspector should expose Play/Stop controls for the current track result"
+    );
+}
+
+#[test]
+fn preferences_menu_source_lists_theme_selector() {
+    let source = std::fs::read_to_string("src/main.clj").expect("read Swing main source");
+    assert!(
+        source.contains("(def default-theme-id \"retro-cherry\")"),
+        "Cherry should be the default built-in theme"
+    );
+    let preferences_start = source
+        .find("(defn build-ui")
+        .and_then(|start| {
+            source[start..]
+                .find("(let [menu-bar")
+                .map(|offset| start + offset)
+        })
+        .expect("find menu setup");
+    let preferences_menu = &source[preferences_start..];
+    assert!(
+        preferences_menu
+            .contains("(menu-item \"Theme Selector\" #(show-theme-selector! frame status))"),
+        "Theme Selector should be under Preferences"
+    );
+    assert!(
+        source.contains("(defn show-theme-selector!")
+            && source.contains("(JFrame. \"Theme Selector\")"),
+        "Themes should open in a selector window"
+    );
+    assert!(
+        !source.contains("(defn theme-menu"),
+        "Theme selector should not be implemented as a dropdown submenu"
+    );
+    assert!(
+        !source.contains("(str \"theme: \" label)"),
+        "Theme changes should not write a transient status-bar message"
+    );
+    assert!(
+        source.contains("(str \"theme failed: \" (:message result))"),
+        "Theme apply failures should still be reported"
+    );
+    for key in [
+        "\"Menu.selectionForeground\"",
+        "\"MenuItem.selectionForeground\"",
+        "\"RadioButtonMenuItem.selectionForeground\"",
+        "\"CheckBoxMenuItem.selectionForeground\"",
+        "\"PopupMenu.background\"",
+        "\"OptionPane.background\"",
+        "\"OptionPane.messageForeground\"",
+        "\"Button.default.background\"",
+        "\"Button.borderColor\"",
+        "\"Button.focusedBorderColor\"",
+        "\"Button.default.focusedBorderColor\"",
+    ] {
+        assert!(
+            source.contains(key),
+            "Theme menu readability should set UI key {}",
+            key
+        );
+    }
+    for hook in [
+        "(defn style-menu-item!",
+        "(defn style-popup-menu!",
+        "(defn style-menu!",
+        "(instance? JPopupMenu component)",
+    ] {
+        assert!(
+            source.contains(hook),
+            "Theme refresh should explicitly style menus/popups via {}",
+            hook
+        );
+    }
+    for label in [
+        "Green", "Amber", "Phosphor", "Midnight", "Cherry", "Blue", "Oxide", "CRT", "Plum",
+        "Steel", "Bone", "Paper", "Light",
+    ] {
+        assert!(
+            source.contains(label),
+            "missing built-in theme option {}",
+            label
+        );
+    }
+}
+
+#[test]
+fn language_reference_documents_gate_special_tokens() {
+    let source = std::fs::read_to_string("src/glitchlisp/swing/docs.clj")
+        .expect("read language reference source");
+    for token in ["1_N", "~N", "?", "?N", "A%B%C"] {
+        assert!(
+            source.contains(token),
+            "language reference should document gate token {}",
+            token
+        );
+    }
+    for example in ["1_3", "~15", "?25", "?99[1 0 1]", "1%0%1%0"] {
+        assert!(
+            source.contains(example),
+            "language reference should include example {}",
+            example
+        );
+    }
+}
+
+#[test]
+fn workstation_build_packages_lib_jars() {
+    let source = std::fs::read_to_string("build.sh").expect("read build script");
+    assert!(
+        source.contains("find \"$DIR/lib\" -maxdepth 1 -type f -name '*.jar'"),
+        "build should discover jars in lib/"
+    );
+    assert!(
+        source.contains("jar xf \"$lib_jar\""),
+        "build should merge lib jars into mescript.jar"
+    );
+}
+
+#[test]
+fn workstation_uses_resizable_tools_split_pane() {
+    let source = std::fs::read_to_string("src/main.clj").expect("read Swing main source");
+    assert!(
+        source.contains("(JSplitPane. JSplitPane/HORIZONTAL_SPLIT tabs tools)"),
+        "main editor/tools layout should use a horizontal split pane"
+    );
+    assert!(
+        source.contains("save-tools-width!"),
+        "tools split width should be persisted after dragging"
+    );
+    assert!(
+        source.contains("(.setDividerSize split 4)"),
+        "split pane divider should stay narrow"
+    );
+    assert!(
+        source.contains("(def default-tools-width 148)"),
+        "default tools panel width should stay fixed"
+    );
+    assert!(
+        source.contains("(defn set-tools-panel-width!"),
+        "tools panel width should be applied through the split pane"
+    );
+}
+
+#[test]
+fn workstation_tool_controls_expand_with_tools_panel() {
+    let source = std::fs::read_to_string("src/main.clj").expect("read Swing main source");
+    assert!(
+        source.contains("(.setMaximumSize component (Dimension. Integer/MAX_VALUE height))"),
+        "tool controls should expand horizontally when the tools panel is resized"
+    );
+    assert!(
+        !source.contains("(.setMaximumSize component (Dimension. 132 height))"),
+        "tool controls should not keep a fixed 132px maximum width"
+    );
+}
+
+#[test]
+fn workstation_preserves_window_size_across_theme_changes() {
+    let source = std::fs::read_to_string("src/main.clj").expect("read Swing main source");
+    let refresh_start = source
+        .find("(defn refresh-window-themes!")
+        .expect("find refresh theme fn");
+    let refresh_end = source[refresh_start..]
+        .find("(defn apply-theme-id!")
+        .map(|offset| refresh_start + offset)
+        .expect("find next theme fn");
+    let refresh_source = &source[refresh_start..refresh_end];
+    assert!(
+        !refresh_source.contains("(.pack window)"),
+        "theme refresh should not repack and resize existing windows"
+    );
+    assert!(
+        refresh_source.contains("(.revalidate window)"),
+        "theme refresh should revalidate without changing the window size"
+    );
+    assert!(
+        source.contains("(refresh-syntax-colors! component)"),
+        "theme refresh should reapply syntax colors to open editor documents"
+    );
+    for key in [
+        "\"TabbedPane.selectedForeground\"",
+        "\"TabbedPane.inactiveForeground\"",
+        "\"TabbedPane.disabledForeground\"",
+        "\"TabbedPane.tabAreaBackground\"",
+    ] {
+        assert!(
+            source.contains(key),
+            "theme should set tab readability key {}",
+            key
+        );
+    }
+    assert!(
+        source.contains("mescript.tab-close-label")
+            && source.contains(
+                "(.setForeground ^JLabel label (if selected? (:text theme) (:muted theme)))"
+            ),
+        "custom tab headers should use active theme colors"
+    );
+}
+
+#[test]
+fn workstation_saves_and_resets_window_layout() {
+    let source = std::fs::read_to_string("src/main.clj").expect("read Swing main source");
+    assert!(
+        source.contains("(defn saved-window-bounds []"),
+        "window bounds should be persisted"
+    );
+    assert!(
+        source.contains("(def default-window-width 741)")
+            && source.contains("(def default-window-height 580)"),
+        "default workstation window size should stay fixed"
+    );
+    assert!(
+        source.contains("(menu-item \"Reset Window Layout\""),
+        "Preferences should expose a reset window layout action"
+    );
+    assert!(
+        source.contains("clear-layout-preferences!"),
+        "reset should clear saved layout preferences"
+    );
+    let reset_start = source
+        .find("(menu-item \"Reset Window Layout\"")
+        .expect("find reset layout menu");
+    let reset_end = source[reset_start..]
+        .find("(menu-item \"Open Inspector\"")
+        .map(|offset| reset_start + offset)
+        .expect("find next preferences item");
+    let reset_source = &source[reset_start..reset_end];
+    assert!(
+        !reset_source.contains("(.pack frame)"),
+        "reset layout should not resize the outer window"
+    );
+    assert!(
+        reset_source.contains("(.setSize frame default-window-width default-window-height)"),
+        "reset layout should restore the explicit default window size"
+    );
+    assert!(
+        reset_source.contains("(set-tools-panel-width! ^JSplitPane split default-tools-width)"),
+        "reset layout should restore the explicit default tools width"
+    );
+    let listener_pos = source
+        .find("(.addComponentListener frame")
+        .expect("find window persistence listener");
+    let visible_pos = source
+        .find("(.setVisible frame true)")
+        .expect("find set visible");
+    assert!(
+        listener_pos > visible_pos,
+        "window bounds listener should be installed after initial pack/saved bounds are applied"
+    );
+}
+
+#[test]
+fn workstation_main_close_disposes_child_windows() {
+    let source = std::fs::read_to_string("src/main.clj").expect("read Swing main source");
+    assert!(
+        source.contains("(defn register-child-window!")
+            && source.contains("(defn dispose-child-windows!")
+            && source.contains("(defn close-main-window!"),
+        "main window should track and dispose helper windows"
+    );
+    assert!(
+        source.contains("(register-child-window! frame repl-frame)"),
+        "Inspector should be registered as a child window"
+    );
+    assert!(
+        source.contains("#(register-child-window! frame (show-language-reference! frame))"),
+        "Language Reference should be registered as a child window"
+    );
+    assert!(
+        source.contains("(menu-item \"Exit\"\n\t                           #(close-main-window! frame tabs status))")
+            || source.contains("(menu-item \"Exit\"\n                           #(close-main-window! frame tabs status))"),
+        "File > Exit should use the main close helper"
+    );
+    assert!(
+        source.contains("(windowClosing [_]\n\t                            (close-main-window! frame tabs status))")
+            || source.contains("(windowClosing [_]\n                            (close-main-window! frame tabs status))"),
+        "window close button should use the main close helper"
+    );
+    assert!(
+        source.contains("(.setAlwaysOnTop ^JFrame child true)")
+            && source.contains("(.setAlwaysOnTop ^JFrame child false)"),
+        "registered child windows should stay above the main window while open"
+    );
+}
+
+#[test]
+fn inspector_repl_commands_return_editable_source_and_info() {
+    let script = r#"
+      (load-file "src/main.clj")
+      (let [source "(bpm 120)\n\n(def hat-gate\n  (p [0 1 0 1]))\n\n(def hat\n  (d :hat-808 :src :hat-808 :note (s [c4 d8]) :gate hat-gate))\n\n(scene :intro :repeat 2\n  hat)\n\n(play-scene :intro)\n"
+            gate (glitchlisp-swing/inspector-command-result source "hat :gate")
+            expanded (glitchlisp-swing/inspector-command-result source "expand hat")
+            info (glitchlisp-swing/inspector-command-result source "info :intro")
+            scene-source (glitchlisp-swing/inspector-command-result source "scene intro")
+            hits (glitchlisp-swing/inspector-command-result source "hits hat-gate")
+            bpm (glitchlisp-swing/inspector-command-result source "bpm")
+            replacement "(def hat-gate\n  (p [1 0 1 0]))"
+            candidate (glitchlisp-swing/inspector-validate-replacement!
+                        source
+                        (:source-start gate)
+                        (:source-end gate)
+                        replacement)
+            bpm-candidate (glitchlisp-swing/inspector-validate-replacement!
+                            source
+                            (:source-start bpm)
+                            (:source-end bpm)
+                            "140")]
+        (println (:editable gate))
+        (println (:text gate))
+        (println (:text expanded))
+        (println (:text info))
+        (println (:editable scene-source))
+        (println (:text scene-source))
+        (println (:text hits))
+        (println (:editable bpm))
+        (println (:text bpm))
+        (println (boolean (re-find #"\[1 0 1 0\]" candidate)))
+        (println bpm-candidate))"#;
+    let output = std::process::Command::new("java")
+        .args([
+            "-Djava.awt.headless=true",
+            "-cp",
+            "mescript.jar",
+            "clojure.main",
+            "-e",
+            script,
+        ])
+        .output()
+        .expect("run inspector REPL command smoke");
+    assert!(
+        output.status.success(),
+        "inspector REPL command smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("true\n(def hat-gate"), "{}", stdout);
+    assert!(
+        stdout.contains(":gate (p [0 1 0 1])"),
+        "expanded track should resolve referenced gate: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("scene :intro") && stdout.contains("effective steps: 4"),
+        "scene info should describe inferred length: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("true\n(scene :intro :repeat 2"),
+        "scene command should return editable scene source without requiring a keyword: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("hits: 2") && stdout.lines().any(|line| line == "true"),
+        "hits and validated replacement should be reported: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("true\n120") && stdout.contains("(bpm 140)"),
+        "bpm command should return an editable tempo value: {}",
+        stdout
+    );
+}
+
+#[test]
+fn inspector_apply_suppresses_immediate_live_auto_update() {
+    let source = std::fs::read_to_string("src/main.clj").expect("read Swing main source");
+    let apply_start = source
+        .find("(defn inspector-apply-result!")
+        .expect("find inspector apply");
+    let apply_end = source[apply_start..]
+        .find("(defn inspector-play-result!")
+        .map(|offset| apply_start + offset)
+        .expect("find inspector apply end");
+    let apply_source = &source[apply_start..apply_end];
+    assert!(
+        apply_source.contains("live-auto-update-suppressed-key")
+            && apply_source.contains("(cancel-live-auto-update! editor)")
+            && apply_source.contains("(live-queue-update!"),
+        "Inspector Apply should suppress normal auto live EVAL and use the queued loop-boundary update: {}",
+        apply_source
+    );
+}
+
+#[test]
+fn live_auto_updates_queue_instead_of_resetting_transport() {
+    let source = std::fs::read_to_string("src/main.clj").expect("read Swing main source");
+    let auto_start = source
+        .find("(defn live-auto-apply-source!")
+        .expect("find live auto apply");
+    let auto_end = source[auto_start..]
+        .find("(defn schedule-live-auto-update!")
+        .map(|offset| auto_start + offset)
+        .expect("find live auto apply end");
+    let auto_source = &source[auto_start..auto_end];
+    assert!(
+        auto_source.contains("(send-compiled-live-queued-update!")
+            && !auto_source.contains("(send-compiled-live-update! editor status compiled"),
+        "live auto edits should queue at the next loop instead of sending immediate EVAL: {}",
+        auto_source
+    );
+}
+
+#[test]
 fn insert_form_categories_hide_math_logic_and_pattern() {
     let source = std::fs::read_to_string("src/main.clj").expect("read Swing main source");
     assert!(
@@ -11710,6 +12813,54 @@ fn insert_form_categories_hide_math_logic_and_pattern() {
             "(def insert-form-categories\n  [\"Oscillator\" \"FX\" \"Post FX\" \"Scene\" \"Playback\"]"
         ),
         "insert form categories should hide Math / Logic and Pattern"
+    );
+}
+
+#[test]
+fn inspector_repl_resolves_nested_track_ids_inside_defs() {
+    let script = r#"
+      (load-file "src/main.clj")
+      (let [source "(def parta\n  (sample :snare\n    \"samps/snare.wav\"\n    :amp 1\n    :gate (p [0 0 1 0]))\n\n  (sample :kick\n    \"samps/kick1.wav\"\n    :amp 1\n    :gate (p [1 0 0 1])))\n"
+            keyed (glitchlisp-swing/inspector-command-result source ":kick")
+            bare (glitchlisp-swing/inspector-command-result source "kick")
+            gate (glitchlisp-swing/inspector-command-result source ":kick :gate")]
+        (println (:editable keyed))
+        (println (:text keyed))
+        (println (:editable bare))
+        (println (:text gate))
+        (println (:editable gate))
+        (flush)
+        (System/exit 0))
+    "#;
+    let output = std::process::Command::new("java")
+        .args([
+            "-Djava.awt.headless=true",
+            "-cp",
+            "mescript.jar",
+            "clojure.main",
+            "-e",
+            script,
+        ])
+        .output()
+        .expect("run nested inspector track smoke");
+    assert!(
+        output.status.success(),
+        "nested inspector track smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("true\n(sample :kick"), "{}", stdout);
+    assert!(
+        stdout.contains("\"samps/kick1.wav\"") && !stdout.contains("(def parta\n"),
+        "nested track lookup should return just the matching sample form: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("(p [1 0 0 1])")
+            && stdout.lines().filter(|line| *line == "true").count() >= 3,
+        "nested track gate lookup should be editable and return the gate value: {}",
+        stdout
     );
 }
 
@@ -11752,6 +12903,50 @@ fn new_file_adds_blank_tab_and_clears_active_file_state() {
         results,
         vec!["true", "true", "true", "true", "true", "new file"],
         "new-file should add a blank active tab and clear active file state: {}",
+        stdout
+    );
+}
+
+#[test]
+fn open_file_replaces_clean_empty_untitled_tab() {
+    let script = r#"
+      (load-file "src/main.clj")
+      (let [tabs (javax.swing.JTabbedPane.)
+            status (javax.swing.JLabel. "stale")
+            file (java.io.File/createTempFile "mescript-open" ".gl")]
+        (spit file "(bpm 140)\n")
+        (glitchlisp-swing/add-editor-tab! tabs status "" nil)
+        (glitchlisp-swing/open-file-in-tab! tabs status file)
+        (let [editor (glitchlisp-swing/active-editor tabs)]
+          (println (= 1 (.getTabCount tabs)))
+          (println (= file (glitchlisp-swing/editor-file editor)))
+          (println (= "(bpm 140)\n" (.getText editor)))
+          (println (not (glitchlisp-swing/editor-dirty? editor)))
+          (println (= (.getName file) (.getTitleAt tabs 0))))
+        (.delete file)
+        (flush)
+        (System/exit 0))
+    "#;
+    let output = clojure_headless_command()
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("run open file replace untitled smoke");
+    assert!(
+        output.status.success(),
+        "open file replace untitled smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter(|line| *line == "true")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec!["true", "true", "true", "true", "true"],
+        "opening a file should replace a clean empty Untitled tab: {}",
         stdout
     );
 }

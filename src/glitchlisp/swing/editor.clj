@@ -320,11 +320,54 @@
          :end block-end
          :text replacement}))))
 
+(def indent-unit "  ")
+
+(defn selected-line-range [^JTextComponent editor]
+  (let [text (.getText editor)
+        [selection-start selection-end] (safe-selection-range editor)
+        end-for-line (if (and (> selection-end selection-start)
+                              (> selection-end 0)
+                              (= (.charAt text (dec selection-end)) \newline))
+                       (dec selection-end)
+                       selection-end)]
+    [(line-start-offset text selection-start)
+     (line-end-offset text end-for-line)]))
+
+(defn indent-lines-text [text]
+  (->> (clojure.string/split text #"\n" -1)
+       (map #(str indent-unit %))
+       (clojure.string/join "\n")))
+
+(defn outdent-line [line]
+  (cond
+    (clojure.string/starts-with? line indent-unit) (subs line (count indent-unit))
+    (clojure.string/starts-with? line " ") (subs line 1)
+    :else line))
+
+(defn outdent-lines-text [text]
+  (->> (clojure.string/split text #"\n" -1)
+       (map outdent-line)
+       (clojure.string/join "\n")))
+
+(defn indent-selected-lines! [^JTextComponent editor outdent?]
+  (let [text (.getText editor)
+        [start end] (selected-line-range editor)
+        block (subs text start end)
+        replacement ((if outdent? outdent-lines-text indent-lines-text) block)
+        caret (.getCaretPosition editor)]
+    (replace-text-range! editor replacement start end)
+    (.setCaretPosition editor
+                       (max start
+                            (min (+ start (count replacement))
+                                 (+ caret (if outdent? (- (count indent-unit)) (count indent-unit))))))))
+
 (defn install-auto-indent! [^JTextComponent editor]
   (let [enter (KeyStroke/getKeyStroke "ENTER")
         tab (KeyStroke/getKeyStroke "TAB")
+        shift-tab (KeyStroke/getKeyStroke "shift TAB")
         action-key "glitchlisp-auto-indent"
-        tab-action-key "glitchlisp-align-track-indent"]
+        tab-action-key "glitchlisp-indent-lines"
+        shift-tab-action-key "glitchlisp-outdent-lines"]
     (.put (.getInputMap editor JComponent/WHEN_FOCUSED) enter action-key)
     (.put (.getActionMap editor)
           action-key
@@ -347,15 +390,23 @@
           tab-action-key
           (proxy [AbstractAction] []
             (actionPerformed [_]
-              (let [source (.getText editor)
-                    caret (.getCaretPosition editor)
-                    edit (or (align-current-line-to-vector source caret)
-                             (align-current-track-to-previous source caret))]
-                (if-let [{:keys [start end text]} edit]
-                  (do
-                    (replace-text-range! editor text start end)
-                    (.setCaretPosition editor (+ start (count text))))
-                  (.replaceSelection editor "  "))))))))
+              (if (not= (.getSelectionStart editor) (.getSelectionEnd editor))
+                (indent-selected-lines! editor false)
+                (let [source (.getText editor)
+                      caret (.getCaretPosition editor)
+                      edit (or (align-current-line-to-vector source caret)
+                               (align-current-track-to-previous source caret))]
+                  (if-let [{:keys [start end text]} edit]
+                    (do
+                      (replace-text-range! editor text start end)
+                      (.setCaretPosition editor (+ start (count text))))
+                    (indent-selected-lines! editor false)))))))
+    (.put (.getInputMap editor JComponent/WHEN_FOCUSED) shift-tab shift-tab-action-key)
+    (.put (.getActionMap editor)
+          shift-tab-action-key
+          (proxy [AbstractAction] []
+            (actionPerformed [_]
+              (indent-selected-lines! editor true))))))
 
 (defn line-column-for-offset [text offset]
   (let [bounded (max 0 (min offset (count text)))
@@ -586,7 +637,7 @@
 (def syntax-form-names
   #{"adsr" "and" "arpeggio" "arp" "asdr" "block" "by-scene" "choose" "chord" "clear" "clear-all"
     "cue" "d" "def" "delay" "distort" "euclid" "euclid-rot" "every-n"
-    "filter" "gate-hold" "gate-seq" "gate_seq" "gs" "interleave" "map"
+    "filter" "gate-hold" "gate-repeat" "gate-seq" "gate-sustain" "gate_seq" "gs" "interleave" "map"
     "master-fx" "mute" "not" "offset" "or" "p" "pan" "phaser" "play-block"
     "play-note" "play-scene" "post-fx" "rand-range" "range" "repeat" "rev" "reverse" "reverb"
     "rotate" "s" "sample" "scale" "scene" "section" "shape" "solo" "start!" "stop!" "take" "then" "times" "tracks" "transpose" "with"
@@ -596,13 +647,20 @@
   (doto (SimpleAttributeSet.)
     (StyleConstants/setForeground color)))
 
-(def syntax-default-attrs (SimpleAttributeSet.))
-(def syntax-comment-attrs (syntax-attrs (Color. 95 120 95)))
-(def syntax-string-attrs (syntax-attrs (Color. 30 120 78)))
-(def syntax-form-attrs (syntax-attrs (Color. 88 72 165)))
-(def syntax-keyword-attrs (syntax-attrs (Color. 22 102 166)))
-(def syntax-number-attrs (syntax-attrs (Color. 145 88 18)))
-(def syntax-note-attrs (syntax-attrs (Color. 150 72 135)))
+(defonce syntax-theme
+  (atom {:text (Color. 220 236 214)
+         :comment (Color. 104 142 104)
+         :string (Color. 126 210 147)
+         :form (Color. 128 205 255)
+         :keyword (Color. 255 202 96)
+         :number (Color. 255 144 112)
+         :note (Color. 210 166 255)}))
+
+(defn syntax-default-attrs []
+  (syntax-attrs (:text @syntax-theme)))
+
+(defn set-syntax-theme! [theme]
+  (swap! syntax-theme merge (select-keys theme [:text :comment :string :form :keyword :number :note])))
 
 (def syntax-span-limit 1500)
 
@@ -615,6 +673,9 @@
     (clojure.string/starts-with? token ":") :keyword
     (contains? syntax-form-names token) :form
     (re-matches #"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:_[0-9]*)?" token) :number
+    (re-matches #"[01](?:%[01])+" token) :number
+    (re-matches #"\?(?:[0-9]+(?:\.[0-9]+)?)?" token) :number
+    (re-matches #"~[0-9]+" token) :number
     (re-matches #"(?i)[a-g](?:s|b)?-?[0-9]+" token) :note
     :else nil))
 
@@ -658,13 +719,13 @@
 
 (defn syntax-attrs-for-kind [kind]
   (case kind
-    :comment syntax-comment-attrs
-    :string syntax-string-attrs
-    :form syntax-form-attrs
-    :keyword syntax-keyword-attrs
-    :number syntax-number-attrs
-    :note syntax-note-attrs
-    syntax-default-attrs))
+    :comment (syntax-attrs (:comment @syntax-theme))
+    :string (syntax-attrs (:string @syntax-theme))
+    :form (syntax-attrs (:form @syntax-theme))
+    :keyword (syntax-attrs (:keyword @syntax-theme))
+    :number (syntax-attrs (:number @syntax-theme))
+    :note (syntax-attrs (:note @syntax-theme))
+    (syntax-default-attrs)))
 
 (defn syntax-highlight-enabled? [text]
   (<= (count text) syntax-max-highlight-chars))
@@ -677,7 +738,7 @@
       (.putClientProperty editor syntax-refreshing-key true)
       (try
         (when (pos? (count text))
-          (.setCharacterAttributes doc 0 (count text) syntax-default-attrs true)
+          (.setCharacterAttributes doc 0 (count text) (syntax-default-attrs) true)
           (when (syntax-highlight-enabled? text)
             (doseq [{:keys [start end kind]} (syntax-spans text)]
               (when (< start end)
@@ -1262,7 +1323,8 @@
            (when-let [close (matching-close text idx \( \))]
              (when-let [{:keys [head args-start]} (list-head-and-args text idx close)]
                (case head
-                 "p" (p-range-entry text args-start close)
+                 ("p" "s" "g" "gs" "gate-seq" "gate_seq")
+                 (p-range-entry text args-start close)
                  "then" (then-range-entry text args-start close)
                  "times" (when-let [entry (times-range-entry text idx args-start close)]
                            (assoc entry :head "times"))
@@ -2041,6 +2103,7 @@
 
 (defn line-number-gutter [^JTextComponent editor]
   (let [line-numbers (JTextPane.)]
+    (.setName line-numbers "mescript-line-numbers")
     (.setEditable line-numbers false)
     (.setFocusable line-numbers false)
     (.setFont line-numbers (.getFont editor))
